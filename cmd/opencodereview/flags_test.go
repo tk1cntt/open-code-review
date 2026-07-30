@@ -223,3 +223,47 @@ func TestExpandShortFlags(t *testing.T) {
 		})
 	}
 }
+
+func TestParseReviewFlagsSaveResult(t *testing.T) {
+	opts, err := parseReviewFlags([]string{
+		"--save-result",
+		"--result-dir", "/tmp/ocr-results",
+		"--result-project", "group/project",
+		"--result-source-branch", "feature/a",
+		"--result-target-branch", "main",
+	})
+	if err != nil {
+		t.Fatalf("parseReviewFlags: %v", err)
+	}
+
+	if !opts.saveResult {
+		t.Fatal("saveResult = false, want true")
+	}
+	if opts.resultDir != "/tmp/ocr-results" {
+		t.Errorf("resultDir = %q", opts.resultDir)
+	}
+	if opts.resultProject != "group/project" {
+		t.Errorf("resultProject = %q", opts.resultProject)
+	}
+	if opts.resultSourceBranch != "feature/a" {
+		t.Errorf("resultSourceBranch = %q", opts.resultSourceBranch)
+	}
+	if opts.resultTargetBranch != "main" {
+		t.Errorf("resultTargetBranch = %q", opts.resultTargetBranch)
+	}
+}
+
+func TestParseReviewFlagsRulesDirAndEnvResultDir(t *testing.T) {
+	t.Setenv("OCR_REVIEWS_DIR", "/mnt/ocr/reviews")
+	t.Setenv("OCR_RULES_DIR", "/mnt/ocr/rules")
+	opts, err := parseReviewFlags([]string{})
+	if err != nil {
+		t.Fatalf("parseReviewFlags: %v", err)
+	}
+	if opts.rulesDir != "/mnt/ocr/rules" {
+		t.Errorf("rulesDir = %q, want /mnt/ocr/rules", opts.rulesDir)
+	}
+	if opts.resultDir != "/mnt/ocr/reviews" {
+		t.Errorf("resultDir = %q, want /mnt/ocr/reviews", opts.resultDir)
+	}
+}
