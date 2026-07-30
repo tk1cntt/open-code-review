@@ -195,9 +195,12 @@ func peekSession(path string) (SessionSummary, error) {
 
 // ViewSession holds fully parsed records for one session.
 type ViewSession struct {
-	Summary    SessionSummary
-	TokenUsage TokenUsageSummary
-	Files      []*FileGroup // ordered by file path
+	Summary       SessionSummary
+	TokenUsage    TokenUsageSummary
+	Files         []*FileGroup    // ordered by file path
+	Findings      []ReviewFinding // review findings from review_item_done
+	SeverityCount map[string]int  // counts per severity
+	CategoryCount map[string]int  // counts per category
 }
 
 // TokenUsageSummary aggregates token counts across the session.
@@ -259,6 +262,18 @@ type ToolCallInfo struct {
 	DurationMs int64
 }
 
+// ReviewFinding represents a single code review finding from LlmComment.
+type ReviewFinding struct {
+	FilePath       string
+	Content        string
+	SuggestionCode string
+	ExistingCode   string
+	StartLine      int
+	EndLine        int
+	Category       string
+	Severity       string
+}
+
 // LoadSession fully parses a JSONL file into a ViewSession.
 func LoadSession(root, encodedRepo, sessionID string) (*ViewSession, error) {
 	path := filepath.Join(root, encodedRepo, sessionID+".jsonl")
@@ -268,7 +283,12 @@ func LoadSession(root, encodedRepo, sessionID string) (*ViewSession, error) {
 	}
 	defer f.Close()
 
-	vs := &ViewSession{Files: make([]*FileGroup, 0)}
+	vs := &ViewSession{
+		Files:         make([]*FileGroup, 0),
+		Findings:      make([]ReviewFinding, 0),
+		SeverityCount: make(map[string]int),
+		CategoryCount: make(map[string]int),
+	}
 	fileIndex := make(map[string]*FileGroup)
 
 	scanner := bufio.NewScanner(f)
@@ -442,7 +462,54 @@ func LoadSession(root, encodedRepo, sessionID string) (*ViewSession, error) {
 				}
 			}
 
-		case "session_end":
+		case "review_item_done", "review_item_reused", "review_item_failed":
+				if comments, ok := rec["comments"].([]any); ok {
+					for _, c := range comments {
+						cm, ok := c.(map[string]any)
+						if !ok {
+							continue
+						}
+						finding := ReviewFinding{}
+						if v, ok := cm["path"].(string); ok {
+							finding.FilePath = v
+						} else if fp, ok := rec["filePath"].(string); ok {
+							finding.FilePath = fp
+						}
+						if v, ok := cm["content"].(string); ok {
+							finding.Content = v
+						}
+						if v, ok := cm["suggestion_code"].(string); ok {
+							finding.SuggestionCode = v
+						}
+						if v, ok := cm["existing_code"].(string); ok {
+							finding.ExistingCode = v
+						}
+						if v, ok := cm["start_line"].(float64); ok {
+							finding.StartLine = int(v)
+						}
+						if v, ok := cm["end_line"].(float64); ok {
+							finding.EndLine = int(v)
+						}
+						if v, ok := cm["category"].(string); ok {
+							finding.Category = v
+						}
+						if v, ok := cm["severity"].(string); ok {
+							finding.Severity = v
+						}
+						if finding.Content == "" && finding.SuggestionCode == "" {
+							continue
+						}
+						vs.Findings = append(vs.Findings, finding)
+						if finding.Severity != "" {
+							vs.SeverityCount[strings.ToLower(finding.Severity)]++
+						}
+						if finding.Category != "" {
+							vs.CategoryCount[strings.ToLower(finding.Category)]++
+						}
+					}
+				}
+
+			case "session_end":
 			if dur, ok := rec["duration_seconds"].(float64); ok {
 				vs.Summary.DurationSec = dur
 			}

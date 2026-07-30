@@ -491,3 +491,203 @@ func TestLoadSession_MultipleTaskTypes(t *testing.T) {
 		t.Errorf("memory_compression_task cards = %d", len(fg.Tasks[MemoryCompressionTask]))
 	}
 }
+
+func TestLoadSession_ReviewItemDone(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeJSONL(t, filepath.Join(repoDir, "sess1.jsonl"),
+		`{"type":"session_start","timestamp":"2025-06-10T08:00:00Z","cwd":"/home/dev/proj","gitBranch":"feat","model":"claude-3","reviewMode":"commit"}`,
+		`{"type":"review_item_done","filePath":"src/api/users.go","comments":[{"path":"src/api/users.go","content":"SQL injection risk","suggestion_code":"const u = await db.user.findUnique({where:{id:sanitize(input)}})","existing_code":"const u = await db.$queryRawUnsafe('SELECT * FROM users WHERE id='+input)","start_line":42,"end_line":42,"category":"security","severity":"critical"}]}`,
+		`{"type":"review_item_done","filePath":"src/ui/List.tsx","comments":[{"path":"src/ui/List.tsx","content":"Missing key prop","suggestion_code":"items.map(i=><li key={i.id}>{i.name}</li>)","existing_code":"items.map(i=><li>{i.name}</li>)","start_line":15,"end_line":17,"category":"bug","severity":"high"},{"path":"src/ui/List.tsx","content":"Use useMemo here","start_line":30,"end_line":30,"category":"performance","severity":"medium"}]}`,
+		`{"type":"review_item_done","filePath":"src/lib/old.ts","comments":[{"path":"src/lib/old.ts","content":"Unused import","start_line":1,"end_line":1,"category":"style","severity":"low"}]}`,
+		`{"type":"session_end","duration_seconds":30,"files_reviewed":["src/api/users.go","src/ui/List.tsx","src/lib/old.ts"],"llm_failures":0}`,
+	)
+
+	vs, err := LoadSession(root, "repo", "sess1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(vs.Findings) != 4 {
+		t.Fatalf("Findings count = %d, want 4", len(vs.Findings))
+	}
+
+	// Finding 1: critical security
+	f := vs.Findings[0]
+	if f.FilePath != "src/api/users.go" {
+		t.Errorf("Findings[0].FilePath = %q", f.FilePath)
+	}
+	if f.Severity != "critical" {
+		t.Errorf("Findings[0].Severity = %q", f.Severity)
+	}
+	if f.Category != "security" {
+		t.Errorf("Findings[0].Category = %q", f.Category)
+	}
+	if f.Content != "SQL injection risk" {
+		t.Errorf("Findings[0].Content = %q", f.Content)
+	}
+	if f.SuggestionCode == "" {
+		t.Error("Findings[0].SuggestionCode should not be empty")
+	}
+	if f.ExistingCode == "" {
+		t.Error("Findings[0].ExistingCode should not be empty")
+	}
+	if f.StartLine != 42 || f.EndLine != 42 {
+		t.Errorf("Findings[0] StartLine/EndLine = %d/%d", f.StartLine, f.EndLine)
+	}
+
+	// Finding 2: high bug
+	f = vs.Findings[1]
+	if f.Severity != "high" || f.Category != "bug" {
+		t.Errorf("Findings[1] = %s/%s, want high/bug", f.Severity, f.Category)
+	}
+
+	// Finding 3: medium performance (no code diff)
+	f = vs.Findings[2]
+	if f.Severity != "medium" || f.Category != "performance" {
+		t.Errorf("Findings[2] = %s/%s, want medium/performance", f.Severity, f.Category)
+	}
+	if f.SuggestionCode != "" || f.ExistingCode != "" {
+		t.Error("Findings[2] should have no code diff")
+	}
+
+	// Finding 4: low style
+	f = vs.Findings[3]
+	if f.Severity != "low" || f.Category != "style" {
+		t.Errorf("Findings[3] = %s/%s, want low/style", f.Severity, f.Category)
+	}
+
+	// Severity and category counts
+	if vs.SeverityCount["critical"] != 1 {
+		t.Errorf("SeverityCount[critical] = %d", vs.SeverityCount["critical"])
+	}
+	if vs.SeverityCount["high"] != 1 {
+		t.Errorf("SeverityCount[high] = %d", vs.SeverityCount["high"])
+	}
+	if vs.SeverityCount["medium"] != 1 {
+		t.Errorf("SeverityCount[medium] = %d", vs.SeverityCount["medium"])
+	}
+	if vs.SeverityCount["low"] != 1 {
+		t.Errorf("SeverityCount[low] = %d", vs.SeverityCount["low"])
+	}
+	if vs.CategoryCount["security"] != 1 {
+		t.Errorf("CategoryCount[security] = %d", vs.CategoryCount["security"])
+	}
+	if vs.CategoryCount["bug"] != 1 {
+		t.Errorf("CategoryCount[bug] = %d", vs.CategoryCount["bug"])
+	}
+	if vs.CategoryCount["performance"] != 1 {
+		t.Errorf("CategoryCount[performance] = %d", vs.CategoryCount["performance"])
+	}
+	if vs.CategoryCount["style"] != 1 {
+		t.Errorf("CategoryCount[style] = %d", vs.CategoryCount["style"])
+	}
+}
+
+func TestLoadSession_ReviewItemReused(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeJSONL(t, filepath.Join(repoDir, "sess1.jsonl"),
+		`{"type":"session_start","timestamp":"2025-06-10T08:00:00Z","cwd":"/home/dev/proj","gitBranch":"feat","model":"claude-3"}`,
+		`{"type":"review_item_reused","filePath":"src/old.go","sourceSessionId":"prev-sess","comments":[{"path":"src/old.go","content":"Reused finding","category":"bug","severity":"high"}]}`,
+		`{"type":"session_end","duration_seconds":1,"files_reviewed":["src/old.go"],"llm_failures":0}`,
+	)
+
+	vs, err := LoadSession(root, "repo", "sess1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(vs.Findings) != 1 {
+		t.Fatalf("Findings count = %d, want 1", len(vs.Findings))
+	}
+	if vs.Findings[0].Content != "Reused finding" {
+		t.Errorf("Content = %q", vs.Findings[0].Content)
+	}
+}
+
+func TestLoadSession_NoFindings(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeJSONL(t, filepath.Join(repoDir, "sess1.jsonl"),
+		`{"type":"session_start","timestamp":"2025-06-10T08:00:00Z","cwd":"/home/dev/proj","gitBranch":"feat","model":"claude-3"}`,
+		`{"type":"session_end","duration_seconds":1,"files_reviewed":[],"llm_failures":0}`,
+	)
+
+	vs, err := LoadSession(root, "repo", "sess1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(vs.Findings) != 0 {
+		t.Errorf("Findings count = %d, want 0", len(vs.Findings))
+	}
+	if len(vs.SeverityCount) != 0 {
+		t.Errorf("SeverityCount should be empty")
+	}
+	if len(vs.CategoryCount) != 0 {
+		t.Errorf("CategoryCount should be empty")
+	}
+}
+
+func TestLoadSession_ReviewItemFailed_WithComments(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeJSONL(t, filepath.Join(repoDir, "sess1.jsonl"),
+		`{"type":"session_start","timestamp":"2025-06-10T08:00:00Z","cwd":"/home/dev/proj","gitBranch":"feat","model":"claude-3","reviewMode":"commit"}`,
+		`{"type":"review_item_failed","filePath":"src/bad.go","error":"400 Bad Request","comments":[{"path":"src/bad.go","content":"N+1 query detected","suggestion_code":"txn.find({include:{posts:true}})","existing_code":"for(user of users){await db.post.find({userId:user.id})}","start_line":10,"end_line":14,"category":"performance","severity":"high"}]}`,
+		`{"type":"review_item_failed","filePath":"src/also_bad.go","error":"timeout","comments":[{"path":"src/also_bad.go","content":"Missing error handling","start_line":5,"end_line":5,"category":"bug","severity":"medium"},{"path":"src/also_bad.go","content":"Hardcoded secret","start_line":20,"end_line":20,"category":"security","severity":"critical"}]}`,
+		`{"type":"session_end","duration_seconds":30,"files_reviewed":["src/bad.go","src/also_bad.go"],"llm_failures":2}`,
+	)
+
+	vs, err := LoadSession(root, "repo", "sess1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(vs.Findings) != 3 {
+		t.Fatalf("Findings count = %d, want 3 (comments from failed files)", len(vs.Findings))
+	}
+
+	// Finding 1: N+1 query from bad.go
+	f := vs.Findings[0]
+	if f.FilePath != "src/bad.go" || f.Severity != "high" || f.Category != "performance" {
+		t.Errorf("Findings[0] = %s/%s/%s, want bad.go/high/performance", f.FilePath, f.Severity, f.Category)
+	}
+
+	// Finding 2: missing error handling from also_bad.go
+	f = vs.Findings[1]
+	if f.Content != "Missing error handling" {
+		t.Errorf("Findings[1].Content = %q", f.Content)
+	}
+
+	// Finding 3: hardcoded secret from also_bad.go
+	f = vs.Findings[2]
+	if f.Content != "Hardcoded secret" || f.Severity != "critical" {
+		t.Errorf("Findings[2] = %s/%s, want Hardcoded secret/critical", f.Content, f.Severity)
+	}
+
+	// Severity counts should include failed findings
+	if vs.SeverityCount["high"] != 1 || vs.SeverityCount["medium"] != 1 || vs.SeverityCount["critical"] != 1 {
+		t.Errorf("SeverityCount h=%d m=%d c=%d", vs.SeverityCount["high"], vs.SeverityCount["medium"], vs.SeverityCount["critical"])
+	}
+	if vs.CategoryCount["performance"] != 1 || vs.CategoryCount["bug"] != 1 || vs.CategoryCount["security"] != 1 {
+		t.Errorf("CategoryCount perf=%d bug=%d sec=%d", vs.CategoryCount["performance"], vs.CategoryCount["bug"], vs.CategoryCount["security"])
+	}
+}

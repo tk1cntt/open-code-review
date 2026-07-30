@@ -1,18 +1,20 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Session Detail - Open Code Review Viewer</title>
+    <title>Review Findings — {{.RepoName}}</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<nav class="breadcrumb"><a href="/">Open Code Review Viewer</a> &rsaquo; <a href="/r/{{.EncodedRepo}}">{{.RepoName}}</a> &rsaquo; Session {{.Session.Summary.SessionID | truncate 12}}</nav>
+<nav class="breadcrumb"><a href="/">Open Code Review Viewer</a> &rsaquo; <a href="/r/{{.EncodedRepo}}">{{.RepoName}}</a> &rsaquo; Findings</nav>
 <main>
+
+<!-- Session Header -->
 <div class="session-header">
-    <h2>Session: {{.Session.Summary.SessionID}}</h2>
+    <h2>Review Findings</h2>
     <div class="meta">
-        <span><strong>CWD:</strong> {{.Session.Summary.CWD}}</span>
+        <span><strong>Session:</strong> {{.Session.Summary.SessionID | truncate 12}}</span>
         <span><strong>Branch:</strong> {{.Session.Summary.GitBranch}}</span>
         <span><strong>Mode:</strong> {{if .Session.Summary.ReviewMode}}{{.Session.Summary.ReviewMode}}{{else}}-{{end}}</span>
         {{if eq .Session.Summary.ReviewMode "range"}}
@@ -28,170 +30,309 @@
     </div>
 </div>
 
-<div class="token-summary">
-    <h3>Token Usage</h3>
-    <div class="token-stats">
-        <div class="token-item">
-            <div class="token-value" title="{{.Session.TokenUsage.TotalPromptTokens}}">{{formatNumber .Session.TokenUsage.TotalPromptTokens}}</div>
-            <div class="token-label">Prompt Tokens</div>
+<!-- Review Summary Dashboard -->
+<div class="review-dashboard">
+    <div class="summary-overview">
+        <div class="summary-total">
+            <div class="summary-big-num">{{len .Session.Findings}}</div>
+            <div class="summary-label">Findings</div>
         </div>
-        <div class="token-item">
-            <div class="token-value" title="{{.Session.TokenUsage.TotalCompletionTokens}}">{{formatNumber .Session.TokenUsage.TotalCompletionTokens}}</div>
-            <div class="token-label">Completion Tokens</div>
+        <div class="summary-total">
+            <div class="summary-big-num">{{.Session.Summary.FileCount}}</div>
+            <div class="summary-label">Files Reviewed</div>
         </div>
-        <div class="token-item">
-            <div class="token-value" title="{{add .Session.TokenUsage.TotalPromptTokens .Session.TokenUsage.TotalCompletionTokens}}">{{formatNumber (add .Session.TokenUsage.TotalPromptTokens .Session.TokenUsage.TotalCompletionTokens)}}</div>
-            <div class="token-label">Total Tokens</div>
+    </div>
+    <div class="summary-breakdown">
+        <div class="summary-section">
+            <div class="summary-section-title">By Severity</div>
+            <div class="summary-tags">
+                {{range severityOrder}}
+                {{$count := index $.Session.SeverityCount .}}
+                {{if $count}}
+                <span class="severity-badge {{severityClass .}} filter-chip" data-filter="severity" data-value="{{.}}">
+                    {{.}} <span class="badge-count">{{$count}}</span>
+                </span>
+                {{end}}
+                {{end}}
+                <span class="filter-chip filter-chip-active" data-filter="severity" data-value="">All</span>
+            </div>
         </div>
-        <div class="token-item">
-            <div class="token-value" title="{{.Session.TokenUsage.RequestCount}}">{{formatNumber .Session.TokenUsage.RequestCount}}</div>
-            <div class="token-label">LLM Requests</div>
+        <div class="summary-section">
+            <div class="summary-section-title">By Category</div>
+            <div class="summary-tags">
+                {{range categoryOrder}}
+                {{$count := index $.Session.CategoryCount .}}
+                {{if $count}}
+                <span class="category-badge filter-chip" data-filter="category" data-value="{{.}}">
+                    {{categoryIcon .}} {{.}} <span class="badge-count">{{$count}}</span>
+                </span>
+                {{end}}
+                {{end}}
+                <span class="filter-chip filter-chip-active" data-filter="category" data-value="">All</span>
+            </div>
         </div>
-        {{if or .Session.TokenUsage.TotalCacheReadTokens .Session.TokenUsage.TotalCacheWriteTokens}}
-        <div class="token-item">
-            <div class="token-value" title="{{.Session.TokenUsage.TotalCacheReadTokens}}">{{formatNumber .Session.TokenUsage.TotalCacheReadTokens}}</div>
-            <div class="token-label">Cache Read</div>
+    </div>
+</div>
+
+<!-- Findings List -->
+<h3>Findings ({{len .Session.Findings}})</h3>
+{{if .Session.Findings}}
+<div class="findings-list" id="findingsList">
+{{range .Session.Findings}}
+<div class="finding-card"
+     data-severity="{{.Severity | lower}}"
+     data-category="{{.Category | lower}}">
+    <div class="finding-header">
+        <div class="finding-header-left">
+            {{if .Severity}}<span class="severity-badge {{severityClass .Severity}}">{{.Severity}}</span>{{end}}
+            {{if .Category}}<span class="category-badge">{{categoryIcon .Category}} {{.Category}}</span>{{end}}
+            <span class="finding-file" title="{{.FilePath}}">{{.FilePath}}</span>
+            {{if or .StartLine .EndLine}}
+            <span class="finding-lines">
+                {{if .StartLine}}L{{.StartLine}}{{end}}
+                {{if .EndLine}}–L{{.EndLine}}{{end}}
+            </span>
+            {{end}}
         </div>
-        <div class="token-item">
-            <div class="token-value" title="{{.Session.TokenUsage.TotalCacheWriteTokens}}">{{formatNumber .Session.TokenUsage.TotalCacheWriteTokens}}</div>
-            <div class="token-label">Cache Write</div>
-        </div>
+    </div>
+    <div class="finding-body">
+        {{if .Content}}
+        <div class="finding-comment response-text">{{.Content}}</div>
         {{end}}
-        {{if .Session.Summary.LLMFailures}}
-        <div class="token-item">
-            <div class="token-value badge-error">{{.Session.Summary.LLMFailures}}</div>
-            <div class="token-label">LLM Failures</div>
+        {{if or .ExistingCode .SuggestionCode}}
+        <div class="diff-container">
+            <div class="diff-pane diff-pane-left">
+                <div class="diff-pane-header">Existing Code</div>
+                <pre class="diff-code"><code>{{.ExistingCode}}</code></pre>
+            </div>
+            <div class="diff-pane diff-pane-right">
+                <div class="diff-pane-header">Suggestion</div>
+                <pre class="diff-code"><code>{{.SuggestionCode}}</code></pre>
+            </div>
         </div>
         {{end}}
     </div>
-    {{with .Session.TokenUsage.FileTokenBreakdown}}
-    <table class="token-table">
-        <thead><tr><th>File</th><th>Prompt</th><th>Completion</th>{{if or $.Session.TokenUsage.TotalCacheReadTokens $.Session.TokenUsage.TotalCacheWriteTokens}}<th>Cache Read</th><th>Cache Write</th>{{end}}<th>Total</th></tr></thead>
-        <tbody>
-        {{range .}}
-            <tr>
-                <td title="{{.FilePath}}">{{.FilePath | truncate 60}}</td>
-                <td title="{{.PromptTokens}}">{{formatNumber .PromptTokens}}</td>
-                <td title="{{.CompletionTokens}}">{{formatNumber .CompletionTokens}}</td>
-                {{if or $.Session.TokenUsage.TotalCacheReadTokens $.Session.TokenUsage.TotalCacheWriteTokens}}<td title="{{.CacheReadTokens}}">{{formatNumber .CacheReadTokens}}</td><td title="{{.CacheWriteTokens}}">{{formatNumber .CacheWriteTokens}}</td>{{end}}
-                <td title="{{add .PromptTokens .CompletionTokens}}"><strong>{{formatNumber (add .PromptTokens .CompletionTokens)}}</strong></td>
-            </tr>
-        {{end}}
-        </tbody>
-    </table>
-    {{end}}
 </div>
-
-{{if .Session.Summary.FilesReviewed}}
-<h3>Files Reviewed</h3>
-<ul class="file-list">
-{{range .Session.Summary.FilesReviewed}}
-    <li>{{.}}</li>
 {{end}}
-</ul>
+</div>
+<div class="no-findings-msg" id="noFindingsMsg" style="display:none">
+    <p>No findings match the current filter.</p>
+</div>
+{{else}}
+<div class="empty-state">
+    <p>No review findings in this session. The LLM did not flag any issues, or findings were not recorded.</p>
+</div>
 {{end}}
 
-<h3>Conversations ({{len .Session.Files}} files)</h3>
-<div class="conversations">
-{{range .Session.Files}}
-<details class="file-accordion">
-    <summary class="file-accordion-header">
+<!-- Token Usage (collapsed) -->
+<details class="section-collapse">
+    <summary class="section-collapse-header">
         <span class="chevron"></span>
-        <span class="file-path">{{.FilePath}}</span>
-        <span class="file-count-badge">{{cardCount .Tasks}} requests</span>
+        <span>Token Usage &amp; Stats</span>
     </summary>
-    <div class="file-accordion-body">
-        {{range $tg := orderedTasks .Tasks}}
-        <div class="task-group {{taskTypeClass $tg.Type}}">
-            <h4 class="task-type-label">
-                <span class="task-type-dot"></span>
-                {{$tg.Type}}
-            </h4>
-            {{range $tg.Cards}}
-            <div class="card">
-                <div class="card-header">
-                    <span class="request-label">Request #{{.RequestNo}}</span>
-                    {{if .Model}}<span class="badge badge-model">{{.Model}}</span>{{end}}
-                    {{if or .PromptTokens .CompletionTokens}}<span class="badge badge-tokens">P:<span title="{{.PromptTokens}}">{{formatNumber .PromptTokens}}</span> C:<span title="{{.CompletionTokens}}">{{formatNumber .CompletionTokens}}</span>{{if or .CacheReadTokens .CacheWriteTokens}} CR:<span title="{{.CacheReadTokens}}">{{formatNumber .CacheReadTokens}}</span> CW:<span title="{{.CacheWriteTokens}}">{{formatNumber .CacheWriteTokens}}</span>{{end}}</span>{{end}}
-                    {{if .DurationMs}}<span class="badge badge-duration">{{.DurationMs}}ms</span>{{end}}
-                    {{if .Error}}<span class="badge badge-error">{{.Error}}</span>{{end}}
+    <div class="section-collapse-body">
+        <div class="token-summary">
+            <div class="token-stats">
+                <div class="token-item">
+                    <div class="token-value" title="{{.Session.TokenUsage.TotalPromptTokens}}">{{formatNumber .Session.TokenUsage.TotalPromptTokens}}</div>
+                    <div class="token-label">Prompt Tokens</div>
                 </div>
-                {{with .ResponseContent}}
-                <div class="card-body response-content">
-                    <div class="response-text">{{.}}</div>
+                <div class="token-item">
+                    <div class="token-value" title="{{.Session.TokenUsage.TotalCompletionTokens}}">{{formatNumber .Session.TokenUsage.TotalCompletionTokens}}</div>
+                    <div class="token-label">Completion Tokens</div>
+                </div>
+                <div class="token-item">
+                    <div class="token-value" title="{{add .Session.TokenUsage.TotalPromptTokens .Session.TokenUsage.TotalCompletionTokens}}">{{formatNumber (add .Session.TokenUsage.TotalPromptTokens .Session.TokenUsage.TotalCompletionTokens)}}</div>
+                    <div class="token-label">Total Tokens</div>
+                </div>
+                <div class="token-item">
+                    <div class="token-value" title="{{.Session.TokenUsage.RequestCount}}">{{formatNumber .Session.TokenUsage.RequestCount}}</div>
+                    <div class="token-label">LLM Requests</div>
+                </div>
+                {{if or .Session.TokenUsage.TotalCacheReadTokens .Session.TokenUsage.TotalCacheWriteTokens}}
+                <div class="token-item">
+                    <div class="token-value" title="{{.Session.TokenUsage.TotalCacheReadTokens}}">{{formatNumber .Session.TokenUsage.TotalCacheReadTokens}}</div>
+                    <div class="token-label">Cache Read</div>
+                </div>
+                <div class="token-item">
+                    <div class="token-value" title="{{.Session.TokenUsage.TotalCacheWriteTokens}}">{{formatNumber .Session.TokenUsage.TotalCacheWriteTokens}}</div>
+                    <div class="token-label">Cache Write</div>
                 </div>
                 {{end}}
-                {{if .ToolCalls}}
-                <div class="tool-calls-section">
-                    <div class="tool-calls-label">Tool Calls ({{len .ToolCalls}})</div>
-                    {{range .ToolCalls}}
-                    <div class="tool-call-item {{if not .Ok}}tool-call-error{{end}}">
-                        <div class="tool-call-header">
-                            <span class="tool-icon">&#9881;</span>
-                            <strong class="tool-name">{{.Name}}</strong>
+                {{if .Session.Summary.LLMFailures}}
+                <div class="token-item">
+                    <div class="token-value badge-error">{{.Session.Summary.LLMFailures}}</div>
+                    <div class="token-label">LLM Failures</div>
+                </div>
+                {{end}}
+            </div>
+            {{with .Session.TokenUsage.FileTokenBreakdown}}
+            <table class="token-table">
+                <thead><tr><th>File</th><th>Prompt</th><th>Completion</th>{{if or $.Session.TokenUsage.TotalCacheReadTokens $.Session.TokenUsage.TotalCacheWriteTokens}}<th>Cache Read</th><th>Cache Write</th>{{end}}<th>Total</th></tr></thead>
+                <tbody>
+                {{range .}}
+                    <tr>
+                        <td title="{{.FilePath}}">{{.FilePath | truncate 60}}</td>
+                        <td title="{{.PromptTokens}}">{{formatNumber .PromptTokens}}</td>
+                        <td title="{{.CompletionTokens}}">{{formatNumber .CompletionTokens}}</td>
+                        {{if or $.Session.TokenUsage.TotalCacheReadTokens $.Session.TokenUsage.TotalCacheWriteTokens}}<td title="{{.CacheReadTokens}}">{{formatNumber .CacheReadTokens}}</td><td title="{{.CacheWriteTokens}}">{{formatNumber .CacheWriteTokens}}</td>{{end}}
+                        <td title="{{add .PromptTokens .CompletionTokens}}"><strong>{{formatNumber (add .PromptTokens .CompletionTokens)}}</strong></td>
+                    </tr>
+                {{end}}
+                </tbody>
+            </table>
+            {{end}}
+        </div>
+    </div>
+</details>
+
+<!-- LLM Conversations (collapsed) -->
+<details class="section-collapse">
+    <summary class="section-collapse-header">
+        <span class="chevron"></span>
+        <span>LLM Conversations ({{len .Session.Files}} files)</span>
+    </summary>
+    <div class="section-collapse-body">
+        <div class="conversations">
+        {{range .Session.Files}}
+        <details class="file-accordion">
+            <summary class="file-accordion-header">
+                <span class="chevron"></span>
+                <span class="file-path">{{.FilePath}}</span>
+                <span class="file-count-badge">{{cardCount .Tasks}} requests</span>
+            </summary>
+            <div class="file-accordion-body">
+                {{range $tg := orderedTasks .Tasks}}
+                <div class="task-group {{taskTypeClass $tg.Type}}">
+                    <h4 class="task-type-label">
+                        <span class="task-type-dot"></span>
+                        {{$tg.Type}}
+                    </h4>
+                    {{range $tg.Cards}}
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="request-label">Request #{{.RequestNo}}</span>
+                            {{if .Model}}<span class="badge badge-model">{{.Model}}</span>{{end}}
+                            {{if or .PromptTokens .CompletionTokens}}<span class="badge badge-tokens">P:<span title="{{.PromptTokens}}">{{formatNumber .PromptTokens}}</span> C:<span title="{{.CompletionTokens}}">{{formatNumber .CompletionTokens}}</span>{{if or .CacheReadTokens .CacheWriteTokens}} CR:<span title="{{.CacheReadTokens}}">{{formatNumber .CacheReadTokens}}</span> CW:<span title="{{.CacheWriteTokens}}">{{formatNumber .CacheWriteTokens}}</span>{{end}}</span>{{end}}
                             {{if .DurationMs}}<span class="badge badge-duration">{{.DurationMs}}ms</span>{{end}}
-                            {{if not .Ok}}<span class="badge badge-error">Failed</span>{{end}}
+                            {{if .Error}}<span class="badge badge-error">{{.Error}}</span>{{end}}
                         </div>
-                        <details class="tool-detail">
-                            <summary class="tool-detail-toggle">
-                                <span class="chevron-sm"></span>
-                                <span>Show Details</span>
-                            </summary>
-                            <div class="tool-detail-body">
-                                <div class="tool-section">
-                                    <div class="tool-section-label">Arguments</div>
-                                    <pre>{{.Arguments}}</pre>
+                        {{with .ResponseContent}}
+                        <div class="card-body response-content">
+                            <div class="response-text">{{.}}</div>
+                        </div>
+                        {{end}}
+                        {{if .ToolCalls}}
+                        <div class="tool-calls-section">
+                            <div class="tool-calls-label">Tool Calls ({{len .ToolCalls}})</div>
+                            {{range .ToolCalls}}
+                            <div class="tool-call-item {{if not .Ok}}tool-call-error{{end}}">
+                                <div class="tool-call-header">
+                                    <span class="tool-icon">&#9881;</span>
+                                    <strong class="tool-name">{{.Name}}</strong>
+                                    {{if .DurationMs}}<span class="badge badge-duration">{{.DurationMs}}ms</span>{{end}}
+                                    {{if not .Ok}}<span class="badge badge-error">Failed</span>{{end}}
                                 </div>
-                                {{if .Result}}
-                                <div class="tool-section">
-                                    <div class="tool-section-label">Result</div>
-                                    <pre>{{.Result}}</pre>
-                                </div>
-                                {{end}}
+                                <details class="tool-detail">
+                                    <summary class="tool-detail-toggle">
+                                        <span class="chevron-sm"></span>
+                                        <span>Show Details</span>
+                                    </summary>
+                                    <div class="tool-detail-body">
+                                        <div class="tool-section">
+                                            <div class="tool-section-label">Arguments</div>
+                                            <pre>{{.Arguments}}</pre>
+                                        </div>
+                                        {{if .Result}}
+                                        <div class="tool-section">
+                                            <div class="tool-section-label">Result</div>
+                                            <pre>{{.Result}}</pre>
+                                        </div>
+                                        {{end}}
+                                    </div>
+                                </details>
                             </div>
-                        </details>
+                            {{end}}
+                        </div>
+                        {{end}}
                     </div>
                     {{end}}
                 </div>
                 {{end}}
             </div>
-            {{end}}
-        </div>
+        </details>
         {{end}}
+        </div>
     </div>
 </details>
-{{end}}
-</div>
+
+</main>
 
 <script>
-document.querySelectorAll('.response-text').forEach(function(el) {
-    var text = el.textContent;
-    var esc = function(s) {
-        return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-    };
-    var codeBlocks = [];
-    var html = esc(text);
-    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, function(_, lang, code) {
-        codeBlocks.push(code.replace(/^\n|\n$/g, ''));
-        return '%%CODEBLOCK_' + (codeBlocks.length - 1) + '%%';
+(function() {
+    // Markdown rendering for response text
+    document.querySelectorAll('.response-text').forEach(function(el) {
+        var text = el.textContent;
+        var esc = function(s) {
+            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        };
+        var codeBlocks = [];
+        var html = esc(text);
+        html = html.replace(/```(\w*)\n([\s\S]*?)```/g, function(_, lang, code) {
+            codeBlocks.push(code.replace(/^\n|\n$/g, ''));
+            return '%%CODEBLOCK_' + (codeBlocks.length - 1) + '%%';
+        });
+        html = html
+            .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
+            .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+            .replace(/^### (.+)$/gm, '<div class="md-h3">$1</div>')
+            .replace(/^## (.+)$/gm, '<div class="md-h2">$1</div>')
+            .replace(/^# (.+)$/gm, '<div class="md-h1">$1</div>')
+            .replace(/^[-*] (.+)$/gm, '<div class="md-li">&bull; $1</div>')
+            .replace(/\n{2,}/g, '<br><br>')
+            .replace(/\n/g, '<br>');
+        codeBlocks.forEach(function(code, i) {
+            html = html.replace('%%CODEBLOCK_' + i + '%%',
+                '<pre class="code-block"><code>' + code + '</code></pre>');
+        });
+        el.innerHTML = html;
     });
-    html = html
-        .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
-        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-        .replace(/^### (.+)$/gm, '<div class="md-h3">$1</div>')
-        .replace(/^## (.+)$/gm, '<div class="md-h2">$1</div>')
-        .replace(/^# (.+)$/gm, '<div class="md-h1">$1</div>')
-        .replace(/^[-*] (.+)$/gm, '<div class="md-li">&bull; $1</div>')
-        .replace(/\n{2,}/g, '<br><br>')
-        .replace(/\n/g, '<br>');
-    codeBlocks.forEach(function(code, i) {
-        html = html.replace('%%CODEBLOCK_' + i + '%%',
-            '<pre class="code-block"><code>' + code + '</code></pre>');
+
+    // Filter chips for severity / category
+    var activeFilters = { severity: '', category: '' };
+
+    function applyFilters() {
+        var cards = document.querySelectorAll('.finding-card');
+        var visibleCount = 0;
+        cards.forEach(function(card) {
+            var match = true;
+            if (activeFilters.severity && card.dataset.severity !== activeFilters.severity) match = false;
+            if (activeFilters.category && card.dataset.category !== activeFilters.category) match = false;
+            card.style.display = match ? '' : 'none';
+            if (match) visibleCount++;
+        });
+        var msg = document.getElementById('noFindingsMsg');
+        if (msg) msg.style.display = visibleCount === 0 ? '' : 'none';
+    }
+
+    document.querySelectorAll('.filter-chip').forEach(function(chip) {
+        chip.addEventListener('click', function() {
+            var filterType = this.dataset.filter;
+            var filterValue = this.dataset.value;
+
+            // Update active state
+            document.querySelectorAll('.filter-chip[data-filter="' + filterType + '"]').forEach(function(c) {
+                c.classList.remove('filter-chip-active');
+            });
+            this.classList.add('filter-chip-active');
+
+            // Update filter
+            activeFilters[filterType] = filterValue;
+            applyFilters();
+        });
     });
-    el.innerHTML = html;
-});
+})();
 </script>
-</main>
 </body>
 </html>

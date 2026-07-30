@@ -6,18 +6,36 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/alibaba/open-code-review/internal/reviewstore"
 )
 
 //go:embed templates/*.html static/style.css
 var assets embed.FS
 
+// ServerOptions configures the viewer HTTP server.
+type ServerOptions struct {
+	Addr       string
+	ReviewsDir string
+}
+
 func StartServer(addr string) error {
+	return StartServerWithOptions(ServerOptions{Addr: addr})
+}
+
+func StartServerWithOptions(opts ServerOptions) error {
 	root, err := SessionsRoot()
 	if err != nil {
 		return fmt.Errorf("resolve sessions root: %w", err)
+	}
+
+	reviewsRoot := opts.ReviewsDir
+	if reviewsRoot == "" {
+		reviewsRoot = os.Getenv("OCR_REVIEWS_DIR")
 	}
 
 	mux := http.NewServeMux()
@@ -31,7 +49,7 @@ func StartServer(addr string) error {
 	})
 	mux.HandleFunc("/r/{repo}", func(w http.ResponseWriter, r *http.Request) {
 		repo := r.PathValue("repo")
-		if strings.Contains(repo, "..") || strings.Contains(repo, "/") {
+		if !isValidPathSegment(repo) {
 			http.Error(w, "invalid repo path", http.StatusBadRequest)
 			return
 		}
@@ -40,26 +58,50 @@ func StartServer(addr string) error {
 	mux.HandleFunc("/r/{repo}/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
 		repo := r.PathValue("repo")
 		sid := r.PathValue("sessionID")
-		if strings.Contains(repo, "..") || strings.Contains(sid, "..") {
+		if !isValidPathSegment(repo) || !isValidPathSegment(sid) {
 			http.Error(w, "invalid path", http.StatusBadRequest)
 			return
 		}
 		handleSession(w, r, root, repo, sid)
 	})
 
+	// JSON API for review results
+	if reviewsRoot != "" {
+		mux.HandleFunc("/api/reviews", func(w http.ResponseWriter, r *http.Request) {
+			handleAPIReviews(w, r, reviewsRoot)
+		})
+		mux.HandleFunc("/api/reviews/{project}", func(w http.ResponseWriter, r *http.Request) {
+			project := r.PathValue("project")
+			if !isValidPathSegment(project) {
+				writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid project"))
+				return
+			}
+			handleAPIProjectReviews(w, r, reviewsRoot, project)
+		})
+		mux.HandleFunc("/api/reviews/{project}/{reviewID}", func(w http.ResponseWriter, r *http.Request) {
+			project := r.PathValue("project")
+			reviewID := r.PathValue("reviewID")
+			if !isValidPathSegment(project) || !isValidPathSegment(reviewID) {
+				writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid path"))
+				return
+			}
+			handleAPIReviewDetail(w, r, reviewsRoot, project, reviewID)
+		})
+	}
+
 	// Wrap the mux with a Host-header allowlist. Without this, any web page
 	// the user visits can DNS-rebind its origin to 127.0.0.1 and read the
 	// session JSONL exposed by this viewer (which contains LLM request bodies
 	// = source code being reviewed and the LLM's analysis of it).
-	allowed := resolveAllowedHostsFromEnv(addr)
+	allowed := resolveAllowedHostsFromEnv(opts.Addr)
 	guarded := hostGuard(allowed, mux)
 
 	srv := &http.Server{
-		Addr:    addr,
+		Addr:    opts.Addr,
 		Handler: guarded,
 	}
 
-	fmt.Printf("\nOpen browser: http://%s\n", addr)
+	fmt.Printf("\nOpen browser: http://%s\n", opts.Addr)
 	return srv.ListenAndServe()
 }
 
@@ -70,6 +112,12 @@ var cstZone = func() *time.Location {
 	}
 	return loc
 }()
+
+// isValidPathSegment delegates to reviewstore.IsSafePathSegment so the
+// HTTP-layer validation stays consistent with the store-layer validation.
+func isValidPathSegment(segment string) bool {
+	return reviewstore.IsSafePathSegment(segment)
+}
 
 func formatTime(t time.Time) string {
 	return t.In(cstZone).Format("2006-01-02 15:04")
@@ -82,6 +130,7 @@ func parseTemplate(name string) (*template.Template, error) {
 		"truncate":       truncateText,
 		"formatNumber":   formatNumber,
 		"add":            func(a, b int) int { return a + b },
+		"lower":          strings.ToLower,
 		"cardCount": func(tasks map[TaskType][]*TaskCard) int {
 			n := 0
 			for _, cards := range tasks {
@@ -102,6 +151,46 @@ func parseTemplate(name string) (*template.Template, error) {
 			default:
 				return "task-default"
 			}
+		},
+		"severityClass": func(s string) string {
+			switch strings.ToLower(s) {
+			case "critical":
+				return "severity-critical"
+			case "high":
+				return "severity-high"
+			case "medium":
+				return "severity-medium"
+			case "low":
+				return "severity-low"
+			default:
+				return "severity-low"
+			}
+		},
+		"categoryIcon": func(c string) string {
+			switch strings.ToLower(c) {
+			case "bug":
+				return "\U0001F41B"
+			case "security":
+				return "\U0001F512"
+			case "performance":
+				return "⚡"
+			case "maintainability":
+				return "\U0001F527"
+			case "test":
+				return "✅"
+			case "style":
+				return "\U0001F3A8"
+			case "documentation":
+				return "\U0001F4DA"
+			default:
+				return "\U0001F4DD"
+			}
+		},
+		"severityOrder": func() []string {
+			return []string{"critical", "high", "medium", "low"}
+		},
+		"categoryOrder": func() []string {
+			return []string{"bug", "security", "performance", "maintainability", "test", "style", "documentation"}
 		},
 		"orderedTasks": func(tasks map[TaskType][]*TaskCard) []struct {
 			Type  TaskType

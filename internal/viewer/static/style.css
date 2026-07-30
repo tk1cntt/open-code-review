@@ -546,3 +546,399 @@ h3 { margin: 1.5rem 0 0.75rem; color: var(--text-strong); }
 }
 
 p { color: var(--text-muted); padding: 1rem 0; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Review Dashboard
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.review-dashboard {
+    background: var(--surface);
+    border-radius: 8px;
+    padding: 1.25rem;
+    margin-bottom: 1.5rem;
+    box-shadow: var(--shadow);
+    border: 1px solid var(--border);
+}
+
+.summary-overview {
+    display: flex;
+    gap: 2rem;
+    margin-bottom: 1rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--border-light);
+}
+
+.summary-total {
+    text-align: center;
+}
+
+.summary-big-num {
+    font-size: 2.2rem;
+    font-weight: 700;
+    color: var(--accent);
+    line-height: 1.2;
+}
+
+.summary-label {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.summary-breakdown {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.summary-section-title {
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    letter-spacing: 0.05em;
+    margin-bottom: 0.35rem;
+}
+
+.summary-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    align-items: center;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Filter Chips
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.filter-chip {
+    cursor: pointer;
+    padding: 0.2em 0.6em;
+    border-radius: 12px;
+    font-size: 0.78rem;
+    font-weight: 500;
+    border: 1.5px solid transparent;
+    transition: all 0.15s;
+    user-select: none;
+    opacity: 0.65;
+}
+
+.filter-chip:hover {
+    opacity: 1;
+    transform: translateY(-1px);
+}
+
+.filter-chip-active {
+    opacity: 1 !important;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+}
+
+.badge-count {
+    display: inline-block;
+    background: rgba(0,0,0,0.08);
+    border-radius: 8px;
+    padding: 0 0.35em;
+    font-size: 0.75em;
+    font-weight: 600;
+    margin-left: 0.15em;
+    min-width: 1.2em;
+    text-align: center;
+}
+
+@media (prefers-color-scheme: dark) {
+    .badge-count {
+        background: rgba(255,255,255,0.1);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Severity Badges
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.severity-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.15em;
+    padding: 0.2em 0.65em;
+    border-radius: 12px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+}
+
+.severity-critical {
+    background: #ffebe9;
+    color: #cf222e;
+}
+.severity-high {
+    background: #fff3e0;
+    color: #e65100;
+}
+.severity-medium {
+    background: #fff8e1;
+    color: #8d6e00;
+}
+.severity-low {
+    background: #e8ecf1;
+    color: #57606a;
+}
+
+@media (prefers-color-scheme: dark) {
+    .severity-critical {
+        background: rgba(248,81,73,0.18);
+        color: #ff7b72;
+    }
+    .severity-high {
+        background: rgba(255,152,0,0.18);
+        color: #ffa726;
+    }
+    .severity-medium {
+        background: rgba(255,193,7,0.15);
+        color: #ffca28;
+    }
+    .severity-low {
+        background: rgba(139,148,158,0.15);
+        color: #adbac7;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Category Badges
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.category-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2em;
+    padding: 0.2em 0.65em;
+    border-radius: 12px;
+    font-size: 0.72rem;
+    font-weight: 500;
+    background: var(--badge-model-bg);
+    color: var(--badge-model-fg);
+    white-space: nowrap;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Findings List
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.findings-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.finding-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+    transition: box-shadow 0.15s;
+}
+
+.finding-card:hover {
+    box-shadow: var(--shadow-hover);
+}
+
+.finding-header {
+    padding: 0.65rem 1rem;
+    border-bottom: 1px solid var(--border-light);
+    background: var(--surface-alt);
+}
+
+.finding-header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.finding-file {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-strong);
+    word-break: break-all;
+}
+
+.finding-lines {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    background: var(--code-bg);
+    padding: 0.1em 0.45em;
+    border-radius: 4px;
+    white-space: nowrap;
+}
+
+.finding-body {
+    padding: 0;
+}
+
+.finding-comment {
+    padding: 0.85rem 1rem;
+    font-size: 0.88rem;
+    line-height: 1.65;
+    color: var(--text-strong);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Diff View (side-by-side)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.diff-container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    border-top: 1px solid var(--border);
+    min-height: 0;
+}
+
+.diff-pane {
+    min-width: 0;
+    overflow: hidden;
+}
+
+.diff-pane-left {
+    border-right: 1px solid var(--border);
+}
+
+.diff-pane-header {
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    padding: 0.35rem 0.75rem;
+    background: var(--surface-alt2);
+    border-bottom: 1px solid var(--border-light);
+}
+
+.diff-pane-right .diff-pane-header {
+    color: #116329;
+}
+
+.diff-code {
+    margin: 0;
+    padding: 0.6rem 0.8rem;
+    font-size: 0.8rem;
+    line-height: 1.55;
+    overflow-x: auto;
+    white-space: pre;
+    max-height: 350px;
+    overflow-y: auto;
+    color: var(--text-strong);
+    background: none;
+    border: none;
+    border-radius: 0;
+}
+
+.diff-pane-left .diff-code {
+    background: rgba(207,34,46,0.04);
+}
+
+.diff-pane-right .diff-code {
+    background: rgba(17,99,41,0.04);
+}
+
+@media (prefers-color-scheme: dark) {
+    .diff-pane-right .diff-pane-header {
+        color: #7ee787;
+    }
+    .diff-pane-left .diff-code {
+        background: rgba(248,81,73,0.06);
+    }
+    .diff-pane-right .diff-code {
+        background: rgba(46,160,67,0.06);
+    }
+}
+
+@media (max-width: 700px) {
+    .diff-container {
+        grid-template-columns: 1fr;
+    }
+    .diff-pane-left {
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Section Collapse (Token Usage + LLM Conversations)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.section-collapse {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-top: 1rem;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+}
+
+.section-collapse-header {
+    cursor: pointer;
+    padding: 0.75rem 1rem;
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--text-strong);
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    list-style: none;
+    transition: background 0.15s;
+}
+
+.section-collapse-header::-webkit-details-marker { display: none; }
+.section-collapse-header::marker { display: none; content: ""; }
+
+.section-collapse-header:hover {
+    background: var(--accent-soft);
+}
+
+.section-collapse[open] > .section-collapse-header {
+    border-bottom: 1px solid var(--border);
+}
+
+.section-collapse-body {
+    padding: 1rem;
+}
+
+/* Nested token-summary inside collapse — remove outer card style */
+.section-collapse .token-summary {
+    background: none;
+    border-radius: 0;
+    padding: 0;
+    margin-bottom: 0;
+    box-shadow: none;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Empty State
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.empty-state {
+    text-align: center;
+    padding: 3rem 1rem;
+    background: var(--surface);
+    border-radius: 8px;
+    border: 1px dashed var(--border);
+}
+
+.empty-state p {
+    color: var(--text-muted);
+    font-size: 0.95rem;
+}
+
+.no-findings-msg p {
+    text-align: center;
+    color: var(--text-muted);
+    padding: 1.5rem;
+    font-size: 0.9rem;
+}
