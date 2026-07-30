@@ -15,7 +15,7 @@ compatibility: >
 metadata:
   author: alibaba
   homepage: https://github.com/alibaba/open-code-review
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Open Code Review — Delegation Mode
@@ -95,8 +95,11 @@ For each reviewable file:
 1. Get its diff (Step 3)
 2. Consult its Rule Group (from Step 2) for the review checklist
 3. Conduct a thorough review, using appropriate context tools as needed
+4. Record findings in structured format (Step 5)
 
-### Step 5: Format Output
+### Step 5: Save and Format Output
+
+**Save results as JSON** to `<repo>/.opencodereview/reviews/<project-key>/<review-id>.json` so they can be consumed by subsequent fix steps and the viewer.
 
 Each comment must follow this structure:
 
@@ -106,25 +109,57 @@ Each comment must follow this structure:
 | content | string | yes | Review comment describing the issue |
 | start_line | integer | no | Start line in the new file |
 | end_line | integer | no | End line in the new file |
-| category | enum | no | bug, security, performance, maintainability, test, style, documentation, other |
 | severity | enum | no | critical, high, medium, low |
+| category | enum | no | bug, security, performance, maintainability, test, style, documentation, other |
+| suggestion_code | string | no | Suggested fix code |
+| existing_code | string | no | Original code snippet |
 
 ### Step 6: Classify and Report
 
 Group findings by severity:
 
-- **Critical/High**: Bugs, security issues, data loss risks — always report
-- **Medium**: Performance concerns, error handling gaps, maintainability issues — report with context
-- **Low**: Style nits, minor suggestions — report only if clearly valuable
+- **Critical/High**: Bugs, security issues, data loss risks — **must fix**, always report
+- **Medium**: Performance concerns, error handling gaps, maintainability issues — **fix if clear**, report with context
+- **Low**: Style nits, minor suggestions — **skip silently** unless clearly valuable
 
-Discard likely false positives silently.
+### Step 7: Fix Issues
 
-### Step 7: Fix (Optional)
+Check whether the user requested automatic fixes:
 
-If the user requested "review and fix":
-- Apply High/Critical fixes directly
-- Describe Medium fixes that require manual intervention
-- Skip Low-priority items unless trivial
+- If the user explicitly said "review and fix" or similar → proceed with automatic fixes
+- If the user only said "review" → ask for permission before applying any changes
+
+**Fix process:**
+
+1. Read the saved JSON results from Step 5
+2. Start with Critical/High items:
+   - If `suggestion_code` is present → apply directly
+   - If line numbers are provided → navigate to that location and fix
+   - If line numbers are 0 → search the file for the described code
+3. Then fix Medium items where the fix is clear-cut
+4. Skip Low items
+5. Run build/verification after each batch of fixes: `go build ./...` or equivalent
+6. Report: which fixes were applied, which need manual follow-up
+
+### Step 8: Re-review After Fixes
+
+After applying fixes, re-review the changed files to verify fixes resolved the issues:
+
+1. Re-run Steps 1-4 for the changed files only (use `git diff` to identify what changed)
+2. Compare new findings against the saved JSON from the first pass
+3. Verify previously reported issues are resolved
+4. Flag any new issues introduced by the fixes
+
+### Step 9: Iterate Until Clean
+
+```
+Review → Save JSON → Classify → Fix → Re-review → Repeat
+```
+
+Stop when:
+- No Critical/High issues remain
+- Only Medium issues that require human judgment remain
+- All fixes pass `go build` or equivalent
 
 ## Sub-commands Reference
 
@@ -146,6 +181,23 @@ If the user requested "review and fix":
 | `-b, --background <text>` | Business context |
 | `-B, --background-file <path>` | Business context from Markdown file |
 
+## Save Results Convention
+
+In delegation mode, always save review results to `<repo>/.opencodereview/reviews/` as JSON. This enables:
+
+- **Fix loop**: agent reads JSON → fixes → re-reviews → compares with old JSON
+- **Viewer**: results are browseable via `ocr viewer`
+- **CI/CD**: artifacts can be published and analyzed over time
+
+Directory structure:
+```
+<repo>/.opencodereview/reviews/
+└── <project-key>/
+    └── <timestamp-or-uuid>.json
+```
+
+Each JSON file should use the same schema as OCR's built-in `--save-result` output (see Step 5 for field reference).
+
 ## Gotchas
 
 - **No LLM needed on OCR side** — delegation mode never calls an LLM. All intelligence comes from the host agent.
@@ -153,3 +205,5 @@ If the user requested "review and fix":
 - **Working directory matters** — `ocr delegate` operates on the Git repo at the current directory. Use `--repo /path` to override.
 - **Untracked files in workspace mode** — `preview` includes untracked files. For these, read the file directly instead of using `git diff`.
 - **Background context** — pass `--background` to `preview` when you have requirement context; it appears in the output for your reference during review.
+- **Always save JSON results** — the fix loop depends on structured data. Don't rely on terminal output alone.
+- **Use the JSON for the fix loop** — read `path`, `start_line`, `end_line`, `suggestion_code`, `severity` fields to apply precise fixes.

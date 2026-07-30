@@ -16,7 +16,7 @@ compatibility: >
 metadata:
   author: alibaba
   homepage: https://github.com/alibaba/open-code-review
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Open Code Review
@@ -77,6 +77,8 @@ Run the OCR command with appropriate flags. **Always pass business context via `
 ocr review --audience agent --background "business context here" [user-args]
 ```
 
+**`--save-result` is enabled by default.** Results are automatically persisted to `<repo>/.opencodereview/reviews/<project-key>/<review-id>.json`.
+
 **Argument handling:**
 
 - **Background context** (RECOMMENDED): use `--background "context"` or `-b "context"` to provide business context for better review quality
@@ -86,6 +88,7 @@ ocr review --audience agent --background "business context here" [user-args]
 - **Timeout**: default timeout is 10 minutes per file; adjust with `--timeout <minutes>`
 - **Concurrency**: default concurrency is 8 file workers; reduce with `--concurrency <n>` if rate limits are hit
 - **Preview mode**: use `--preview` or `-p` to preview which files will be reviewed without running the LLM
+- **Resume**: use `--resume <session-id>` to reuse completed results and retry failed files from a previous session
 - **Installation**: if `ocr` command is not found, install it by running `npm i -g @alibaba-group/open-code-review`
 
 **Common invocation patterns:**
@@ -101,29 +104,87 @@ ocr review --audience agent --background "business context here" [user-args]
 
 - Always use `--audience agent` to suppress progress UI and emit only the final summary
 
-### Step 3: Classify and Report
+### Step 3: Read Structured Review Results
 
-For each comment from the review output, classify by priority and report all issues to the user:
+After the review completes, the result JSON is saved at `<repo>/.opencodereview/reviews/`. The terminal output will show the exact path:
 
-- **High**: Obvious bugs, security issues, clear mistakes, or well-founded suggestions with precise fix proposals
-- **Medium**: Reasonable concerns but context-dependent, style/performance suggestions, or fixes that require manual implementation
-- **Low**: Likely false positives, lacking sufficient context, nitpicks, or meaningless suggestions
+```
+[ocr] Review result saved to: /path/to/.opencodereview/reviews/<project-key>/<review-id>.json
+```
 
-Report all comments grouped by priority level.
+**Read the JSON file** to get structured review data:
 
-### Step 4: Fix
+```bash
+cat .opencodereview/reviews/<project-key>/<review-id>.json
+```
 
-Before applying fixes, check whether the user requested automatic fixes:
+Each comment in the JSON contains:
 
-- If the user explicitly requested "review and fix" or similar, proceed with automatic fixes
-- If the user only requested "review" without fix intent, ask for permission before applying any changes
+| Field | Description |
+|-------|-------------|
+| `path` | Relative file path |
+| `content` | Review comment describing the issue |
+| `start_line` / `end_line` | Line range of the issue (0 means positioning failed) |
+| `suggestion_code` | Optional fix suggestion code |
+| `existing_code` | Optional original code snippet |
+| `severity` | `critical`, `high`, `medium`, or `low` |
+| `category` | `bug`, `security`, `performance`, `maintainability`, `test`, `style`, `documentation` |
+| `thinking` | Optional LLM reasoning |
 
-When fixing issues and suggestions:
+Also note the `review.session_id` field — save this for the `--resume` flag in Step 5.
 
-- Focus on High and Medium priority items
-- Apply fixes directly to the code when safe and well-defined
-- For complex fixes requiring manual intervention, clearly describe what needs to be done
-- Always verify fixes with the user before committing
+### Step 4: Classify and Prioritize
+
+For each comment from the JSON, classify by priority:
+
+- **Critical/High**: Obvious bugs, security issues, clear mistakes, or well-founded suggestions with precise fix proposals — **must fix**
+- **Medium**: Reasonable concerns but context-dependent, style/performance suggestions, or fixes that require manual implementation — **fix if clear**
+- **Low**: Likely false positives, lacking sufficient context, nitpicks, or meaningless suggestions — **skip silently**
+
+Report all actionable findings grouped by file and priority before applying fixes.
+
+### Step 5: Fix Issues
+
+Check whether the user requested automatic fixes:
+
+- If the user explicitly said "review and fix" or similar → proceed with automatic fixes
+- If the user only said "review" → ask for permission before applying any changes
+
+**Fix process:**
+
+1. Read each file with issues (use the `path` field from JSON)
+2. For each comment:
+   - If `suggestion_code` is present and matches the issue → apply the suggestion
+   - If `start_line`/`end_line` are non-zero → navigate to that location and fix
+   - If line numbers are 0 (mispositioned) → search the file for the code described in `content`
+3. After applying fixes, run verification: `go build ./...` or equivalent for the project language
+4. Report which fixes were applied and which require manual follow-up
+
+**Priority order:** Fix Critical/High items first, then Medium. Skip Low items.
+
+### Step 6: Re-review with --resume
+
+After applying fixes, re-run review to verify fixes resolved the issues:
+
+```bash
+ocr review --audience agent -b "context" --from main --to HEAD --resume <session-id>
+```
+
+`--resume` will:
+- **Reuse** completed results for files that haven't changed
+- **Retry** files that previously failed (auto-detected)
+- **Re-review** files whose diff content changed (because you edited them)
+
+### Step 7: Iterate Until Clean
+
+```
+Review → Read JSON → Fix → Re-review (--resume) → Repeat
+```
+
+Stop when:
+- No Critical/High issues remain
+- Only Medium issues that require human judgment remain
+- All fixes pass `go build` or equivalent
 
 ## Output Format
 
@@ -178,8 +239,10 @@ If the user wants project-specific rules, OCR resolves them in this priority ord
 
 1. `--rule <path>` flag (highest)
 2. `<repo>/.opencodereview/rule.json`
-3. `~/.opencodereview/rule.json`
-4. Built-in system defaults (lowest)
+3. Enterprise project `<rules-dir>/projects/<project>/rule.json`
+4. Enterprise global `<rules-dir>/global.json`
+5. `~/.opencodereview/rule.json`
+6. Built-in system defaults (lowest)
 
 By default, the first matching user rule replaces the built-in system rule. Set `merge_system_rule: true` on a rule entry when the matched system rule and user rule should both be included.
 
@@ -216,14 +279,17 @@ ocr rules check src/main/java/com/example/Foo.java
 - **Plan phase triggers at 50 lines** — diffs exceeding 50 changed lines run an extra risk-analysis phase before main review. This adds latency but improves quality.
 - **Don't pass `--audience human`** — it streams progress UI that pollutes output. Always use `--audience agent`.
 - **Comment language follows config** — set `language` config to `English` or `Chinese` (default: Chinese) to control review comment language.
+- **`--save-result` is always on** — results are saved to `<repo>/.opencodereview/reviews/`. Read this JSON instead of parsing terminal output.
+- **Use `--resume` after fixing** — it skips unchanged files and retries failed files, making re-review fast.
 
 ## Validation
 
 After the review completes, verify success by checking:
 
 1. The command exited with code 0
-2. Comments were generated (or "No comments generated" message appears)
-3. Warnings (if any) are displayed in stderr
+2. A result JSON was saved to `.opencodereview/reviews/`
+3. `cat .opencodereview/reviews/<project-key>/<latest>.json | jq '.comments | length'` returns a count
+4. Warnings (if any) are displayed in stderr
 
 If errors occurred, check the stderr warnings for details about which files failed and why.
 
