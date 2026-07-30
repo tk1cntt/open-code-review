@@ -113,6 +113,20 @@ func splitBindHost(addr string) string {
 	return addr
 }
 
+// DisplayAddr normalizes a listen address for display: wildcard bind addresses
+// (empty, 0.0.0.0, ::) are shown as localhost with the same port.
+func DisplayAddr(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		return net.JoinHostPort("localhost", port)
+	}
+	return addr
+}
+
 // resolveAllowedHostsFromEnv reads the OCR_VIEWER_ALLOWED_HOSTS environment
 // variable and combines it with the bind host to produce the active allowlist.
 func resolveAllowedHostsFromEnv(bindAddr string) map[string]struct{} {
