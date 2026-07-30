@@ -174,8 +174,10 @@ func (jw *jsonlWriter) WriteReviewItemReused(filePath, oldPath, newPath, fingerp
 }
 
 // WriteReviewItemFailed writes a file-level checkpoint for a failed diff.
-func (jw *jsonlWriter) WriteReviewItemFailed(filePath, oldPath, newPath, fingerprint, errorMsg string) string {
-	return jw.writeReviewItemRecord("review_item_failed", filePath, oldPath, newPath, fingerprint, "", errorMsg, nil)
+// comments contains any findings collected before the failure; they are persisted
+// so the viewer can display partial results.
+func (jw *jsonlWriter) WriteReviewItemFailed(filePath, oldPath, newPath, fingerprint, errorMsg string, comments []model.LlmComment) string {
+	return jw.writeReviewItemRecord("review_item_failed", filePath, oldPath, newPath, fingerprint, "", errorMsg, comments)
 }
 
 func (jw *jsonlWriter) writeReviewItemRecord(recordType, filePath, oldPath, newPath, fingerprint, sourceSessionID, errorMsg string, comments []model.LlmComment) string {
