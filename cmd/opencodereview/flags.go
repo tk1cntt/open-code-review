@@ -121,7 +121,7 @@ type reviewOptions struct {
 	maxGitProcs     int
 	maxTokensBudget int // --max-tokens-budget: cap total token usage; 0 = unlimited
 	preview         bool
-	showHelp       bool
+	showHelp        bool
 }
 
 func parseReviewFlags(args []string) (reviewOptions, error) {
@@ -249,6 +249,9 @@ Examples:
   ocr review --preview
   ocr review -c abc123 -p
 
+  # Exclude generated files / fixtures
+  ocr review --exclude '**/generated/*,**/testdata/*'
+
   # Provide requirement/business context inline, from a Markdown file, or both
   ocr review --background "Adding rate limiting to the login API"
   ocr review --background-file ./docs/requirements.md
@@ -261,7 +264,9 @@ Flags:
   -c, --commit string           single commit hash or tag to review (vs its parent)
   -f, --format string           output format: text or json (default "text")
   --concurrency int             max concurrent file reviews (default 8)
+  --exclude string              comma-separated gitignore-style patterns to exclude (merged with rule.json)
   --max-git-procs int           max concurrent git subprocesses (default 16)
+  --max-tokens-budget int       cap total token usage; dispatch stops once exceeded (0 = unlimited)
   --from string                 source ref to start diff from (e.g., 'main')
   --max-tools int               max tool call rounds per file (0 = template default; min 10)
   --model string                override LLM model for this review (e.g., claude-opus-4-6)
@@ -300,7 +305,7 @@ func parseConfigArgs(args []string) (configAction, error) {
 		}, nil
 	case "unset":
 		if len(args) < 2 {
-			return configAction{}, fmt.Errorf("usage: ocr config unset custom_providers.<name>\ne.g., ocr config unset custom_providers.my-gateway")
+			return configAction{}, fmt.Errorf("usage: ocr config unset <provider|custom_providers.<name>|mcp_servers.<name>>\nexamples:\n  ocr config unset provider\n  ocr config unset custom_providers.my-provider\n  ocr config unset mcp_servers.github")
 		}
 		return configAction{
 			subCmd: "unset",
@@ -316,6 +321,7 @@ func printConfigUsage() {
 
 Usage:
   ocr config set <key> <value>
+  ocr config unset provider                    Disable provider-based configuration
   ocr config unset custom_providers.<name>  Delete a custom provider
   ocr config unset mcp_servers.<name>       Delete an MCP server
   ocr config provider                       Interactive provider setup
@@ -343,6 +349,9 @@ Examples:
 
   # Delete a custom provider
   ocr config unset custom_providers.my-gateway
+
+  # Disable provider-based configuration and use legacy llm.* settings
+  ocr config unset provider
 
   # MCP server configuration (stdio transport)
   ocr config set mcp_servers.codegraph.command npx

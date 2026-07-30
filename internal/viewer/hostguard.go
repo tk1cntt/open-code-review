@@ -113,8 +113,9 @@ func splitBindHost(addr string) string {
 	return addr
 }
 
-// DisplayAddr normalizes a listen address for display: wildcard bind addresses
-// (empty, 0.0.0.0, ::) are shown as localhost with the same port.
+// DisplayAddr rewrites a wildcard listen address (empty host, 0.0.0.0, or ::)
+// to a localhost form so printed URLs are always openable in a browser.
+// Non-wildcard addresses are returned unchanged.
 func DisplayAddr(addr string) string {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {

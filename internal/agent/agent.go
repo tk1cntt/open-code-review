@@ -90,7 +90,7 @@ type Args struct {
 	// executeToolCall instead of via a separate worker pool.
 	CommentWorkerPool *CommentWorkerPool
 
-	// Concurrency limit for per-file subtasks. Defaults to number of CPUs.
+	// Concurrency limit for per-file subtasks. MaxConcurrency <= 0 defaults to 8.
 	MaxConcurrency int
 
 	// Concurrent task timeout in minutes. 0 means no timeout.
@@ -238,8 +238,15 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 	// Record file count metric.
 	telemetry.RecordFilesReviewed(ctx, int64(reviewCount))
 
-	// Pre-run cost projection (INV-5): non-blocking estimate gated behind
-	// MaxTokensBudget so users who never opt in see no new output line.
+	// Pre-run cost projection so users aren't surprised by a large review
+	// (INV-5). Non-blocking warn-only: the estimate is order-of-magnitude and
+	// cannot account for agent tool-use inflation (≈300× in the #409 report),
+	// so it is a floor; real usage is reported from the API after the run.
+	//
+	// Gated behind MaxTokensBudget so users who never opt into a budget see no
+	// new output line (the estimate is only useful to budget-setters comparing
+	// projected cost against their cap). Keeps the prior text-mode output
+	// unchanged for the common unlimited path.
 	if a.args.MaxTokensBudget > 0 {
 		est := estimateDiffCost(a.diffs)
 		fmt.Fprintf(stdout.Writer(), "[ocr] estimated cost: %s\n", est)
@@ -319,7 +326,10 @@ func (a *Agent) Warnings() []AgentWarning { return a.runner.Warnings() }
 func (a *Agent) ToolCalls() map[string]int64 { return a.runner.ToolCalls() }
 
 // BudgetExceeded reports whether a token or tool-call budget gate stopped
-// dispatch before all files were reviewed; partial results still returned.
+// dispatch before all files were reviewed. The run still returns the partial
+// comments collected up to that point (and a nil error) so the caller can
+// emit a typed budget_exceeded status with the partial results instead of a
+// bare failure.
 func (a *Agent) BudgetExceeded() bool { return a.budgetExceeded }
 
 // recordWarning adds a non-fatal warning to the agent's warning list.
@@ -415,8 +425,14 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 			continue
 		}
 
-		// Per-file budget look-ahead: if tokens spent + estimate exceeds
-		// budget, stop scheduling files (mirrors scan/agent.go).
+		// Per-file budget look-ahead, checked BEFORE acquiring the semaphore
+		// (mirrors scan/agent.go:472-486): if the tokens already spent PLUS a
+		// look-ahead estimate of this file's cost would exceed the budget,
+		// stop scheduling further files. Any worker already in flight is
+		// allowed to finish — its tokens flow into the atomic counter; we do
+		// NOT cancel it (matches scan, avoids half-written session records).
+		// Overrun is therefore bounded by the in-flight worker count
+		// (≤ concurrency, default 8), never a whole batch.
 		if a.args.MaxTokensBudget > 0 {
 			used := a.runner.TotalTokensUsed()
 			nextEst := estimateDiffFileTokens(toDispatch[i])

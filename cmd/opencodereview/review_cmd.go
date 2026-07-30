@@ -193,7 +193,14 @@ func runReview(args []string) error {
 		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
 		// INV-4: emit a best-effort structured usage record on the failure
-		// path so the cost of the failed attempt is not lost.
+		// path so the cost of the failed attempt is not lost. Budget exhaustion
+		// typically returns partial comments with a nil error and does not
+		// reach here, but a residual edge exists (budget trips, then all
+		// dispatched files error) — emitFailureUsage reports the agent's actual
+		// BudgetExceeded() state, so the record can never contradict it.
+		// Restore the quiet handle early so the stderr line is visible to
+		// agent-text audiences (Restore is idempotent; the deferred Restore is
+		// a no-op).
 		q.Restore()
 		emitFailureUsage(ag, time.Since(startTime), opts.outputFormat)
 		if id := ag.SessionID(); id != "" {
