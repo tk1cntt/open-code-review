@@ -88,6 +88,25 @@ func (c *CommentCollector) ReplaceSince(start int, replacements []model.LlmComme
 	c.comments = append(c.comments[:start:start], replacements...)
 }
 
+// RemoveByPath removes all comments whose Path matches the given path.
+// Used to clear stale comments before retrying a failed subtask.
+func (c *CommentCollector) RemoveByPath(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := c.comments[:0]
+	for _, cm := range c.comments {
+		if cm.Path == path {
+			continue
+		}
+		kept = append(kept, cm)
+	}
+	tail := c.comments[len(kept):]
+	for i := range tail {
+		tail[i] = model.LlmComment{}
+	}
+	c.comments = kept
+}
+
 // RemoveByPathAndIndices removes comments for a given path whose per-path index
 // (0-based position among all comments with that path) is in the indices set.
 func (c *CommentCollector) RemoveByPathAndIndices(path string, indices map[int]struct{}) {
