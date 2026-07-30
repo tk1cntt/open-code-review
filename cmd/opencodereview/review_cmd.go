@@ -11,6 +11,8 @@ import (
 
 	"github.com/alibaba/open-code-review/internal/agent"
 	"github.com/alibaba/open-code-review/internal/mcp"
+	"github.com/alibaba/open-code-review/internal/model"
+	"github.com/alibaba/open-code-review/internal/reviewstore"
 	"github.com/alibaba/open-code-review/internal/session"
 	"github.com/alibaba/open-code-review/internal/telemetry"
 	"github.com/alibaba/open-code-review/internal/tool"
@@ -30,7 +32,7 @@ func runReview(args []string) error {
 	}
 
 	// review path: git repo is required (diff concepts depend on it).
-	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, opts.maxTools, opts.maxGitProcs, true)
+	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, opts.rulesDir, opts.maxTools, opts.maxGitProcs, true)
 	if err != nil {
 		return err
 	}
@@ -98,6 +100,34 @@ func runReview(args []string) error {
 	rt.PlanToolDefs = append(rt.PlanToolDefs, mcpToolDefs...)
 	rt.MainToolDefs = append(rt.MainToolDefs, mcpToolDefs...)
 
+	var perFileWriter *reviewstore.PerFileWriter
+	var reviewID string
+	if opts.saveResult || opts.savePerFile {
+		var idErr error
+		reviewID, idErr = reviewstore.GenerateID()
+		if idErr != nil {
+			return fmt.Errorf("generate review ID: %w", idErr)
+		}
+	}
+	if opts.savePerFile {
+		if opts.resultDir == "" {
+			opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+		}
+		projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(cc.RepoDir))
+		projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir))
+		project := reviewstore.ProjectInfo{
+			ID:      projectID,
+			Name:    projectName,
+			RepoDir: cc.RepoDir,
+			WebURL:  os.Getenv("CI_PROJECT_URL"),
+		}
+		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
+		if pfwErr != nil {
+			return fmt.Errorf("create per-file writer: %w", pfwErr)
+		}
+		perFileWriter = pfw
+	}
+
 	ag := agent.New(agent.Args{
 		RepoDir:               cc.RepoDir,
 		From:                  opts.from,
@@ -119,6 +149,13 @@ func runReview(args []string) error {
 		Background:            opts.background,
 		GitRunner:             cc.GitRunner,
 		Resume:                resumeState,
+		OnFileDone: func(filePath string, comments []model.LlmComment) {
+			if perFileWriter != nil {
+				if err := perFileWriter.WriteFile(filePath, comments); err != nil {
+					fmt.Fprintf(os.Stderr, "[ocr] warning: per-file save failed for %s: %v\n", filePath, err)
+				}
+			}
+		},
 	})
 
 	// Silence progress output during execution; restored before the trace
@@ -141,6 +178,15 @@ func runReview(args []string) error {
 	}
 	startTime := time.Now()
 
+	var finalized bool
+	defer func() {
+		if perFileWriter != nil && !finalized {
+			if _, fErr := perFileWriter.Finalize(reviewstore.ReviewInfo{}, reviewstore.GitLabInfo{}, nil); fErr != nil {
+				fmt.Fprintf(os.Stderr, "[ocr] warning: failed to finalize partial per-file output: %v\n", fErr)
+			}
+		}
+	}()
+
 	comments, err := ag.Run(ctx)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
@@ -151,6 +197,62 @@ func runReview(args []string) error {
 		return fmt.Errorf("review failed: %w", err)
 	}
 
+	duration := time.Since(startTime)
+	if opts.saveResult {
+		if opts.resultDir == "" {
+			opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+		}
+		path, mdPath, err := saveReviewResult(cc.RepoDir, opts, ag, comments, ag.Warnings(), duration, reviewID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to save review result: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "[ocr] JSON saved to: %s\n", path)
+			if mdPath != "" {
+				fmt.Fprintf(os.Stderr, "[ocr] Markdown report saved to: %s\n", mdPath)
+			}
+		}
+	}
+	if perFileWriter != nil {
+		sess := ag.Session()
+		reviewMode := reviewModeFromOptions(opts)
+		sourceBranch := firstNonEmpty(opts.resultSourceBranch, os.Getenv("CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"))
+		targetBranch := firstNonEmpty(opts.resultTargetBranch, os.Getenv("CI_MERGE_REQUEST_TARGET_BRANCH_NAME"))
+		gitlab := reviewstore.GitLabInfo{
+			ServerURL:       os.Getenv("CI_SERVER_URL"),
+			ProjectID:       firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir)),
+			MergeRequestIID: os.Getenv("CI_MERGE_REQUEST_IID"),
+			PipelineID:      os.Getenv("CI_PIPELINE_ID"),
+			JobID:           os.Getenv("CI_JOB_ID"),
+		}
+		reviewInfo := reviewstore.ReviewInfo{
+			Mode:             reviewMode,
+			SourceBranch:     sourceBranch,
+			TargetBranch:     targetBranch,
+			From:             opts.from,
+			To:               opts.to,
+			Commit:           opts.commit,
+			FilesReviewed:    ag.FilesReviewed(),
+			CommentCount:     int64(len(comments)),
+			TotalTokens:      ag.TotalTokensUsed(),
+			InputTokens:      ag.TotalInputTokens(),
+			OutputTokens:     ag.TotalOutputTokens(),
+			CacheReadTokens:  ag.TotalCacheReadTokens(),
+			CacheWriteTokens: ag.TotalCacheWriteTokens(),
+			Duration:         duration.String(),
+			DurationSeconds:  int64(duration.Seconds()),
+			SessionID:        ag.SessionID(),
+		}
+		if sess != nil {
+			reviewInfo.Model = sess.Model
+		}
+		perFileIdxPath, fErr := perFileWriter.Finalize(reviewInfo, gitlab, mapWarnings(ag.Warnings()))
+		if fErr != nil {
+			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to finalize per-file output: %v\n", fErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "[ocr] Per-file output saved to: %s\n", perFileIdxPath)
+		}
+		finalized = true
+	}
 	return emitRunResult(ctx, ag, comments, startTime, opts.outputFormat, opts.audience, q)
 }
 
