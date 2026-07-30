@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "openmemory": {
+      "type": "stdio",
+      "command": "C:/Program Files/Python312/python.exe",
+      "args": [
+        "-m",
+        "openmemory.main",
+        "mcp"
+      ],
+      "cwd": "D:\open-code-review",
+      "env": {
+        "PYTHONPATH": "D:/ai-tools/openmemory-py/packages/openmemory-py/src",
+        "OM_DB_URL": "sqlite:///.openmemory/openmemory.db"
+      }
+    },
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": [
+        "serve",
+        "--mcp"
+      ]
+    }
+  }
+}
