@@ -22,6 +22,9 @@ type ResumeState struct {
 	DiffTo     string
 	DiffCommit string
 	Items      map[string]ResumeItem
+	// FailedFiles maps fingerprint → newPath for files that failed in the
+	// previous session, so callers can log which files are being retried.
+	FailedFiles map[string]string
 }
 
 // ResumeItem is a completed file-level checkpoint, keyed by diff fingerprint.
@@ -77,9 +80,10 @@ func LoadResumeState(repoDir, sessionID string) (*ResumeState, error) {
 	defer f.Close()
 
 	state := &ResumeState{
-		SessionID: sessionID,
-		RepoDir:   repoDir,
-		Items:     make(map[string]ResumeItem),
+		SessionID:   sessionID,
+		RepoDir:     repoDir,
+		Items:       make(map[string]ResumeItem),
+		FailedFiles: make(map[string]string),
 	}
 	reader := bufio.NewReader(f)
 	for {
@@ -119,6 +123,12 @@ func (s *ResumeState) applyResumeLine(line []byte) error {
 		if filePath == "" {
 			filePath = rec.NewPath
 		}
+		// If a previously-done item has zero comments and is not a reuse,
+		// treat it as incomplete — the LLM may have returned nothing.
+		if rec.Type == "review_item_done" && len(rec.Comments) == 0 {
+			s.FailedFiles[rec.Fingerprint] = filePath
+			return nil
+		}
 		s.Items[rec.Fingerprint] = ResumeItem{
 			FilePath:    filePath,
 			OldPath:     rec.OldPath,
@@ -129,6 +139,11 @@ func (s *ResumeState) applyResumeLine(line []byte) error {
 	case "review_item_failed":
 		if rec.Fingerprint != "" {
 			delete(s.Items, rec.Fingerprint)
+			filePath := rec.FilePath
+			if filePath == "" {
+				filePath = rec.NewPath
+			}
+			s.FailedFiles[rec.Fingerprint] = filePath
 		}
 	}
 	return nil
@@ -157,6 +172,14 @@ func (s *ResumeState) CompletedCount() int {
 	return len(s.Items)
 }
 
+// FailedCount returns the number of failed files that can be retried.
+func (s *ResumeState) FailedCount() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.FailedFiles)
+}
+
 // Item returns a copy of the checkpoint for fingerprint.
 func (s *ResumeState) Item(fingerprint string) (ResumeItem, bool) {
 	if s == nil {
@@ -175,10 +198,19 @@ func (s *ResumeState) ValidateOptions(opts SessionOptions) error {
 	if s == nil {
 		return nil
 	}
-	if opts.ReviewMode == "" || opts.ReviewMode == ReviewModeWorkspace {
+	if opts.ReviewMode == "" {
+		return fmt.Errorf("resume requires --from/--to, --commit, or a full-scan session")
+	}
+	if opts.ReviewMode == ReviewModeWorkspace {
 		return fmt.Errorf("resume requires --from/--to or --commit; workspace resume is not supported")
 	}
 	if s.ReviewMode == "" {
+		if opts.ReviewMode == ReviewModeFullScan {
+			// Older scan sessions may not have reviewMode metadata; allow resume
+			// so the user can retry files that were reviewed before checkpoint
+			// recording was added.
+			return nil
+		}
 		return fmt.Errorf("resume session %q is missing review mode metadata", s.SessionID)
 	}
 	if s.ReviewMode != opts.ReviewMode {
@@ -193,6 +225,8 @@ func (s *ResumeState) ValidateOptions(opts SessionOptions) error {
 		if s.DiffCommit != opts.DiffCommit {
 			return fmt.Errorf("resume session commit %q does not match current commit %q", s.DiffCommit, opts.DiffCommit)
 		}
+	case ReviewModeFullScan:
+		// Full-scan fingerprint is path-based; no diff validation needed.
 	default:
 		return fmt.Errorf("resume mode %q is not supported", opts.ReviewMode)
 	}
