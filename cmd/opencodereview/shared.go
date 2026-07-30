@@ -46,7 +46,7 @@ type commonContext struct {
 // requireGit=true fails fast when the directory is not a git repo (review
 // path: diff concept requires git). requireGit=false allows non-git
 // directories (scan path: provider falls back to filepath.Walk).
-func loadCommonContext(repoDirInput, rulePath string, maxTools, maxGitProcs int, requireGit bool) (*commonContext, error) {
+func loadCommonContext(repoDirInput, rulePath, rulesDir string, maxTools, maxGitProcs int, requireGit bool) (*commonContext, error) {
 	tpl, err := template.LoadDefault()
 	if err != nil {
 		return nil, fmt.Errorf("load default template: %w", err)
@@ -63,7 +63,10 @@ func loadCommonContext(repoDirInput, rulePath string, maxTools, maxGitProcs int,
 		return nil, err
 	}
 
-	resolver, fileFilter, err := rules.NewResolver(repoDir, rulePath)
+	resolver, fileFilter, err := rules.NewResolverWithOptions(repoDir, rules.ResolverOptions{
+		CustomRulePath: rulePath,
+		RulesDir:       rulesDir,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("load rules: %w", err)
 	}

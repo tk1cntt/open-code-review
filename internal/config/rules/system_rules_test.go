@@ -1354,6 +1354,323 @@ func TestResolveRuleEntries_EmptyRepoDirAbsolute(t *testing.T) {
 	}
 }
 
+// ── Enterprise rules tests ──
+
+func TestNewResolverWithOptions_RulesDirProjectRule(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	rulesDir := t.TempDir()
+	repoDir := t.TempDir()
+	// Name the repo dir so encodeProjectKey produces a predictable segment
+	repoDir = filepath.Join(repoDir, "my-repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	projectKey := encodeProjectKey(repoDir)
+	projectsDir := filepath.Join(rulesDir, "projects", projectKey)
+	if err := os.MkdirAll(projectsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entProjectJSON := `{"rules":[{"path":"**/*.go","rule":"enterprise-go-rule"}]}`
+	if err := os.WriteFile(filepath.Join(projectsDir, "rule.json"), []byte(entProjectJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver, _, err := NewResolverWithOptions(repoDir, ResolverOptions{RulesDir: rulesDir})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	got := resolver.Resolve("main.go")
+	if got != "enterprise-go-rule" {
+		t.Errorf("expected enterprise project rule, got %q", got)
+	}
+}
+
+func TestNewResolverWithOptions_RulesDirGlobalRule(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	rulesDir := t.TempDir()
+	entGlobalJSON := `{"rules":[{"path":"**/*.py","rule":"enterprise-global-py-rule"}]}`
+	if err := os.WriteFile(filepath.Join(rulesDir, "global.json"), []byte(entGlobalJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Project that doesn't have a matching enterprise project rule
+	repoDir := filepath.Join(t.TempDir(), "other-repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver, _, err := NewResolverWithOptions(repoDir, ResolverOptions{RulesDir: rulesDir})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	got := resolver.Resolve("app.py")
+	if got != "enterprise-global-py-rule" {
+		t.Errorf("expected enterprise global rule, got %q", got)
+	}
+}
+
+func TestNewResolverWithOptions_RulesDirPriority(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	repoDir := filepath.Join(t.TempDir(), "my-repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rulesDir := t.TempDir()
+	entGlobalJSON := `{"rules":[{"path":"**/*.go","rule":"enterprise-global-go-rule"}]}`
+	if err := os.WriteFile(filepath.Join(rulesDir, "global.json"), []byte(entGlobalJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Enterprise project rule — use encoded key from repoDir
+	projectKey := encodeProjectKey(repoDir)
+	projectsDir := filepath.Join(rulesDir, "projects", projectKey)
+	if err := os.MkdirAll(projectsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entProjJSON := `{"rules":[{"path":"internal/**/*.go","rule":"enterprise-project-go-rule"}]}`
+	if err := os.WriteFile(filepath.Join(projectsDir, "rule.json"), []byte(entProjJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver, _, err := NewResolverWithOptions(repoDir, ResolverOptions{RulesDir: rulesDir})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	// Enterprise project rule wins over enterprise global for matching path
+	got := resolver.Resolve("internal/pkg/foo.go")
+	if got != "enterprise-project-go-rule" {
+		t.Errorf("expected enterprise project rule, got %q", got)
+	}
+
+	// Enterprise global still matches non-internal paths
+	got = resolver.Resolve("main.go")
+	if got != "enterprise-global-go-rule" {
+		t.Errorf("expected enterprise global rule, got %q", got)
+	}
+}
+
+func TestNewResolverWithOptions_RulesDirMissingFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	rulesDir := t.TempDir() // no global.json, no projects dir
+	repoDir := t.TempDir()
+
+	resolver, _, err := NewResolverWithOptions(repoDir, ResolverOptions{RulesDir: rulesDir})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions should not fail when enterprise rules are missing: %v", err)
+	}
+
+	// Should fall back to system default
+	got := resolver.Resolve("main.go")
+	if !strings.Contains(got, "Correctness") {
+		t.Errorf("expected system default, got %q", truncate(got, 80))
+	}
+}
+
+func TestEnterpriseProjectRulePathsRejectTraversal(t *testing.T) {
+	// encodeProjectKey neutralises slashes/backslashes into hyphens.
+	// "../etc" → "..-etc" (safe flat directory name).
+	paths := enterpriseProjectRulePaths("/rules", "../etc")
+	if len(paths) != 1 {
+		t.Fatalf("expected 1 path for traversal-like repoDir, got %v", paths)
+	}
+	expected := filepath.Join("/rules", "projects", "..-etc", "rule.json")
+	if paths[0] != expected {
+		t.Errorf("expected %q, got %q", expected, paths[0])
+	}
+
+	// Bare ".." is still rejected: encodeProjectKey returns "..", which
+	// isSafeRulePathSegment rejects as a traversal name.
+	paths = enterpriseProjectRulePaths("/rules", "..")
+	if len(paths) != 0 {
+		t.Errorf("expected empty for '..' repoDir, got %v", paths)
+	}
+}
+
+func TestEnterpriseProjectRulePathsNormal(t *testing.T) {
+	paths := enterpriseProjectRulePaths("/rules", "/home/user/my-project")
+	if len(paths) != 1 {
+		t.Fatalf("expected 1 path, got %v", paths)
+	}
+	expected := filepath.FromSlash("/rules/projects/home-user-my-project/rule.json")
+	if paths[0] != expected {
+		t.Errorf("expected %q, got %q", expected, paths[0])
+	}
+}
+
+func TestEnterpriseProjectRulePathSafe(t *testing.T) {
+	path, ok := enterpriseProjectRulePath("/rules", "my-project")
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	expected := filepath.FromSlash("/rules/projects/my-project/rule.json")
+	if path != expected {
+		t.Errorf("expected %q, got %q", expected, path)
+	}
+}
+
+func TestEnterpriseProjectRulePathRejectsTraversal(t *testing.T) {
+	_, ok := enterpriseProjectRulePath("/rules", "../etc")
+	if ok {
+		t.Fatal("expected false for traversal")
+	}
+}
+
+func TestEncodeProjectKey(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		want string
+	}{
+		{"empty", "", "empty"},
+		{"simple", "my-project", "my-project"},
+		{"path", "/home/user/repo", "home-user-repo"},
+		{"windows volume", `C:\Users\dev\repo`, "C_Users-dev-repo"},
+		{"mixed separators", `group/project\service`, "group-project-service"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := encodeProjectKey(tt.key); got != tt.want {
+				t.Errorf("encodeProjectKey(%q) = %q, want %q", tt.key, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsSafeRulePathSegment(t *testing.T) {
+	tests := []struct {
+		seg  string
+		safe bool
+	}{
+		{"", false},
+		{".", false},
+		{"..", false},
+		{"a/b", false},
+		{`a\b`, false},
+		{"my-project", true},
+		{"home-user-repo", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.seg, func(t *testing.T) {
+			if got := isSafeRulePathSegment(tt.seg); got != tt.safe {
+				t.Errorf("isSafeRulePathSegment(%q) = %v, want %v", tt.seg, got, tt.safe)
+			}
+		})
+	}
+}
+
+func TestResolveDetail_EnterpriseSources(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	repoDir := filepath.Join(t.TempDir(), "my-repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rulesDir := t.TempDir()
+	entGlobalJSON := `{"rules":[{"path":"**/*.py","rule":"enterprise-global-py-rule"}]}`
+	if err := os.WriteFile(filepath.Join(rulesDir, "global.json"), []byte(entGlobalJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	projectKey := encodeProjectKey(repoDir)
+	projectsDir := filepath.Join(rulesDir, "projects", projectKey)
+	if err := os.MkdirAll(projectsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entProjJSON := `{"rules":[{"path":"**/*.java","rule":"enterprise-project-java-rule"}]}`
+	if err := os.WriteFile(filepath.Join(projectsDir, "rule.json"), []byte(entProjJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver, _, err := NewResolverWithOptions(repoDir, ResolverOptions{RulesDir: rulesDir})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+	dr := resolver.(DetailResolver)
+
+	// Enterprise project match
+	detail := dr.ResolveDetail("src/foo.java")
+	if detail.Source != "enterprise-project" {
+		t.Errorf("expected source 'enterprise-project', got %q", detail.Source)
+	}
+
+	// Enterprise global match
+	detail = dr.ResolveDetail("app.py")
+	if detail.Source != "enterprise-global" {
+		t.Errorf("expected source 'enterprise-global', got %q", detail.Source)
+	}
+
+	// System fallback
+	detail = dr.ResolveDetail("readme.md")
+	if detail.Source != "system" {
+		t.Errorf("expected source 'system', got %q", detail.Source)
+	}
+}
+
+func TestNewResolverWithOptions_CustomOverridesEnterprise(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	rulesDir := t.TempDir()
+	entGlobalJSON := `{"rules":[{"path":"**/*.go","rule":"enterprise-global-go-rule"}]}`
+	if err := os.WriteFile(filepath.Join(rulesDir, "global.json"), []byte(entGlobalJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	customDir := t.TempDir()
+	customJSON := `{"rules":[{"path":"**/*.go","rule":"custom-go-rule"}]}`
+	customPath := filepath.Join(customDir, "custom.json")
+	if err := os.WriteFile(customPath, []byte(customJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver, _, err := NewResolverWithOptions(t.TempDir(), ResolverOptions{
+		CustomRulePath: customPath,
+		RulesDir:       rulesDir,
+	})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	// Custom (--rule) should override enterprise global
+	got := resolver.Resolve("main.go")
+	if got != "custom-go-rule" {
+		t.Errorf("expected custom rule to override enterprise, got %q", got)
+	}
+}
+
+func TestNewResolverWithOptions_EnterpriseFileFilter(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	rulesDir := t.TempDir()
+	entGlobalJSON := `{"rules":[],"include":["src/**/*.java"],"exclude":["**/generated/**"]}`
+	if err := os.WriteFile(filepath.Join(rulesDir, "global.json"), []byte(entGlobalJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, filter, err := NewResolverWithOptions(t.TempDir(), ResolverOptions{RulesDir: rulesDir})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+	if filter == nil {
+		t.Fatal("expected non-nil FileFilter from enterprise layer")
+	}
+	if !filter.IsUserIncluded("src/main/foo.java") {
+		t.Error("expected enterprise include to take effect")
+	}
+	if !filter.IsUserExcluded("src/generated/api.java") {
+		t.Error("expected enterprise exclude to take effect")
+	}
+}
+
 func TestResolveRuleEntries_GlobalRuleFileResolution(t *testing.T) {
 	// Simulate loadGlobalRule: repoDir = filepath.Dir(~/.opencodereview/rule.json)
 	homeDir := t.TempDir()
@@ -1375,5 +1692,38 @@ func TestResolveRuleEntries_GlobalRuleFileResolution(t *testing.T) {
 
 	if entries[0].Rule != "global reusable rule" {
 		t.Errorf("global rule file should be resolved, got %q", entries[0].Rule)
+	}
+}
+
+func TestLoadProjectRule_ResolvesRelativePath(t *testing.T) {
+	// Simulate loadProjectRule: rule.json at <repo>/.opencodereview/rule.json,
+	// with a relative rule path "rules/my-rule.md" that must resolve against
+	// .opencodereview/ (the directory containing rule.json), not the repo root.
+	repoDir := t.TempDir()
+	ocrDir := filepath.Join(repoDir, ".opencodereview")
+	rulesDir := filepath.Join(ocrDir, "rules")
+	if err := os.MkdirAll(rulesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rulesDir, "my-rule.md"), []byte("custom rule"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ruleJSON := filepath.Join(ocrDir, "rule.json")
+	if err := os.WriteFile(ruleJSON, []byte(`{"rules":[{"path":"**/*.go","rule":"rules/my-rule.md"}]}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pr, err := loadProjectRule(repoDir)
+	if err != nil {
+		t.Fatalf("loadProjectRule: %v", err)
+	}
+	if pr == nil {
+		t.Fatal("expected non-nil ProjectRule")
+	}
+	if len(pr.Rules) != 1 {
+		t.Fatalf("expected 1 rule entry, got %d", len(pr.Rules))
+	}
+	if pr.Rules[0].Rule != "custom rule" {
+		t.Errorf("expected 'custom rule', got %q", pr.Rules[0].Rule)
 	}
 }
