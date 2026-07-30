@@ -101,7 +101,7 @@ func StartServerWithOptions(opts ServerOptions) error {
 		Handler: guarded,
 	}
 
-	fmt.Printf("\nOpen browser: http://%s\n", opts.Addr)
+	fmt.Printf("\nOpen browser: http://%s\n", DisplayAddr(opts.Addr))
 	return srv.ListenAndServe()
 }
 

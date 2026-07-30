@@ -42,7 +42,7 @@ func runViewer(args []string) error {
 		return nil
 	}
 
-	fmt.Printf("Open Code Review Viewer starting on http://%s\n", opts.addr)
+	fmt.Printf("Open Code Review Viewer starting on http://%s\n", viewer.DisplayAddr(opts.addr))
 	return viewer.StartServerWithOptions(viewer.ServerOptions{
 		Addr:       opts.addr,
 		ReviewsDir: opts.reviewsDir,

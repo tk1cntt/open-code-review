@@ -149,6 +149,7 @@ func runReview(args []string) error {
 		Background:            opts.background,
 		GitRunner:             cc.GitRunner,
 		Resume:                resumeState,
+		MaxTokensBudget:       int64(opts.maxTokensBudget),
 		OnFileDone: func(filePath string, comments []model.LlmComment) {
 			if perFileWriter != nil {
 				if err := perFileWriter.WriteFile(filePath, comments); err != nil {
@@ -191,6 +192,10 @@ func runReview(args []string) error {
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
+		// INV-4: emit a best-effort structured usage record on the failure
+		// path so the cost of the failed attempt is not lost.
+		q.Restore()
+		emitFailureUsage(ag, time.Since(startTime), opts.outputFormat)
 		if id := ag.SessionID(); id != "" {
 			fmt.Fprintf(os.Stderr, "[ocr] Session: %s (retry with: --resume %s)\n", id, id)
 		}

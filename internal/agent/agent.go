@@ -123,6 +123,11 @@ type Args struct {
 	// (may be nil/empty). The callback is invoked from the per-file dispatch
 	// goroutine and should be safe for concurrent use.
 	OnFileDone func(filePath string, comments []model.LlmComment)
+
+	// MaxTokensBudget caps the aggregate token usage (input+output) across the
+	// whole run; dispatch stops once the running total + a per-file look-ahead
+	// would exceed it. 0 = unlimited. Mirrors scan.Args.MaxTokensBudget.
+	MaxTokensBudget int64
 }
 
 // Agent orchestrates the AI-powered code review. LLM tool-use loop / memory
@@ -138,6 +143,7 @@ type Agent struct {
 	subtaskFailed   int64 // count of failed subtasks, accessed atomically
 	runner          *llmloop.Runner
 	resumeInfo      *ResumeInfo
+	budgetExceeded  bool // set when a token/tool-call budget gate stopped dispatch
 }
 
 // ResumeInfo summarizes file-level reuse for a resumed review.
@@ -232,6 +238,18 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 	// Record file count metric.
 	telemetry.RecordFilesReviewed(ctx, int64(reviewCount))
 
+	// Pre-run cost projection (INV-5): non-blocking estimate gated behind
+	// MaxTokensBudget so users who never opt in see no new output line.
+	if a.args.MaxTokensBudget > 0 {
+		est := estimateDiffCost(a.diffs)
+		fmt.Fprintf(stdout.Writer(), "[ocr] estimated cost: %s\n", est)
+		fmt.Fprintf(stdout.Writer(), "[ocr] token budget: %s (dispatch stops once exceeded)\n", humanTokens(a.args.MaxTokensBudget))
+		if est.TotalTokens > a.args.MaxTokensBudget {
+			fmt.Fprintf(stdout.Writer(), "[ocr] WARNING: estimate (%s) exceeds token budget (%s); review will stop partway\n",
+				humanTokens(est.TotalTokens), humanTokens(a.args.MaxTokensBudget))
+		}
+	}
+
 	// Step 2: Dispatch per-file subtasks concurrently
 	comments, err := a.dispatchSubtasks(ctx)
 	if len(comments) > 0 {
@@ -299,6 +317,10 @@ func (a *Agent) Warnings() []AgentWarning { return a.runner.Warnings() }
 
 // ToolCalls returns per-tool call counts accumulated during review.
 func (a *Agent) ToolCalls() map[string]int64 { return a.runner.ToolCalls() }
+
+// BudgetExceeded reports whether a token or tool-call budget gate stopped
+// dispatch before all files were reviewed; partial results still returned.
+func (a *Agent) BudgetExceeded() bool { return a.budgetExceeded }
 
 // recordWarning adds a non-fatal warning to the agent's warning list.
 func (a *Agent) recordWarning(warningType, file, message string) {
@@ -392,6 +414,23 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 		if toDispatch[i].IsDeleted {
 			continue
 		}
+
+		// Per-file budget look-ahead: if tokens spent + estimate exceeds
+		// budget, stop scheduling files (mirrors scan/agent.go).
+		if a.args.MaxTokensBudget > 0 {
+			used := a.runner.TotalTokensUsed()
+			nextEst := estimateDiffFileTokens(toDispatch[i])
+			projected := used + nextEst
+			if projected > a.args.MaxTokensBudget {
+				fmt.Fprintf(stdout.Writer(), "[ocr] token budget reached (used %s + next-file est %s = projected %s > budget %s) — skipping %s and remaining files\n",
+					humanTokens(used), humanTokens(nextEst), humanTokens(projected), humanTokens(a.args.MaxTokensBudget), toDispatch[i].NewPath)
+				a.recordWarning("token_budget_reached", toDispatch[i].NewPath,
+					fmt.Sprintf("stopped dispatch: used %d tokens + next-file estimate %d = projected %d exceeds budget %d", used, nextEst, projected, a.args.MaxTokensBudget))
+				a.budgetExceeded = true
+				break
+			}
+		}
+
 		dispatched++
 		wg.Add(1)
 		sem <- struct{}{} // acquire semaphore

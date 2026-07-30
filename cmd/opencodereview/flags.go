@@ -117,9 +117,10 @@ type reviewOptions struct {
 	resultTargetBranch string // --result-target-branch: target branch metadata
 	concurrency    int
 	perFileTimeout int
-	maxTools       int
-	maxGitProcs    int
-	preview        bool
+	maxTools        int
+	maxGitProcs     int
+	maxTokensBudget int // --max-tokens-budget: cap total token usage; 0 = unlimited
+	preview         bool
 	showHelp       bool
 }
 
@@ -152,6 +153,7 @@ func parseReviewFlags(args []string) (reviewOptions, error) {
 	a.StringVar(&opts.resultTargetBranch, "result-target-branch", "", "target branch metadata for persisted review results")
 	a.IntVar(&opts.maxTools, "max-tools", 0, "max tool call rounds per file (0 = template default; min 10)")
 	a.IntVar(&opts.maxGitProcs, "max-git-procs", 16, "max concurrent git subprocesses")
+	a.IntVar(&opts.maxTokensBudget, "max-tokens-budget", 0, "cap total token usage (input+output); dispatch stops once exceeded (0 = unlimited)")
 	a.BoolVarP(&opts.preview, "preview", "p", false, "preview which files will be reviewed without running the LLM")
 
 	if err := a.Parse(args); err != nil {
@@ -207,6 +209,9 @@ func parseReviewFlags(args []string) (reviewOptions, error) {
 
 	if opts.maxGitProcs < 0 {
 		return opts, fmt.Errorf("--max-git-procs must be a non-negative integer (0 means use default 16)")
+	}
+	if opts.maxTokensBudget < 0 {
+		return opts, fmt.Errorf("--max-tokens-budget must be a non-negative integer (0 means unlimited)")
 	}
 
 	return opts, nil
