@@ -117,6 +117,12 @@ type Args struct {
 
 	// Resume is an optional read-only checkpoint index from a previous review session.
 	Resume *session.ResumeState
+
+	// OnFileDone is called when each file completes (success or failure).
+	// filePath is the new-path; comments are the collected review findings
+	// (may be nil/empty). The callback is invoked from the per-file dispatch
+	// goroutine and should be safe for concurrent use.
+	OnFileDone func(filePath string, comments []model.LlmComment)
 }
 
 // Agent orchestrates the AI-powered code review. LLM tool-use loop / memory
@@ -361,6 +367,16 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 	}
 	toDispatch := a.applyResume(a.diffs)
 
+	if a.args.OnFileDone != nil && a.args.Resume != nil {
+		for _, item := range a.args.Resume.Items {
+			path := item.NewPath
+			if path == "" {
+				path = item.FilePath
+			}
+			a.args.OnFileDone(path, item.Comments)
+		}
+	}
+
 	var wg sync.WaitGroup
 
 	concurrency := a.args.MaxConcurrency
@@ -393,7 +409,10 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 			defer func() {
 				if r := recover(); r != nil {
 					atomic.AddInt64(&a.subtaskFailed, 1)
-					a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, fmt.Sprintf("panic: %v", r))
+					a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, fmt.Sprintf("panic: %v", r), nil)
+					if a.args.OnFileDone != nil {
+						a.args.OnFileDone(d.NewPath, nil)
+					}
 					fmt.Fprintf(stdout.Writer(), "[ocr] Subtask panic for %s: %v\n%s\n", d.NewPath, r, debug.Stack())
 					telemetry.ErrorEvent(ctx, "subtask.panic", fmt.Errorf("panic: %v", r),
 						telemetry.AnyToAttr("file.path", d.NewPath))
@@ -410,24 +429,62 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 				fileCtx = ctx
 			}
 
-			completed, skipReason, err := a.executeSubtask(fileCtx, d)
-			if err != nil {
+			const maxRetries = 3
+			var (
+				completed  bool
+				skipReason string
+				lastErr    error
+			)
+			for attempt := 0; attempt < maxRetries; attempt++ {
+				if attempt > 0 {
+					// Clear stale comments from the failed attempt before retrying
+					a.args.CommentCollector.RemoveByPath(d.NewPath)
+					backoff := time.Duration(1<<(attempt-1)) * time.Second
+					fmt.Fprintf(stdout.Writer(), "[ocr] Retry %d/%d for %s after %v\n", attempt, maxRetries-1, d.NewPath, backoff)
+					select {
+					case <-time.After(backoff):
+					case <-fileCtx.Done():
+						break
+					}
+					if fileCtx.Err() != nil {
+						lastErr = fileCtx.Err()
+						break
+					}
+				}
+
+				completed, skipReason, lastErr = a.executeSubtask(fileCtx, d)
+				if lastErr == nil {
+					break
+				}
+				fmt.Fprintf(stdout.Writer(), "[ocr] Subtask error for %s (attempt %d/%d): %v\n", d.NewPath, attempt+1, maxRetries, lastErr)
+			}
+
+			comments := a.args.CommentCollector.CommentsForPath(d.NewPath)
+			if lastErr != nil {
 				atomic.AddInt64(&a.subtaskFailed, 1)
-				a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, err.Error())
-				fmt.Fprintf(stdout.Writer(), "[ocr] Subtask error for %s: %v\n", d.NewPath, err)
-				telemetry.ErrorEvent(fileCtx, "subtask.error", err,
+				a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, lastErr.Error(), comments)
+				if a.args.OnFileDone != nil {
+					a.args.OnFileDone(d.NewPath, comments)
+				}
+				fmt.Fprintf(stdout.Writer(), "[ocr] Subtask failed for %s after %d attempts: %v\n", d.NewPath, maxRetries, lastErr)
+				telemetry.ErrorEvent(fileCtx, "subtask.error", lastErr,
 					telemetry.AnyToAttr("file.path", d.NewPath))
-				a.recordWarning("subtask_error", d.NewPath, err.Error())
+				a.recordWarning("subtask_error", d.NewPath, lastErr.Error())
 				return
 			}
 			if !completed {
 				if skipReason != "" {
-					a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, skipReason)
+					a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, skipReason, comments)
+				}
+				if a.args.OnFileDone != nil {
+					a.args.OnFileDone(d.NewPath, comments)
 				}
 				return
 			}
-			comments := a.args.CommentCollector.CommentsForPath(d.NewPath)
 			a.session.RecordReviewItemDone(d.NewPath, d.OldPath, d.NewPath, fingerprint, comments)
+			if a.args.OnFileDone != nil {
+				a.args.OnFileDone(d.NewPath, comments)
+			}
 		}(toDispatch[i])
 	}
 
@@ -458,7 +515,7 @@ func (a *Agent) applyResume(diffs []model.Diff) []model.Diff {
 
 	mode := a.reviewMode()
 	toDispatch := make([]model.Diff, 0, len(diffs))
-	var reused int64
+	var reused, retried int64
 	for _, d := range diffs {
 		if d.IsDeleted {
 			toDispatch = append(toDispatch, d)
@@ -467,6 +524,11 @@ func (a *Agent) applyResume(diffs []model.Diff) []model.Diff {
 		fingerprint := reviewItemFingerprint(mode, d)
 		item, ok := resume.Item(fingerprint)
 		if !ok {
+			// Log explicitly when a file was previously failed and is now retried.
+			if prevPath, wasFailed := resume.FailedFiles[fingerprint]; wasFailed {
+				fmt.Fprintf(stdout.Writer(), "[ocr] Resume retrying previously failed file: %s\n", prevPath)
+				retried++
+			}
 			toDispatch = append(toDispatch, d)
 			continue
 		}
@@ -485,7 +547,8 @@ func (a *Agent) applyResume(diffs []model.Diff) []model.Diff {
 		PreviousModel: resume.Model,
 		CurrentModel:  a.args.Model,
 	}
-	fmt.Fprintf(stdout.Writer(), "[ocr] Resume %s: reusing %d file(s), reviewing %d file(s)\n", resume.SessionID, reused, rerun)
+	fmt.Fprintf(stdout.Writer(), "[ocr] Resume %s: reusing %d file(s), retrying %d failed file(s), reviewing %d new file(s)\n",
+		resume.SessionID, reused, retried, rerun-retried)
 	return toDispatch
 }
 
