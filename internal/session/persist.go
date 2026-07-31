@@ -107,7 +107,16 @@ func (jw *jsonlWriter) open() error {
 	}
 
 	filename := filepath.Join(sessionDir, jw.sessionID+".jsonl")
-	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	// When resuming from a prior session, append to the existing file so
+	// subsequent --resume calls can replay all records (original + appended)
+	// from the same JSONL. Otherwise truncate to start fresh.
+	flags := os.O_CREATE | os.O_WRONLY
+	if jw.resumedFrom != "" {
+		flags |= os.O_APPEND
+	} else {
+		flags |= os.O_TRUNC
+	}
+	f, err := os.OpenFile(filename, flags, 0600)
 	if err != nil {
 		return fmt.Errorf("open session file: %w", err)
 	}

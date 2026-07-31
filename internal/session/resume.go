@@ -129,6 +129,7 @@ func (s *ResumeState) applyResumeLine(line []byte) error {
 			s.FailedFiles[rec.Fingerprint] = filePath
 			return nil
 		}
+		delete(s.FailedFiles, rec.Fingerprint)
 		s.Items[rec.Fingerprint] = ResumeItem{
 			FilePath:    filePath,
 			OldPath:     rec.OldPath,

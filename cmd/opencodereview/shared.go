@@ -263,6 +263,11 @@ type ResultProvider interface {
 	// comments; this lets the output layer set a typed "budget_exceeded"
 	// status distinct from success / warnings / errors.
 	BudgetExceeded() bool
+	// SubtaskFailed returns the number of files whose review subtask failed.
+	// Zero when all files reviewed successfully. Callers should print the
+	// session ID and a --resume hint when any files failed, so the user
+	// knows they can retry from the current session checkpoint.
+	SubtaskFailed() int64
 }
 
 type resumeInfoProvider interface {

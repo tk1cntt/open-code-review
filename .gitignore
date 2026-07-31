@@ -9,6 +9,11 @@ npm/*/bin/
 .claude/plans
 .claude/settings.local.json
 
+# Environment files
+.env
+.env.*
+!.env.example
+
 CLAUDE.md
 pages/package-lock.json
 scripts/hooks/

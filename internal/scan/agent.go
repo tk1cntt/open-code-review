@@ -197,6 +197,9 @@ func (a *Agent) SessionID() string {
 // FilesReviewed returns the number of items included in this scan.
 func (a *Agent) FilesReviewed() int64 { return int64(len(a.items)) }
 
+// SubtaskFailed returns the number of files whose review subtask failed.
+func (a *Agent) SubtaskFailed() int64 { return atomic.LoadInt64(&a.subtaskFailed) }
+
 // Diffs returns the scanned items adapted to model.Diff form so callers
 // (e.g. cmd/opencodereview's outputJSON / ResolveLineNumbers) can treat
 // both review and scan results uniformly.

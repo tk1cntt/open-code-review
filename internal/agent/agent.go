@@ -293,6 +293,9 @@ func (a *Agent) FilesReviewed() int64 {
 	return countDispatchable(a.diffs)
 }
 
+// SubtaskFailed returns the number of files whose review subtask failed.
+func (a *Agent) SubtaskFailed() int64 { return atomic.LoadInt64(&a.subtaskFailed) }
+
 // Diffs returns the parsed diffs loaded by the agent.
 func (a *Agent) Diffs() []model.Diff {
 	return a.diffs

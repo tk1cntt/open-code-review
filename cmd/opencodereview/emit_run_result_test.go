@@ -28,6 +28,7 @@ type mockResultProvider struct {
 	resumeInfo       *agent.ResumeInfo
 	sessionID        string
 	budgetExceeded   bool
+	subtaskFailed    int64
 }
 
 func (m *mockResultProvider) Diffs() []model.Diff            { return m.diffs }
@@ -43,6 +44,7 @@ func (m *mockResultProvider) ToolCalls() map[string]int64    { return m.toolCall
 func (m *mockResultProvider) ResumeInfo() *agent.ResumeInfo  { return m.resumeInfo }
 func (m *mockResultProvider) SessionID() string              { return m.sessionID }
 func (m *mockResultProvider) BudgetExceeded() bool           { return m.budgetExceeded }
+func (m *mockResultProvider) SubtaskFailed() int64           { return m.subtaskFailed }
 
 func TestEmitRunResult_JSONNoFiles(t *testing.T) {
 	ag := &mockResultProvider{filesReviewed: 0}

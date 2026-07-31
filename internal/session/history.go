@@ -106,8 +106,14 @@ type SessionOptions struct {
 }
 
 // New creates a new SessionHistory with the given repo directory.
+// When opts.ResumedFrom is set, the returned session reuses that session ID
+// so new records are appended to the same JSONL file — this way subsequent
+// --resume calls see all records (original + appended) when replaying.
 func New(repoDir, gitBranch, model string, opts SessionOptions) *SessionHistory {
-	sessionID := generateUUID()
+	sessionID := opts.ResumedFrom
+	if sessionID == "" {
+		sessionID = generateUUID()
+	}
 	sh := &SessionHistory{
 		SessionID:    sessionID,
 		RepoDir:      repoDir,

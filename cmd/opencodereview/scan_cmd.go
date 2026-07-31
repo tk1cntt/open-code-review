@@ -369,6 +369,12 @@ func runScan(args []string) error {
 		return fmt.Errorf("scan failed: %w", err)
 	}
 
+	if failed := ag.SubtaskFailed(); failed > 0 {
+		if id := ag.SessionID(); id != "" {
+			fmt.Fprintf(os.Stderr, "[ocr] %d file(s) failed — Session: %s (retry with: --resume %s)\n", failed, id, id)
+		}
+	}
+
 	duration := time.Since(startTime)
 	if opts.saveResult {
 		if opts.resultDir == "" {
