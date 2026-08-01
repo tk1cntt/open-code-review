@@ -772,3 +772,244 @@ func TestSavePerFile_MarkdownContent(t *testing.T) {
 		}
 	}
 }
+
+func TestMergePerFileIndex_PreservesCreatedAt(t *testing.T) {
+	createdAt := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+	existing := &PerFileIndex{
+		ID:        "old-id",
+		CreatedAt: createdAt,
+		Project:   ProjectInfo{Name: "proj"},
+		Review: ReviewInfo{
+			Mode:            "full_scan",
+			FilesReviewed:   3,
+			CommentCount:    5,
+			TotalTokens:     10000,
+			InputTokens:     8000,
+			OutputTokens:    2000,
+			CacheReadTokens: 500,
+		},
+		Files: []PerFileEntry{
+			{Path: "src/a.go", CommentCount: 2, MD: "src/a.go.md"},
+			{Path: "src/b.go", CommentCount: 3, MD: "src/b.go.md"},
+		},
+		Warnings: []Warning{{File: "src/a.go", Message: "slow file", Type: "subtask_warning"}},
+	}
+
+	// New (resume) run: file a.go was re-reviewed, file b.go was reused,
+	// and file c.go is new.
+	newIdx := &PerFileIndex{
+		ID:        "new-id",
+		CreatedAt: time.Now().UTC(),
+		Project:   ProjectInfo{Name: "proj"},
+		Review: ReviewInfo{
+			Mode:            "full_scan",
+			FilesReviewed:   3,
+			CommentCount:    5,
+			TotalTokens:     3000,
+			InputTokens:     2500,
+			OutputTokens:    500,
+			CacheReadTokens: 200,
+		},
+		Files: []PerFileEntry{
+			{Path: "src/a.go", CommentCount: 4, MD: "src/a.go.md"},
+			{Path: "src/c.go", CommentCount: 1, MD: "src/c.go.md"},
+		},
+		Warnings: []Warning{{File: "src/c.go", Message: "new warning", Type: "subtask_warning"}},
+	}
+
+	merged := mergePerFileIndex(existing, newIdx)
+
+	// Preserved created_at from existing (original run).
+	if !merged.CreatedAt.Equal(createdAt) {
+		t.Errorf("CreatedAt = %v, want %v", merged.CreatedAt, createdAt)
+	}
+
+	// Files: a.go updated (re-reviewed), b.go kept (reused), c.go added (new).
+	if len(merged.Files) != 3 {
+		t.Fatalf("Files len = %d, want 3", len(merged.Files))
+	}
+	fileMap := make(map[string]PerFileEntry)
+	for _, f := range merged.Files {
+		fileMap[f.Path] = f
+	}
+	if fileMap["src/a.go"].CommentCount != 4 {
+		t.Errorf("a.go CommentCount = %d, want 4 (re-reviewed)", fileMap["src/a.go"].CommentCount)
+	}
+	if fileMap["src/b.go"].CommentCount != 3 {
+		t.Errorf("b.go CommentCount = %d, want 3 (reused)", fileMap["src/b.go"].CommentCount)
+	}
+	if _, ok := fileMap["src/c.go"]; !ok {
+		t.Error("c.go missing (should be added as new)")
+	}
+
+	// Token accumulation.
+	if merged.Review.TotalTokens != 13000 {
+		t.Errorf("TotalTokens = %d, want 13000", merged.Review.TotalTokens)
+	}
+	if merged.Review.InputTokens != 10500 {
+		t.Errorf("InputTokens = %d, want 10500", merged.Review.InputTokens)
+	}
+	if merged.Review.CacheReadTokens != 700 {
+		t.Errorf("CacheReadTokens = %d, want 700", merged.Review.CacheReadTokens)
+	}
+
+	// Warnings: deduplicated across runs (existing + new).
+	warnCount := len(merged.Warnings)
+	if warnCount != 2 {
+		t.Errorf("Warnings len = %d, want 2 (one from each run)", warnCount)
+	}
+}
+
+func TestMergePerFileIndex_WarnDedup(t *testing.T) {
+	existing := &PerFileIndex{
+		ID:      "old",
+		Project: ProjectInfo{Name: "proj"},
+		Review:  ReviewInfo{Mode: "full_scan"},
+		Warnings: []Warning{
+			{File: "f.go", Message: "dup msg", Type: "warn"},
+			{File: "f.go", Message: "unique old", Type: "warn"},
+		},
+	}
+	newIdx := &PerFileIndex{
+		ID:      "new",
+		Project: ProjectInfo{Name: "proj"},
+		Review:  ReviewInfo{Mode: "full_scan"},
+		Warnings: []Warning{
+			{File: "f.go", Message: "dup msg", Type: "warn"},
+			{File: "f.go", Message: "unique new", Type: "warn"},
+		},
+	}
+
+	merged := mergePerFileIndex(existing, newIdx)
+	if len(merged.Warnings) != 3 {
+		t.Errorf("Warnings len = %d, want 3 (deduplicated)", len(merged.Warnings))
+	}
+}
+
+func TestPerFileWriter_FinalizeMerge(t *testing.T) {
+	root := t.TempDir()
+	project := ProjectInfo{Name: "merge-proj"}
+
+	// Simulate run 1: write an index.json directly (as if Finalize was called).
+	baseDir := filepath.Join(root, ProjectKey(project), "merge-id")
+	if err := os.MkdirAll(baseDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	existing := PerFileIndex{
+		ID:        "merge-id",
+		CreatedAt: time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC),
+		Project:   project,
+		Review: ReviewInfo{
+			Mode:          "full_scan",
+			FilesReviewed: 2,
+			CommentCount:  3,
+			TotalTokens:   5000,
+			InputTokens:   4000,
+			OutputTokens:  1000,
+		},
+		Files: []PerFileEntry{
+			{Path: "src/x.go", CommentCount: 2, MD: "src/x.go.md"},
+			{Path: "src/y.go", CommentCount: 1, MD: "src/y.go.md"},
+		},
+	}
+	if err := writePerFileJSON(filepath.Join(baseDir, "index.json"), existing); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run 2 (resume): create a PerFileWriter in the same directory.
+	pw := &PerFileWriter{
+		BaseDir:  baseDir,
+		ReviewID: "merge-id",
+		Project:  project,
+		entries: []PerFileEntry{
+			{Path: "src/x.go", CommentCount: 3, MD: "src/x.go.md"},
+			{Path: "src/z.go", CommentCount: 2, MD: "src/z.go.md"},
+		},
+	}
+
+	// Write per-file md for new entries.
+	for _, e := range pw.entries {
+		mdPath := filepath.Join(baseDir, filepath.FromSlash(e.MD))
+		if err := os.MkdirAll(filepath.Dir(mdPath), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(mdPath, []byte("dummy"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	indexPath, err := pw.Finalize(ReviewInfo{
+		Mode:          "full_scan",
+		FilesReviewed: 2,
+		CommentCount:  3,
+		TotalTokens:   2000,
+		InputTokens:   1500,
+		OutputTokens:  500,
+	}, GitLabInfo{}, nil)
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+
+	raw, _ := os.ReadFile(indexPath)
+	var merged PerFileIndex
+	if err := json.Unmarshal(raw, &merged); err != nil {
+		t.Fatalf("parse merged index.json: %v", err)
+	}
+
+	// Preserved created_at.
+	if !merged.CreatedAt.Equal(existing.CreatedAt) {
+		t.Errorf("CreatedAt = %v, want %v", merged.CreatedAt, existing.CreatedAt)
+	}
+
+	// Files: x.go (re-reviewed), y.go (reused), z.go (new).
+	if len(merged.Files) != 3 {
+		t.Fatalf("Files len = %d, want 3", len(merged.Files))
+	}
+	fileMap := make(map[string]PerFileEntry)
+	for _, f := range merged.Files {
+		fileMap[f.Path] = f
+	}
+	if fileMap["src/x.go"].CommentCount != 3 {
+		t.Errorf("x.go CommentCount = %d, want 3", fileMap["src/x.go"].CommentCount)
+	}
+	if _, ok := fileMap["src/y.go"]; !ok {
+		t.Error("y.go missing (should be kept from run 1)")
+	}
+	if _, ok := fileMap["src/z.go"]; !ok {
+		t.Error("z.go missing (should be added from run 2)")
+	}
+
+	// Tokens accumulated.
+	if merged.Review.TotalTokens != 7000 {
+		t.Errorf("TotalTokens = %d, want 7000", merged.Review.TotalTokens)
+	}
+}
+
+func TestPerFileWriter_FinalizeNoMerge(t *testing.T) {
+	root := t.TempDir()
+	project := ProjectInfo{Name: "fresh-proj"}
+
+	pw, err := NewPerFileWriter(root, project, "fresh-id")
+	if err != nil {
+		t.Fatalf("NewPerFileWriter: %v", err)
+	}
+	pw.WriteFile("src/f.go", []model.LlmComment{{Path: "src/f.go", Content: "bug", Severity: "high"}})
+
+	before := time.Now().UTC()
+	_, err = pw.Finalize(ReviewInfo{Mode: "full_scan", FilesReviewed: 1, CommentCount: 1}, GitLabInfo{}, nil)
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+
+	raw, _ := os.ReadFile(filepath.Join(pw.BaseDir, "index.json"))
+	var idx PerFileIndex
+	json.Unmarshal(raw, &idx)
+
+	// No existing index — created_at should be recent.
+	if idx.CreatedAt.Before(before) {
+		t.Errorf("CreatedAt = %v, should be >= %v", idx.CreatedAt, before)
+	}
+	if len(idx.Files) != 1 {
+		t.Errorf("Files len = %d, want 1", len(idx.Files))
+	}
+}

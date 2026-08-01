@@ -173,7 +173,8 @@ type Agent struct {
 	subtaskFailed   int64 // count of failed subtasks, accessed atomically
 	runner          *llmloop.Runner
 	resumeInfo      *ResumeInfo
-	budgetExceeded  bool // set when a token/tool-call budget gate stopped dispatch
+	reusedCount     int64 // number of files reused from previous session (resume only)
+	budgetExceeded  bool  // set when a token/tool-call budget gate stopped dispatch
 
 	// inputResolution holds this run's frozen commit endpoints (resolved_base/
 	// head/exact_range), and repoRemoteIdentity the credential-free repository
@@ -382,10 +383,23 @@ func (a *Agent) ResumeInfo() *ResumeInfo {
 	return &info
 }
 
-// FilesReviewed returns the number of dispatchable files included in this review.
+// FilesReviewed returns the number of newly-reviewed (non-reused) files
+// dispatched in this review run. On resume, this excludes reused results
+// from the previous session; use TotalFilesReviewed for the combined count.
 func (a *Agent) FilesReviewed() int64 {
-	return countDispatchable(a.diffs)
+	n := countDispatchable(a.diffs)
+	if a.reusedCount > n {
+		return 0
+	}
+	return n - a.reusedCount
 }
+
+// FilesReused returns the number of files whose results were reused from a
+// previous session. Zero for non-resume runs.
+func (a *Agent) FilesReused() int64 { return a.reusedCount }
+
+// TotalFilesReviewed returns the total count of dispatchable files (new + reused).
+func (a *Agent) TotalFilesReviewed() int64 { return countDispatchable(a.diffs) }
 
 // SubtaskFailed returns the number of files whose review subtask failed.
 func (a *Agent) SubtaskFailed() int64 { return atomic.LoadInt64(&a.subtaskFailed) }
@@ -775,6 +789,7 @@ func (a *Agent) applyResume(diffs []model.Diff) []model.Diff {
 	}
 
 	rerun := countDispatchable(toDispatch)
+	a.reusedCount = reused
 	a.resumeInfo = &ResumeInfo{
 		ResumedFrom:   resume.SessionID,
 		ReusedFiles:   reused,

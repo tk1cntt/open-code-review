@@ -126,7 +126,7 @@ func saveScanResult(repoDir string, opts scanOptions, ag *scan.Agent, comments [
 		Review: reviewstore.ReviewInfo{
 			Mode:             session.ReviewModeFullScan,
 			Model:            sess.Model,
-			FilesReviewed:    ag.FilesReviewed(),
+			FilesReviewed:    ag.TotalFilesReviewed(),
 			CommentCount:     int64(len(comments)),
 			TotalTokens:      ag.TotalTokensUsed(),
 			InputTokens:      ag.TotalInputTokens(),
@@ -139,6 +139,13 @@ func saveScanResult(repoDir string, opts scanOptions, ag *scan.Agent, comments [
 		},
 		Comments: comments,
 		Warnings: mapWarnings(warnings),
+	}
+
+	if sess.ResumedFrom != "" {
+		projectKey := reviewstore.ProjectKey(result.Project)
+		if existing, loadErr := reviewstore.Load(opts.resultDir, projectKey, resultID); loadErr == nil {
+			result = mergeResults(*existing, result)
+		}
 	}
 
 	jsonPath, mdPath, saveErr := reviewstore.Save(opts.resultDir, result)
@@ -365,7 +372,7 @@ func executeScan(opts scanOptions) error {
 		}
 		reviewInfo := reviewstore.ReviewInfo{
 			Mode:             session.ReviewModeFullScan,
-			FilesReviewed:    ag.FilesReviewed(),
+			FilesReviewed:    ag.TotalFilesReviewed(),
 			CommentCount:     int64(len(comments)),
 			TotalTokens:      ag.TotalTokensUsed(),
 			InputTokens:      ag.TotalInputTokens(),

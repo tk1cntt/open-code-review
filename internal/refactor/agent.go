@@ -62,6 +62,7 @@ type Agent struct {
 	session     *session.SessionHistory
 	runner      *llmloop.Runner
 	resumeInfo  *scan.ResumeInfo
+	reusedCount int64 // number of files reused from previous session (resume only)
 
 	subtaskFailed int64
 }
@@ -125,8 +126,23 @@ func (a *Agent) SessionID() string {
 	return a.session.SessionID
 }
 
-// FilesReviewed returns the number of items included.
-func (a *Agent) FilesReviewed() int64 { return int64(len(a.items)) }
+// FilesReviewed returns the number of newly-reviewed (non-reused) items dispatched
+// in this refactor run. On resume, this excludes reused results from the previous
+// session; use TotalFilesReviewed for the combined count.
+func (a *Agent) FilesReviewed() int64 {
+	n := int64(len(a.items))
+	if a.reusedCount > n {
+		return 0
+	}
+	return n - a.reusedCount
+}
+
+// FilesReused returns the number of files whose results were reused from a
+// previous session. Zero for non-resume runs.
+func (a *Agent) FilesReused() int64 { return a.reusedCount }
+
+// TotalFilesReviewed returns the total count of items (new + reused).
+func (a *Agent) TotalFilesReviewed() int64 { return int64(len(a.items)) }
 
 // SubtaskFailed returns the number of files whose subtask failed.
 func (a *Agent) SubtaskFailed() int64 { return atomic.LoadInt64(&a.subtaskFailed) }
@@ -346,6 +362,7 @@ func (a *Agent) applyResume(items []model.ScanItem) []model.ScanItem {
 	}
 
 	rerun := int64(len(toDispatch))
+	a.reusedCount = reused
 	a.resumeInfo = &scan.ResumeInfo{
 		ResumedFrom:   resume.SessionID,
 		ReusedFiles:   reused,

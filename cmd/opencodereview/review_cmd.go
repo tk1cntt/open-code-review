@@ -326,7 +326,7 @@ func executeReview(opts reviewOptions) error {
 			From:             opts.from,
 			To:               opts.to,
 			Commit:           opts.commit,
-			FilesReviewed:    ag.FilesReviewed(),
+			FilesReviewed:    ag.TotalFilesReviewed(),
 			CommentCount:     int64(len(comments)),
 			TotalTokens:      ag.TotalTokensUsed(),
 			InputTokens:      ag.TotalInputTokens(),

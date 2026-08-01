@@ -244,7 +244,7 @@ func executeRefactor(opts refactorOptions) error {
 		}
 		reviewInfo := reviewstore.ReviewInfo{
 			Mode:             session.ReviewModeFullScan,
-			FilesReviewed:    ag.FilesReviewed(),
+			FilesReviewed:    ag.TotalFilesReviewed(),
 			CommentCount:     int64(len(comments)),
 			TotalTokens:      ag.TotalTokensUsed(),
 			InputTokens:      ag.TotalInputTokens(),
@@ -314,7 +314,7 @@ func saveRefactorResult(repoDir string, opts refactorOptions, ag *refactor.Agent
 		Review: reviewstore.ReviewInfo{
 			Mode:             session.ReviewModeFullScan,
 			Model:            sess.Model,
-			FilesReviewed:    ag.FilesReviewed(),
+			FilesReviewed:    ag.TotalFilesReviewed(),
 			CommentCount:     int64(len(comments)),
 			TotalTokens:      ag.TotalTokensUsed(),
 			InputTokens:      ag.TotalInputTokens(),
@@ -327,6 +327,13 @@ func saveRefactorResult(repoDir string, opts refactorOptions, ag *refactor.Agent
 		},
 		Comments: comments,
 		Warnings: mapWarnings(warnings),
+	}
+
+	if sess.ResumedFrom != "" {
+		projectKey := reviewstore.ProjectKey(result.Project)
+		if existing, loadErr := reviewstore.Load(opts.resultDir, projectKey, resultID); loadErr == nil {
+			result = mergeResults(*existing, result)
+		}
 	}
 
 	jsonPath, mdPath, saveErr := reviewstore.Save(opts.resultDir, result)

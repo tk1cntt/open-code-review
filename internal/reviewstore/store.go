@@ -700,6 +700,10 @@ func (w *PerFileWriter) WriteFile(filePath string, comments []model.LlmComment) 
 }
 
 // Finalize writes the index.json and returns its path.
+// If an existing index.json is present (e.g. from a previous run being
+// resumed), the new index is merged into the existing one to preserve the
+// original created_at timestamp, file entries from earlier runs, and
+// accumulated token counts.
 func (w *PerFileWriter) Finalize(review ReviewInfo, gitlab GitLabInfo, warnings []Warning) (string, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -718,10 +722,113 @@ func (w *PerFileWriter) Finalize(review ReviewInfo, gitlab GitLabInfo, warnings 
 		Warnings:  warnings,
 		Files:     w.entries,
 	}
+
+	// On resume: merge with existing index to preserve original metadata,
+	// accumulated statistics, and file entries from previous runs.
+	if existing, err := w.loadExistingIndex(); err == nil {
+		index = mergePerFileIndex(existing, &index)
+	}
+
 	if err := writePerFileJSON(indexPath, index); err != nil {
 		return "", fmt.Errorf("write index.json: %w", err)
 	}
 	return indexPath, nil
+}
+
+// loadExistingIndex reads and decodes an existing index.json from the
+// writer's base directory. It returns an error if the file is absent or
+// unreadable.
+func (w *PerFileWriter) loadExistingIndex() (*PerFileIndex, error) {
+	indexPath := filepath.Join(w.BaseDir, "index.json")
+	f, err := os.Open(indexPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var idx PerFileIndex
+	if err := json.NewDecoder(io.LimitReader(f, 10<<20)).Decode(&idx); err != nil {
+		return nil, fmt.Errorf("decode existing index.json: %w", err)
+	}
+	return &idx, nil
+}
+
+// mergePerFileIndex merges a previous-run index into a new (current-run)
+// index. It preserves the original created_at timestamp, merges file
+// entries (new entries win for re-reviewed files; existing entries are
+// kept for files that were reused without re-review), and accumulates
+// token counts from both runs.
+func mergePerFileIndex(existing *PerFileIndex, newIdx *PerFileIndex) PerFileIndex {
+	merged := *newIdx
+	merged.CreatedAt = existing.CreatedAt
+
+	// Build lookup maps for file entries.
+	existingByPath := make(map[string]PerFileEntry, len(existing.Files))
+	for _, f := range existing.Files {
+		existingByPath[f.Path] = f
+	}
+	newByPath := make(map[string]PerFileEntry, len(newIdx.Files))
+	for _, f := range newIdx.Files {
+		newByPath[f.Path] = f
+	}
+
+	// Merge files: for each existing file, keep the existing entry unless
+	// the new index has a re-reviewed version of the same file.
+	mergedFiles := make(map[string]PerFileEntry, len(existingByPath)+len(newByPath))
+	for path, entry := range existingByPath {
+		if newEntry, ok := newByPath[path]; ok {
+			// File was re-reviewed; use the updated entry.
+			mergedFiles[path] = newEntry
+		} else {
+			// File was reused without re-review; keep the existing entry.
+			mergedFiles[path] = entry
+		}
+	}
+	// Add files that only appear in the new index (newly added files).
+	for path, entry := range newByPath {
+		if _, ok := existingByPath[path]; !ok {
+			mergedFiles[path] = entry
+		}
+	}
+
+	merged.Files = make([]PerFileEntry, 0, len(mergedFiles))
+	for _, entry := range mergedFiles {
+		merged.Files = append(merged.Files, entry)
+	}
+	sort.Slice(merged.Files, func(i, j int) bool {
+		return merged.Files[i].Path < merged.Files[j].Path
+	})
+
+	// Accumulate summary fields.
+	// CommentCount and FilesReviewed on resume already include the reused
+	// items (the agent's CommentCollector receives them in applyResume),
+	// so use the larger value to avoid double-counting.
+	merged.Review.FilesReviewed = max(existing.Review.FilesReviewed, newIdx.Review.FilesReviewed)
+	merged.Review.CommentCount = max(existing.Review.CommentCount, newIdx.Review.CommentCount)
+	// Token counts reflect only new LLM calls made during the current
+	// resume run, so add them to the existing totals.
+	merged.Review.TotalTokens = existing.Review.TotalTokens + newIdx.Review.TotalTokens
+	merged.Review.InputTokens = existing.Review.InputTokens + newIdx.Review.InputTokens
+	merged.Review.OutputTokens = existing.Review.OutputTokens + newIdx.Review.OutputTokens
+	merged.Review.CacheReadTokens = existing.Review.CacheReadTokens + newIdx.Review.CacheReadTokens
+	merged.Review.CacheWriteTokens = existing.Review.CacheWriteTokens + newIdx.Review.CacheWriteTokens
+
+	// Merge warnings: keep warnings from both runs, deduplicated by
+	// file + message.
+	seen := make(map[string]bool)
+	for _, w := range newIdx.Warnings {
+		key := w.File + "\x00" + w.Message
+		seen[key] = true
+	}
+	for _, w := range existing.Warnings {
+		key := w.File + "\x00" + w.Message
+		if !seen[key] {
+			merged.Warnings = append(merged.Warnings, w)
+			seen[key] = true
+		}
+	}
+
+	return merged
 }
 
 // Entries returns a copy of the current entry list.

@@ -53,7 +53,7 @@ func saveReviewResult(repoDir string, opts reviewOptions, ag *agent.Agent, comme
 			To:               opts.to,
 			Commit:           opts.commit,
 			Model:            sess.Model,
-			FilesReviewed:    ag.FilesReviewed(),
+			FilesReviewed:    ag.TotalFilesReviewed(),
 			CommentCount:     int64(len(comments)),
 			TotalTokens:      ag.TotalTokensUsed(),
 			InputTokens:      ag.TotalInputTokens(),
@@ -66,6 +66,13 @@ func saveReviewResult(repoDir string, opts reviewOptions, ag *agent.Agent, comme
 		},
 		Comments: comments,
 		Warnings: mapWarnings(warnings),
+	}
+
+	if sess.ResumedFrom != "" {
+		projectKey := reviewstore.ProjectKey(result.Project)
+		if existing, loadErr := reviewstore.Load(opts.resultDir, projectKey, resultID); loadErr == nil {
+			result = mergeResults(*existing, result)
+		}
 	}
 
 	return reviewstore.Save(opts.resultDir, result)
@@ -93,4 +100,69 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// mergeResults merges a current review result into an existing one on resume.
+// Merged fields:
+//   - Comments: deduplicated by file path (current run wins for duplicate paths)
+//   - Tokens: summed across both runs
+//   - Duration: summed (parsed as time.Duration)
+//   - FilesReviewed: deduplicated unique file paths across both runs
+//   - CreatedAt: preserved from existing
+//   - Warnings: deduplicated by message content
+func mergeResults(existing, current reviewstore.Result) reviewstore.Result {
+	merged := existing
+	merged.CreatedAt = existing.CreatedAt // keep original timestamp
+
+	// Merge comments: append current, deduplicate by file path (current wins)
+	currentPaths := make(map[string]bool)
+	for _, c := range current.Comments {
+		currentPaths[c.Path] = true
+	}
+	var deduped []model.LlmComment
+	for _, c := range existing.Comments {
+		if currentPaths[c.Path] {
+			continue // current run has a newer review for this file
+		}
+		deduped = append(deduped, c)
+	}
+	deduped = append(deduped, current.Comments...)
+	merged.Comments = deduped
+	merged.Review.CommentCount = int64(len(deduped))
+
+	// Sum tokens
+	merged.Review.TotalTokens = existing.Review.TotalTokens + current.Review.TotalTokens
+	merged.Review.InputTokens = existing.Review.InputTokens + current.Review.InputTokens
+	merged.Review.OutputTokens = existing.Review.OutputTokens + current.Review.OutputTokens
+	merged.Review.CacheReadTokens = existing.Review.CacheReadTokens + current.Review.CacheReadTokens
+	merged.Review.CacheWriteTokens = existing.Review.CacheWriteTokens + current.Review.CacheWriteTokens
+
+	// Sum duration
+	merged.Review.DurationSeconds = existing.Review.DurationSeconds + current.Review.DurationSeconds
+	if existingDur, err := time.ParseDuration(existing.Review.Duration); err == nil {
+		if currentDur, err2 := time.ParseDuration(current.Review.Duration); err2 == nil {
+			merged.Review.Duration = (existingDur + currentDur).String()
+		}
+	}
+
+	// FilesReviewed: count unique file paths across both runs
+	seenPaths := make(map[string]bool)
+	for _, c := range merged.Comments {
+		seenPaths[c.Path] = true
+	}
+	merged.Review.FilesReviewed = int64(len(seenPaths))
+
+	// Merge warnings: deduplicate by message
+	existingWarn := make(map[string]bool)
+	for _, w := range existing.Warnings {
+		existingWarn[w.Message] = true
+	}
+	for _, w := range current.Warnings {
+		if !existingWarn[w.Message] {
+			merged.Warnings = append(merged.Warnings, w)
+			existingWarn[w.Message] = true
+		}
+	}
+
+	return merged
 }
