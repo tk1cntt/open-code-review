@@ -146,6 +146,9 @@ func (a *Agent) ProjectSummary() string { return "" }
 // BudgetExceeded always returns false for refactor.
 func (a *Agent) BudgetExceeded() bool { return false }
 
+// RunManifest returns nil because refactor is outside v1 run manifest coverage.
+func (a *Agent) RunManifest() *session.RunManifest { return nil }
+
 // ResumeInfo returns resume metadata.
 func (a *Agent) ResumeInfo() *scan.ResumeInfo {
 	if a.resumeInfo == nil {

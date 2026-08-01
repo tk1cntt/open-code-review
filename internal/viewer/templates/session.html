@@ -3,16 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Review Findings — {{.RepoName}}</title>
+    <title>Session Detail - Open Code Review Viewer</title>
+
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<nav class="breadcrumb"><a href="/">Open Code Review Viewer</a> &rsaquo; <a href="/r/{{.EncodedRepo}}">{{.RepoName}}</a> &rsaquo; Findings</nav>
+<nav class="breadcrumb"><a href="/" class="nav-brand"><span class="brand-icon"></span>Open Code Review Viewer</a><span class="sep">/</span><a href="/r/{{.EncodedRepo}}">{{.RepoName}}</a><span class="sep">/</span><span class="current">{{.Session.Summary.SessionID | truncate 12}}</span></nav>
 <main>
 
 <!-- Session Header -->
 <div class="session-header">
-    <h2>Review Findings</h2>
+    <h2>Session Detail</h2>
     <div class="meta">
         <span><strong>Session:</strong> {{.Session.Summary.SessionID | truncate 12}}</span>
         <span><strong>Branch:</strong> {{.Session.Summary.GitBranch}}</span>
@@ -27,14 +28,29 @@
         <span><strong>Model:</strong> <code>{{.Session.Summary.Model}}</code></span>
         <span><strong>Duration:</strong> {{formatDuration .Session.Summary.DurationSec}}</span>
         <span><strong>Files:</strong> {{.Session.Summary.FileCount}}</span>
+        <span><strong>Status:</strong> {{if .Session.Summary.Aborted}}aborted{{else if .Session.Summary.Legacy}}legacy{{else}}{{.Session.Summary.TerminalState}}{{end}}</span>
     </div>
 </div>
 
-<!-- Review Summary Dashboard -->
+{{if .Session.Summary.RunManifest}}
+<div class="token-summary">
+    <h3>Coverage</h3>
+    <div class="token-stats">
+        <div class="token-item"><div class="token-value">{{.Session.Summary.SelectedCount}}</div><div class="token-label">Selected</div></div>
+        <div class="token-item"><div class="token-value">{{.Session.Summary.CompletedCount}}</div><div class="token-label">Completed</div></div>
+        <div class="token-item"><div class="token-value">{{.Session.Summary.ReusedCount}}</div><div class="token-label">Reused</div></div>
+        <div class="token-item"><div class="token-value{{if .Session.Summary.FailedCount}} badge-error{{end}}">{{.Session.Summary.FailedCount}}</div><div class="token-label">Failed</div></div>
+        <div class="token-item"><div class="token-value">{{.Session.Summary.WaivedCount}}</div><div class="token-label">Waived</div></div>
+    </div>
+</div>
+{{end}}
+
+<!-- Review Dashboard — severity / category filter chips -->
+{{if .Session.Comments}}
 <div class="review-dashboard">
     <div class="summary-overview">
         <div class="summary-total">
-            <div class="summary-big-num">{{len .Session.Findings}}</div>
+            <div class="summary-big-num">{{len .Session.Comments}}</div>
             <div class="summary-label">Findings</div>
         </div>
         <div class="summary-total">
@@ -49,7 +65,7 @@
                 {{range severityOrder}}
                 {{$count := index $.Session.SeverityCount .}}
                 {{if $count}}
-                <span class="severity-badge {{severityClass .}} filter-chip" data-filter="severity" data-value="{{.}}">
+                <span class="severity-badge filter-chip {{severityClass .}}" data-filter="severity" data-value="{{.}}">
                     {{.}} <span class="badge-count">{{$count}}</span>
                 </span>
                 {{end}}
@@ -73,55 +89,75 @@
         </div>
     </div>
 </div>
-
-<!-- Findings List -->
-<h3>Findings ({{len .Session.Findings}})</h3>
-{{if .Session.Findings}}
-<div class="findings-list" id="findingsList">
-{{range .Session.Findings}}
-<div class="finding-card"
-     data-severity="{{.Severity | lower}}"
-     data-category="{{.Category | lower}}">
-    <div class="finding-header">
-        <div class="finding-header-left">
-            {{if .Severity}}<span class="severity-badge {{severityClass .Severity}}">{{.Severity}}</span>{{end}}
-            {{if .Category}}<span class="category-badge">{{categoryIcon .Category}} {{.Category}}</span>{{end}}
-            <span class="finding-file" title="{{.FilePath}}">{{.FilePath}}</span>
-            {{if or .StartLine .EndLine}}
-            <span class="finding-lines">
-                {{if .StartLine}}L{{.StartLine}}{{end}}
-                {{if .EndLine}}–L{{.EndLine}}{{end}}
-            </span>
-            {{end}}
-        </div>
-    </div>
-    <div class="finding-body">
-        {{if .Content}}
-        <div class="finding-comment response-text">{{.Content}}</div>
-        {{end}}
-        {{if or .ExistingCode .SuggestionCode}}
-        <div class="diff-container">
-            <div class="diff-pane diff-pane-left">
-                <div class="diff-pane-header">Existing Code</div>
-                <pre class="diff-code"><code>{{.ExistingCode}}</code></pre>
-            </div>
-            <div class="diff-pane diff-pane-right">
-                <div class="diff-pane-header">Suggestion</div>
-                <pre class="diff-code"><code>{{.SuggestionCode}}</code></pre>
-            </div>
-        </div>
-        {{end}}
-    </div>
-</div>
 {{end}}
-</div>
-<div class="no-findings-msg" id="noFindingsMsg" style="display:none">
-    <p>No findings match the current filter.</p>
+
+{{if .Session.Comments}}
+<div class="comments-section">
+    <h3>Review Comments ({{len .Session.Comments}} findings)</h3>
+    {{with severityCounts .Session.Comments}}
+    <div class="severity-bar">
+        {{if .Critical}}<span class="severity-badge severity-critical">Critical: {{.Critical}}</span>{{end}}
+        {{if .High}}<span class="severity-badge severity-high">High: {{.High}}</span>{{end}}
+        {{if .Medium}}<span class="severity-badge severity-medium">Medium: {{.Medium}}</span>{{end}}
+        {{if .Low}}<span class="severity-badge severity-low">Low: {{.Low}}</span>{{end}}
+    </div>
+    {{end}}
+    <div class="comment-groups" id="commentGroups">
+    {{range groupCommentsByFile .Session.Comments}}
+    <details class="comment-file-group" data-file-group open>
+        <summary class="comment-file-header">
+            <span class="chevron"></span>
+            <span class="file-path">{{.FilePath}}</span>
+            <span class="file-count-badge">{{len .Comments}} comments</span>
+        </summary>
+        <div class="comment-file-body">
+        {{range .Comments}}
+            <div class="comment-card" data-severity="{{.Severity | lower}}" data-category="{{.Category | lower}}">
+                <div class="comment-meta">
+                    {{if .Category}}<span class="comment-badge {{categoryClass .Category}}">{{.Category}}</span>{{end}}
+                    {{if .Severity}}<span class="comment-badge {{severityClass .Severity}}">{{.Severity}}</span>{{end}}
+                    {{if .StartLine}}<span class="comment-lines">L{{.StartLine}}{{if and .EndLine (ne .EndLine .StartLine)}}-L{{.EndLine}}{{end}}</span>{{end}}
+                </div>
+                <div class="comment-content">{{.Content}}</div>
+                {{if or .ExistingCode .SuggestionCode}}
+                <div class="comment-code-diff">
+                    {{if .ExistingCode}}
+                    <div class="code-panel code-existing">
+                        <div class="code-panel-label">Existing Code</div>
+                        <pre><code>{{.ExistingCode}}</code></pre>
+                    </div>
+                    {{end}}
+                    {{if .SuggestionCode}}
+                    <div class="code-panel code-suggestion">
+                        <div class="code-panel-label">Suggested Change</div>
+                        <pre><code>{{.SuggestionCode}}</code></pre>
+                    </div>
+                    {{end}}
+                </div>
+                {{end}}
+            </div>
+        {{end}}
+        </div>
+    </details>
+    {{end}}
+    </div>
+    <div class="no-findings-msg" id="noFindingsMsg" style="display:none">
+        <p>No findings match the current filter.</p>
+    </div>
 </div>
 {{else}}
 <div class="empty-state">
     <p>No review findings in this session. The LLM did not flag any issues, or findings were not recorded.</p>
 </div>
+{{end}}
+
+{{if .Session.Summary.FilesReviewed}}
+<h3>Files Reviewed</h3>
+<ul class="file-list">
+{{range .Session.Summary.FilesReviewed}}
+    <li>{{.}}</li>
+{{end}}
+</ul>
 {{end}}
 
 <!-- Token Usage (collapsed) -->
@@ -303,7 +339,7 @@
     var activeFilters = { severity: '', category: '' };
 
     function applyFilters() {
-        var cards = document.querySelectorAll('.finding-card');
+        var cards = document.querySelectorAll('.comment-card');
         var visibleCount = 0;
         cards.forEach(function(card) {
             var match = true;
@@ -312,6 +348,14 @@
             card.style.display = match ? '' : 'none';
             if (match) visibleCount++;
         });
+
+        // Hide empty file groups
+        document.querySelectorAll('.comment-file-group').forEach(function(group) {
+            var visible = group.querySelectorAll('.comment-card[style*="display: none"]').length;
+            var total = group.querySelectorAll('.comment-card').length;
+            group.style.display = (visible === total) ? 'none' : '';
+        });
+
         var msg = document.getElementById('noFindingsMsg');
         if (msg) msg.style.display = visibleCount === 0 ? '' : 'none';
     }

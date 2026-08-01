@@ -15,6 +15,7 @@ import (
 	"github.com/alibaba/open-code-review/internal/session"
 	"github.com/alibaba/open-code-review/internal/telemetry"
 	"github.com/alibaba/open-code-review/internal/tool"
+	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel/codes"
 )
 
@@ -30,68 +31,44 @@ type refactorOptions struct {
 	preview                                            bool
 }
 
-func parseRefactorFlags(args []string) (refactorOptions, error) {
-	a := newOcrFlagSet("ocr refactor")
-	opts := refactorOptions{}
+var refactorOpts refactorOptions
 
-	a.StringVar(&opts.toolConfigPath, "tools", "", "path to JSON tools config file (default: embedded)")
-	a.StringVar(&opts.rulePath, "rule", "", "path to JSON file with system refactoring rules")
-	a.StringVar(&opts.repoDir, "repo", "", "root directory of the git repository (default: current dir)")
-	a.StringVar(&opts.paths, "path", "", "comma-separated repo-relative directories or files to refactor (default: whole repo)")
-	a.StringVar(&opts.excludes, "exclude", "", "comma-separated gitignore-style patterns to exclude; merged with rule.json excludes")
-	a.StringVarP(&opts.outputFormat, "format", "f", "text", "output format: text or json")
-	a.IntVar(&opts.concurrency, "concurrency", 8, "max concurrent file analyses")
-	a.IntVar(&opts.perFileTimeout, "timeout", 10, "concurrent task timeout in minutes")
-	a.StringVar(&opts.audience, "audience", "human", "output audience: human (show progress) or agent (summary only)")
-	a.StringVarP(&opts.background, "background", "b", "", "optional requirement/business context for the refactoring")
-	a.IntVar(&opts.maxTools, "max-tools", 0, "max tool call rounds per file; only takes effect when greater than template default")
-	a.IntVar(&opts.maxGitProcs, "max-git-procs", 16, "max concurrent git subprocesses")
-	a.IntVar(&opts.maxTokensBudget, "max-tokens-budget", 0, "cap total token usage (input+output); dispatch stops once exceeded (0 = unlimited)")
-	a.BoolVarP(&opts.preview, "preview", "p", false, "preview which files will be analyzed without running the LLM")
-	a.BoolVar(&opts.noPlan, "no-plan", false, "skip the per-file PLAN_TASK pre-pass (one fewer LLM call per file; may reduce analysis focus)")
-	a.StringVar(&opts.model, "model", "", "override LLM model for this refactoring (e.g., claude-opus-4-6)")
-	a.StringVar(&opts.resume, "resume", "", "resume from a previous refactoring session id")
-	a.BoolVar(&opts.saveResult, "save-result", true, "persist final refactoring result for the WebUI viewer")
-	a.BoolVar(&opts.savePerFile, "save-per-file", true, "split output into per-file markdown files under a directory tree mirroring the source tree")
-	a.StringVar(&opts.resultDir, "result-dir", "", "refactoring result storage root (env: OCR_REVIEWS_DIR, default: .opencodereview/reviews)")
-	a.StringVar(&opts.resultProject, "result-project", "", "project name/path for persisted refactoring results")
+var refactorCmd = &cobra.Command{
+	Use:     "refactor [flags]",
+	Aliases: []string{"rf"},
+	Short:   "Analyze code and suggest refactoring improvements",
+	Long:    "OpenCodeReview - AI-Powered Code Refactoring\n\nAnalyze code and suggest refactoring improvements using a configurable LLM.",
+	Args:    cobra.NoArgs,
+	Example: `  # Analyze the entire repository
+  ocr refactor
 
-	if err := a.Parse(args); err != nil {
-		return opts, fmt.Errorf("parse flags: %w", err)
-	}
+  # Analyze a single directory
+  ocr refactor --path internal/agent
 
-	opts.showHelp = a.showHelp
-	if opts.showHelp {
-		return opts, nil
-	}
+  # Analyze multiple files
+  ocr refactor --path internal/agent/agent.go,internal/diff/scan.go
 
-	switch opts.audience {
-	case "human", "agent":
-	default:
-		return opts, fmt.Errorf("invalid --audience value %q: must be 'human' or 'agent'", opts.audience)
-	}
+  # Preview which files would be analyzed without calling the LLM
+  ocr refactor --preview
 
-	if opts.maxTools < 0 {
-		return opts, fmt.Errorf("--max-tools must be a non-negative integer (0 means use template default)")
-	}
-	if opts.maxGitProcs < 0 {
-		return opts, fmt.Errorf("--max-git-procs must be a non-negative integer (0 means use default 16)")
-	}
-	if opts.maxTokensBudget < 0 {
-		return opts, fmt.Errorf("--max-tokens-budget must be a non-negative integer (0 means unlimited)")
-	}
-	return opts, nil
+  # Skip the per-file PLAN_TASK pre-pass (saves ~1 LLM call per file)
+  ocr refactor --no-plan
+
+  # Exclude generated files / fixtures
+  ocr refactor --exclude '**/generated/*,**/testdata/*'`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := validateRefactorOptions(&refactorOpts); err != nil {
+			return err
+		}
+		return executeRefactor(refactorOpts)
+	},
 }
 
-func runRefactor(args []string) error {
-	opts, err := parseRefactorFlags(args)
-	if err != nil {
-		return err
-	}
-	if opts.showHelp {
-		printRefactorUsage()
-		return nil
-	}
+func init() {
+	registerRefactorFlags(refactorCmd, &refactorOpts)
+}
+
+func executeRefactor(opts refactorOptions) error {
 
 	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, "", opts.maxTools, opts.maxGitProcs, false)
 	if err != nil {
@@ -385,54 +362,4 @@ func loadRefactorResumeState(repoDir string, opts refactorOptions) (*session.Res
 			opts.resume, state.CompletedCount(), state.FailedCount())
 	}
 	return state, nil
-}
-
-func printRefactorUsage() {
-	fmt.Println(`OpenCodeReview - AI-Powered Code Refactoring
-
-Usage:
-  ocr refactor [flags]
-  ocr rf       [flags]                (alias)
-
-Examples:
-  # Analyze the entire repository
-  ocr refactor
-
-  # Analyze a single directory
-  ocr refactor --path internal/agent
-
-  # Analyze multiple files
-  ocr refactor --path internal/agent/agent.go,internal/diff/scan.go
-
-  # Preview which files would be analyzed without calling the LLM
-  ocr refactor --preview
-
-  # Skip the per-file PLAN_TASK pre-pass (saves ~1 LLM call per file)
-  ocr refactor --no-plan
-
-  # Exclude generated files / fixtures
-  ocr refactor --exclude '**/generated/*,**/testdata/*'
-
-Flags:
-  --path string           comma-separated repo-relative dirs/files to analyze (default: whole repo)
-  --exclude string        comma-separated gitignore-style patterns to exclude (merged with rule.json)
-  --no-plan               skip the per-file PLAN_TASK pre-pass (faster, less focused)
-  --model string          override LLM model for this refactoring (e.g., claude-opus-4-6)
-  --audience string       output audience: human (show progress) or agent (summary only) (default "human")
-  -b, --background string optional requirement/business context for the refactoring
-  -f, --format string     output format: text or json (default "text")
-  --concurrency int       max concurrent file analyses (default 8)
-  --max-git-procs int     max concurrent git subprocesses (default 16)
-  --max-tokens-budget int  cap total token usage; dispatch stops once exceeded (0 = unlimited)
-  --max-tools int         max tool call rounds per file; only takes effect when greater than template default
-  -p, --preview           preview which files will be analyzed without running the LLM
-  --repo string           root directory of the git repository (default: current dir)
-  --resume string         resume from a previous refactoring session id
-  --save-result           persist refactoring result as JSON + Markdown for the viewer (default true)
-  --save-per-file         split output into per-file markdown files under a directory tree mirroring the source tree
-  --result-dir string     refactoring result storage root (env: OCR_REVIEWS_DIR, default: .opencodereview/reviews)
-  --result-project string project name/path for persisted refactoring results
-  --rule string           path to JSON file with system refactoring rules
-  --timeout int           concurrent task timeout in minutes (default 10)
-  --tools string          path to JSON tools config file (default: embedded)`)
-}
+}}
