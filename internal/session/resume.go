@@ -202,9 +202,6 @@ func (s *ResumeState) ValidateOptions(opts SessionOptions) error {
 	if opts.ReviewMode == "" {
 		return fmt.Errorf("resume requires --from/--to, --commit, or a full-scan session")
 	}
-	if opts.ReviewMode == ReviewModeWorkspace {
-		return fmt.Errorf("resume requires --from/--to or --commit; workspace resume is not supported")
-	}
 	if s.ReviewMode == "" {
 		if opts.ReviewMode == ReviewModeFullScan {
 			// Older scan sessions may not have reviewMode metadata; allow resume

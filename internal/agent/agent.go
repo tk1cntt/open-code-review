@@ -805,7 +805,13 @@ func (a *Agent) reviewMode() string {
 }
 
 func reviewItemFingerprint(mode string, d model.Diff) string {
-	sum := sha256.Sum256([]byte(mode + "\x00" + d.OldPath + "\x00" + d.NewPath + "\x00" + d.Diff))
+	var input string
+	if mode == string(session.ReviewModeWorkspace) {
+		input = mode + "\x00" + d.OldPath + "\x00" + d.NewPath
+	} else {
+		input = mode + "\x00" + d.OldPath + "\x00" + d.NewPath + "\x00" + d.Diff
+	}
+	sum := sha256.Sum256([]byte(input))
 	return fmt.Sprintf("%x", sum)
 }
 

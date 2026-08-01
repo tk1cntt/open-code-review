@@ -119,11 +119,11 @@ func TestValidateOptions_NilState(t *testing.T) {
 	}
 }
 
-func TestValidateOptions_RejectsWorkspaceMode(t *testing.T) {
-	s := &ResumeState{ReviewMode: ReviewModeRange}
+func TestValidateOptions_AllowsWorkspaceMode(t *testing.T) {
+	s := &ResumeState{ReviewMode: ReviewModeWorkspace}
 	err := s.ValidateOptions(SessionOptions{ReviewMode: ReviewModeWorkspace})
-	if err == nil {
-		t.Fatal("expected error for workspace mode")
+	if err != nil {
+		t.Fatalf("expected nil error for matching workspace mode, got: %v", err)
 	}
 }
 
