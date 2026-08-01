@@ -202,6 +202,11 @@ type ClientConfig struct {
 // The defensive default keeps legacy callers that somehow bypass resolver
 // normalization working (they previously got OpenAIClient for any non-anthropic
 // protocol).
+//
+// The returned client is wrapped with retryClient which adds sleep-based retry
+// for HTTP 429 (Too Many Requests) and 502 (Bad Gateway) errors. On those status
+// codes the wrapper sleeps 10 seconds before retrying, up to 3 attempts. Other
+// errors are passed through without additional sleep.
 func NewLLMClient(ep ResolvedEndpoint) LLMClient {
 	cfg := ClientConfig{
 		URL:          ep.URL,
@@ -212,14 +217,67 @@ func NewLLMClient(ep ResolvedEndpoint) LLMClient {
 		ExtraBody:    ep.ExtraBody,
 		ExtraHeaders: ep.ExtraHeaders,
 	}
+	var inner LLMClient
 	switch ep.Protocol {
 	case ProtocolAnthropic:
-		return NewAnthropicClient(cfg)
+		inner = NewAnthropicClient(cfg)
 	case ProtocolOpenAIResponses:
-		return NewOpenAIResponsesClient(cfg)
+		inner = NewOpenAIResponsesClient(cfg)
 	default:
-		return NewOpenAIClient(cfg)
+		inner = NewOpenAIClient(cfg)
 	}
+	return &retryClient{inner: inner}
+}
+
+// retryClient wraps an LLMClient with sleep-based retry for HTTP 429 and 502
+// errors. The inner SDK already does its own automatic retries (5 by default);
+// this wrapper provides an additional backstop that pauses for 10 seconds between
+// attempts, which is necessary when the upstream rate limiter requires a cooldown
+// beyond the SDK's fast retry window.
+//
+// The 10-second sleep counter resets on any successful request (the next 429/502
+// starts fresh), meeting the contract: "If a request succeeds, reset the sleep."
+type retryClient struct {
+	inner LLMClient
+}
+
+func (rc *retryClient) CompletionsWithCtx(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	const maxAttempts = 3
+	const sleepDuration = 10 * time.Second
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err := rc.inner.CompletionsWithCtx(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+		if !IsRetryableHTTPStatus(err) {
+			return resp, err
+		}
+		if attempt == maxAttempts {
+			return resp, err
+		}
+		// Sleep 10s before the next retry; respect context cancellation.
+		select {
+		case <-time.After(sleepDuration):
+		case <-ctx.Done():
+			return resp, ctx.Err()
+		}
+	}
+	// Unreachable — the loop can only exit via return above.
+	return nil, fmt.Errorf("retryClient: unexpected exit from retry loop")
+}
+
+// IsRetryableHTTPStatus reports whether err was caused by an HTTP 429 (Too Many
+// Requests) or 502 (Bad Gateway) response. It detects the status code by
+// inspecting the error string, which works across all three SDKs (OpenAI Chat
+// Completions, OpenAI Responses, and Anthropic) without importing SDK-internal
+// error types.
+func IsRetryableHTTPStatus(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "429") || strings.Contains(s, "502")
 }
 
 // --- Token counting with tiktoken ---

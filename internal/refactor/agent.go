@@ -502,14 +502,23 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 				if lastErr == nil {
 					break
 				}
-				if !errors.Is(lastErr, context.DeadlineExceeded) || attempt == maxRetries-1 {
+
+				shouldRetry := errors.Is(lastErr, context.DeadlineExceeded) ||
+					llm.IsRetryableHTTPStatus(lastErr)
+				if !shouldRetry || attempt == maxRetries-1 {
 					break
 				}
-				a.args.CommentCollector.RemoveByPath(it.Path)
-				fmt.Fprintf(stdout.Writer(), "[ocr] Refactor subtask timeout for %s (batch #%d, attempt %d/%d), retrying with extended timeout...\n",
-					it.Path, batchIdx, attempt+1, maxRetries)
-			}
 
+				a.args.CommentCollector.RemoveByPath(it.Path)
+
+				if errors.Is(lastErr, context.DeadlineExceeded) {
+					fmt.Fprintf(stdout.Writer(), "[ocr] Refactor subtask timeout for %s (batch #%d, attempt %d/%d), retrying with extended timeout...\n",
+						it.Path, batchIdx, attempt+1, maxRetries)
+				} else {
+					fmt.Fprintf(stdout.Writer(), "[ocr] Refactor subtask rate-limited (429/502) for %s (batch #%d, attempt %d/%d), retrying...\n",
+						it.Path, batchIdx, attempt+1, maxRetries)
+				}
+			}
 			if lastErr != nil {
 				atomic.AddInt64(&a.subtaskFailed, 1)
 				comments := a.args.CommentCollector.CommentsForPath(it.Path)
