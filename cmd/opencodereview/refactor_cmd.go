@@ -362,4 +362,4 @@ func loadRefactorResumeState(repoDir string, opts refactorOptions) (*session.Res
 			opts.resume, state.CompletedCount(), state.FailedCount())
 	}
 	return state, nil
-}}
+}
