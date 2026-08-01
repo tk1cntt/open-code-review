@@ -109,6 +109,13 @@ func executeReview(opts reviewOptions) error {
 	}
 	applyCLIExcludes(cc, splitPaths(opts.excludes))
 
+	// Auto-populate missing --from/--to/--commit from stored session metadata
+	// before ref validation and background resolution.
+	resumeState, err := loadReviewResumeState(cc.RepoDir, &opts)
+	if err != nil {
+		return err
+	}
+
 	// Security (#112): reject ref-option injection before any git invocation.
 	if err := validateReviewRefs(cc.RepoDir, opts); err != nil {
 		return err
@@ -136,11 +143,6 @@ func executeReview(opts reviewOptions) error {
 
 	if opts.preview {
 		return runPreview(cc, opts)
-	}
-
-	resumeState, err := loadReviewResumeState(cc.RepoDir, opts)
-	if err != nil {
-		return err
 	}
 
 	rt, err := loadLLMRuntime(cc.Template, opts.toolConfigPath, opts.model)
@@ -377,19 +379,32 @@ func reviewResultError(runErr error, manifest *session.RunManifest) error {
 	return nil
 }
 
-func loadReviewResumeState(repoDir string, opts reviewOptions) (*session.ResumeState, error) {
+func loadReviewResumeState(repoDir string, opts *reviewOptions) (*session.ResumeState, error) {
 	if opts.resume == "" {
 		return nil, nil
-	}
-	current := session.SessionOptions{
-		ReviewMode: reviewModeFromOptions(opts),
-		DiffFrom:   opts.from,
-		DiffTo:     opts.to,
-		DiffCommit: opts.commit,
 	}
 	state, err := session.LoadResumeState(repoDir, opts.resume)
 	if err != nil {
 		return nil, fmt.Errorf("load resume session: %w (run 'ocr session list' to see available sessions)", err)
+	}
+
+	// Auto-populate missing CLI flags from stored session metadata so the
+	// review mode derived from opts matches the original session.
+	if opts.from == "" && state.DiffFrom != "" {
+		opts.from = state.DiffFrom
+	}
+	if opts.to == "" && state.DiffTo != "" {
+		opts.to = state.DiffTo
+	}
+	if opts.commit == "" && state.DiffCommit != "" {
+		opts.commit = state.DiffCommit
+	}
+
+	current := session.SessionOptions{
+		ReviewMode: reviewModeFromOptions(*opts),
+		DiffFrom:   opts.from,
+		DiffTo:     opts.to,
+		DiffCommit: opts.commit,
 	}
 	if err := state.ValidateOptions(current); err != nil {
 		return nil, fmt.Errorf("%w (run 'ocr session list' to see available sessions)", err)
