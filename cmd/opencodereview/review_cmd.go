@@ -172,32 +172,6 @@ func executeReview(opts reviewOptions) error {
 	rt.MainToolDefs = append(rt.MainToolDefs, mcpToolDefs...)
 
 	var perFileWriter *reviewstore.PerFileWriter
-	var reviewID string
-	if opts.saveResult || opts.savePerFile {
-		var idErr error
-		reviewID, idErr = reviewstore.GenerateID()
-		if idErr != nil {
-			return fmt.Errorf("generate review ID: %w", idErr)
-		}
-	}
-	if opts.savePerFile {
-		if opts.resultDir == "" {
-			opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
-		}
-		projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(cc.RepoDir))
-		projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir))
-		project := reviewstore.ProjectInfo{
-			ID:      projectID,
-			Name:    projectName,
-			RepoDir: cc.RepoDir,
-			WebURL:  os.Getenv("CI_PROJECT_URL"),
-		}
-		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
-		if pfwErr != nil {
-			return fmt.Errorf("create per-file writer: %w", pfwErr)
-		}
-		perFileWriter = pfw
-	}
 
 	ag := agent.New(agent.Args{
 		RepoDir:               cc.RepoDir,
@@ -231,6 +205,28 @@ func executeReview(opts reviewOptions) error {
 		},
 		RuntimeConfig:         rt.RuntimeConfig,
 	})
+
+	// Use the session ID as the review result ID so --resume and review
+	// result persistence share one consistent identifier.
+	reviewID := ag.SessionID()
+	if opts.savePerFile {
+		if opts.resultDir == "" {
+			opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+		}
+		projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(cc.RepoDir))
+		projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir))
+		project := reviewstore.ProjectInfo{
+			ID:      projectID,
+			Name:    projectName,
+			RepoDir: cc.RepoDir,
+			WebURL:  os.Getenv("CI_PROJECT_URL"),
+		}
+		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
+		if pfwErr != nil {
+			return fmt.Errorf("create per-file writer: %w", pfwErr)
+		}
+		perFileWriter = pfw
+	}
 
 	// Silence progress output during execution; restored before the trace
 	// summary in agent-text mode (and on function exit otherwise).

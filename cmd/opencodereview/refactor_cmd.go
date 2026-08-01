@@ -119,36 +119,6 @@ func executeRefactor(opts refactorOptions) error {
 	tools := buildToolRegistry(rt.Collector, fileReader)
 
 	var perFileWriter *reviewstore.PerFileWriter
-	var reviewID string
-	if opts.saveResult || opts.savePerFile {
-		var idErr error
-		reviewID, idErr = reviewstore.GenerateID()
-		if idErr != nil {
-			return fmt.Errorf("generate review ID: %w", idErr)
-		}
-	}
-	if opts.savePerFile {
-		if opts.resultDir == "" {
-			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
-				opts.resultDir = d
-			} else {
-				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
-			}
-		}
-		projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(cc.RepoDir))
-		projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir))
-		project := reviewstore.ProjectInfo{
-			ID:      projectID,
-			Name:    projectName,
-			RepoDir: cc.RepoDir,
-			WebURL:  os.Getenv("CI_PROJECT_URL"),
-		}
-		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
-		if pfwErr != nil {
-			return fmt.Errorf("create per-file writer: %w", pfwErr)
-		}
-		perFileWriter = pfw
-	}
 
 	ag := refactor.NewAgent(refactor.Args{
 		RepoDir:               cc.RepoDir,
@@ -178,6 +148,32 @@ func executeRefactor(opts refactorOptions) error {
 			}
 		},
 	})
+
+	// Use the session ID as the review result ID so --resume and review
+	// result persistence share one consistent identifier.
+	reviewID := ag.SessionID()
+	if opts.savePerFile {
+		if opts.resultDir == "" {
+			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
+				opts.resultDir = d
+			} else {
+				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+			}
+		}
+		projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(cc.RepoDir))
+		projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir))
+		project := reviewstore.ProjectInfo{
+			ID:      projectID,
+			Name:    projectName,
+			RepoDir: cc.RepoDir,
+			WebURL:  os.Getenv("CI_PROJECT_URL"),
+		}
+		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
+		if pfwErr != nil {
+			return fmt.Errorf("create per-file writer: %w", pfwErr)
+		}
+		perFileWriter = pfw
+	}
 
 	q := newQuietHandle(opts.outputFormat, opts.audience)
 	defer q.Restore()
