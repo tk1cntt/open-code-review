@@ -244,8 +244,8 @@ func TestParseComments_CategorySeveritySchemaDrift(t *testing.T) {
 	if got := comments[0].Category; got != "other" {
 		t.Errorf("category = %q, want %q", got, "other")
 	}
-	if got := comments[0].Severity; got != "low" {
-		t.Errorf("severity = %q, want %q", got, "low")
+	if got := comments[0].Severity; got != "info" {
+		t.Errorf("severity = %q, want %q", got, "info")
 	}
 	if got := comments[0].Content; got != "Use the canonical metadata fallback." {
 		t.Errorf("content = %q", got)

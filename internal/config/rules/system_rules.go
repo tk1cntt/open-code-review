@@ -15,6 +15,7 @@ import (
 // Resolver resolves a review rule for a file path.
 type Resolver interface {
 	Resolve(path string) string
+	ResolveRefactor(path string) string
 }
 
 // PathRule is a single pattern→rule entry preserving declaration order.
@@ -27,60 +28,82 @@ type PathRule struct {
 type SystemRule struct {
 	DefaultRule string     `json:"default_rule"`
 	PathRules   []PathRule // ordered; first match wins
+
+	// Refactoring rules (same structure as review rules, different purpose).
+	DefaultRefactorRule string     `json:"default_refactor_rule"`
+	RefactorPathRules   []PathRule `json:"refactor_rule_map,omitempty"`
 }
 
-// UnmarshalJSON preserves the key order from JSON's path_rule_map object.
+// UnmarshalJSON preserves the key order from JSON's path_rule_map and
+// refactor_rule_map objects.
 func (r *SystemRule) UnmarshalJSON(data []byte) error {
-	// Decode default_rule normally.
+	// Decode scalar fields normally.
 	var wrapper struct {
-		DefaultRule string `json:"default_rule"`
+		DefaultRule        string `json:"default_rule"`
+		DefaultRefactorRule string `json:"default_refactor_rule"`
 	}
 	if err := json.Unmarshal(data, &wrapper); err != nil {
 		return err
 	}
 	r.DefaultRule = wrapper.DefaultRule
+	r.DefaultRefactorRule = wrapper.DefaultRefactorRule
 
 	// Use json.Decoder with UseNumber to preserve order of path_rule_map keys.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	mapData, ok := raw["path_rule_map"]
-	if !ok || len(mapData) == 0 || string(mapData) == "null" {
-		return nil
+
+	// Parse path_rule_map.
+	if mapData, ok := raw["path_rule_map"]; ok && len(mapData) > 0 && string(mapData) != "null" {
+		pathRules, err := parseOrderedRuleMap(mapData)
+		if err != nil {
+			return fmt.Errorf("path_rule_map: %w", err)
+		}
+		r.PathRules = pathRules
 	}
 
-	// Parse ordered keys using a streaming decoder.
-	dec := json.NewDecoder(strings.NewReader(string(mapData)))
-	// Read opening '{'
-	t, err := dec.Token()
-	if err != nil {
-		return fmt.Errorf("expected '{' in path_rule_map: %w", err)
-	}
-	if t != json.Delim('{') {
-		return fmt.Errorf("expected '{' in path_rule_map, got %v", t)
-	}
-	for dec.More() {
-		// Read key
-		keyTok, err := dec.Token()
+	// Parse refactor_rule_map.
+	if mapData, ok := raw["refactor_rule_map"]; ok && len(mapData) > 0 && string(mapData) != "null" {
+		refRules, err := parseOrderedRuleMap(mapData)
 		if err != nil {
-			return fmt.Errorf("read path_rule_map key: %w", err)
+			return fmt.Errorf("refactor_rule_map: %w", err)
 		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return fmt.Errorf("expected string key in path_rule_map, got %T", keyTok)
-		}
-		// Read value
-		var value string
-		if err := dec.Decode(&value); err != nil {
-			return fmt.Errorf("read path_rule_map value for %q: %w", key, err)
-		}
-		r.PathRules = append(r.PathRules, PathRule{Pattern: key, Rule: value})
+		r.RefactorPathRules = refRules
 	}
+
 	return nil
 }
 
-//go:embed system_rules.json rule_docs/*
+func parseOrderedRuleMap(data json.RawMessage) ([]PathRule, error) {
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	t, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("expected '{': %w", err)
+	}
+	if t != json.Delim('{') {
+		return nil, fmt.Errorf("expected '{', got %v", t)
+	}
+	var rules []PathRule
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, fmt.Errorf("read key: %w", err)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, fmt.Errorf("expected string key, got %T", keyTok)
+		}
+		var value string
+		if err := dec.Decode(&value); err != nil {
+			return nil, fmt.Errorf("read value for %q: %w", key, err)
+		}
+		rules = append(rules, PathRule{Pattern: key, Rule: value})
+	}
+	return rules, nil
+}
+
+//go:embed system_rules.json rule_docs/* rule_docs/refactoring/*
 var rulesFS embed.FS
 
 // LoadDefault parses the embedded system_rules.json and resolves rule file references.
@@ -104,6 +127,21 @@ func LoadDefault() (*SystemRule, error) {
 			return nil, fmt.Errorf("read rule file %q for pattern %q: %w", rule.PathRules[i].Rule, rule.PathRules[i].Pattern, err)
 		}
 		rule.PathRules[i].Rule = strings.TrimRight(string(content), "\n")
+	}
+	// Resolve refactoring rule files.
+	if rule.DefaultRefactorRule != "" {
+		content, err := rulesFS.ReadFile("rule_docs/" + rule.DefaultRefactorRule)
+		if err != nil {
+			return nil, fmt.Errorf("read default refactor rule file %q: %w", rule.DefaultRefactorRule, err)
+		}
+		rule.DefaultRefactorRule = strings.TrimRight(string(content), "\n")
+	}
+	for i := range rule.RefactorPathRules {
+		content, err := rulesFS.ReadFile("rule_docs/" + rule.RefactorPathRules[i].Rule)
+		if err != nil {
+			return nil, fmt.Errorf("read refactor rule file %q for pattern %q: %w", rule.RefactorPathRules[i].Rule, rule.RefactorPathRules[i].Pattern, err)
+		}
+		rule.RefactorPathRules[i].Rule = strings.TrimRight(string(content), "\n")
 	}
 	return &rule, nil
 }
@@ -150,6 +188,21 @@ func (r *SystemRule) resolveDetail(path string) RuleDetail {
 	return RuleDetail{Rule: r.DefaultRule, Source: "system", Pattern: "default"}
 }
 
+// ResolveRefactor returns the refactoring rule text for a given file path.
+// Same resolution logic as Resolve but uses refactor-specific rule maps and default.
+func (r *SystemRule) ResolveRefactor(path string) string {
+	lowerPath := strings.ToLower(path)
+	for _, pr := range r.RefactorPathRules {
+		expanded := expandBraces(pr.Pattern)
+		for _, p := range expanded {
+			if matched, _ := doublestar.Match(strings.ToLower(p), lowerPath); matched {
+				return pr.Rule
+			}
+		}
+	}
+	return r.DefaultRefactorRule
+}
+
 // expandBraces turns "{a,b,c}" style patterns into individual strings.
 // e.g. "*.go.{java,kotlin}" → ["*.go.java", "*.go.kotlin"].
 // If no braces exist, returns the original pattern unchanged.
@@ -184,10 +237,14 @@ type ProjectRuleEntry struct {
 }
 
 // ProjectRule holds rules loaded from <repoDir>/.opencodereview/rule.json.
+// Rules are resolved by Resolve (for review). RefactorRules are resolved by
+// ResolveRefactor. When RefactorRules is empty, ResolveRefactor falls back to
+// Rules so existing rule.json files work without changes.
 type ProjectRule struct {
-	Rules   []ProjectRuleEntry `json:"rules"`
-	Include []string           `json:"include,omitempty"`
-	Exclude []string           `json:"exclude,omitempty"`
+	Rules         []ProjectRuleEntry `json:"rules"`
+	RefactorRules []ProjectRuleEntry `json:"refactor_rules,omitempty"`
+	Include       []string           `json:"include,omitempty"`
+	Exclude       []string           `json:"exclude,omitempty"`
 }
 
 // FileFilter holds the merged user-configured include/exclude glob patterns
@@ -364,7 +421,7 @@ func loadGlobalRule() (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal global rule: %w", err)
 	}
-	resolveRuleEntries(pr.Rules, filepath.Dir(path))
+	resolveRuleEntries(pr.Rules, filepath.Dir(path)); resolveRuleEntries(pr.RefactorRules, filepath.Dir(path))
 	return &pr, nil
 }
 
@@ -382,7 +439,7 @@ func loadEnterpriseGlobalRule(rulesDir string) (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal enterprise global rule: %w", err)
 	}
-	resolveRuleEntries(pr.Rules, rulesDir)
+	resolveRuleEntries(pr.Rules, rulesDir); resolveRuleEntries(pr.RefactorRules, rulesDir)
 	return &pr, nil
 }
 
@@ -405,7 +462,7 @@ func loadEnterpriseProjectRule(rulesDir, repoDir string) (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal enterprise project rule: %w", err)
 	}
-	resolveRuleEntries(pr.Rules, filepath.Dir(path))
+	resolveRuleEntries(pr.Rules, filepath.Dir(path)); resolveRuleEntries(pr.RefactorRules, filepath.Dir(path))
 	return &pr, nil
 }
 
@@ -472,7 +529,7 @@ func loadRuleFile(path string) (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal rule file %s: %w", path, err)
 	}
-	resolveRuleEntries(pr.Rules, filepath.Dir(path))
+	resolveRuleEntries(pr.Rules, filepath.Dir(path)); resolveRuleEntries(pr.RefactorRules, filepath.Dir(path))
 	return &pr, nil
 }
 
@@ -494,7 +551,7 @@ func loadProjectRule(repoDir string) (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal project rule: %w", err)
 	}
-	resolveRuleEntries(pr.Rules, filepath.Dir(path))
+	resolveRuleEntries(pr.Rules, filepath.Dir(path)); resolveRuleEntries(pr.RefactorRules, filepath.Dir(path))
 	return &pr, nil
 }
 
@@ -511,6 +568,48 @@ func (c *composedResolver) Resolve(path string) string {
 		}
 	}
 	return c.system.Resolve(path)
+}
+
+func (c *composedResolver) ResolveRefactor(path string) string {
+	for _, layer := range []*ProjectRule{c.custom, c.project, c.enterpriseProject, c.enterpriseGlobal, c.global} {
+		if entry := matchRefactorRuleEntry(layer, path); entry != nil {
+			if entry.MergeSystemRule {
+				return c.mergeWithSystemRefactorRule(path, entry.Rule)
+			}
+			return entry.Rule
+		}
+	}
+	return c.system.ResolveRefactor(path)
+}
+
+// matchRefactorRuleEntry matches against a layer's RefactorRules first.
+// Falls back to Rules when RefactorRules is empty so existing rule.json files
+// work without changes.
+func matchRefactorRuleEntry(pr *ProjectRule, path string) *ProjectRuleEntry {
+	if pr == nil {
+		return nil
+	}
+	// If RefactorRules are explicitly defined, use them exclusively.
+	if len(pr.RefactorRules) > 0 {
+		return matchProjectRuleEntry(&ProjectRule{Rules: pr.RefactorRules}, path)
+	}
+	// Otherwise fall back to Rules (backwards-compatible).
+	return matchProjectRuleEntry(pr, path)
+}
+
+func (c *composedResolver) mergeWithSystemRefactorRule(path, rule string) string {
+	systemRule := c.system.ResolveRefactor(path)
+	if systemRule == "" {
+		return rule
+	}
+	if rule == "" {
+		return systemRule
+	}
+	return "## System-Specific Refactoring Rules (Mandatory)\n\n" +
+		systemRule +
+		"\n\n---\n\n" +
+		"## User-Specific Refactoring Rules (Mandatory)\n\n" +
+		rule
 }
 
 func (c *composedResolver) mergeWithSystemRule(path, rule string) string {

@@ -293,13 +293,13 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 	}
 
 	// Pre-run cost projection so users aren't surprised by a large scan.
-	est := estimateCost(a.items, a.planEnabled(), a.dedupEnabled(), a.summaryEnabled())
+	est := EstimateCost(a.items, a.planEnabled(), a.dedupEnabled(), a.summaryEnabled())
 	fmt.Fprintf(stdout.Writer(), "[ocr] estimated cost: %s\n", est)
 	if a.args.MaxTokensBudget > 0 {
-		fmt.Fprintf(stdout.Writer(), "[ocr] token budget: %s (dispatch stops once exceeded)\n", humanTokens(a.args.MaxTokensBudget))
+		fmt.Fprintf(stdout.Writer(), "[ocr] token budget: %s (dispatch stops once exceeded)\n", HumanTokens(a.args.MaxTokensBudget))
 		if est.TotalTokens > a.args.MaxTokensBudget {
 			fmt.Fprintf(stdout.Writer(), "[ocr] WARNING: estimate (%s) exceeds budget (%s); scan will stop partway\n",
-				humanTokens(est.TotalTokens), humanTokens(a.args.MaxTokensBudget))
+				HumanTokens(est.TotalTokens), HumanTokens(a.args.MaxTokensBudget))
 		}
 	}
 
@@ -463,7 +463,7 @@ func (a *Agent) whyExcluded(it model.ScanItem) model.ExcludeReason {
 	if a.args.FileFilter != nil && a.args.FileFilter.HasInclude() && a.args.FileFilter.IsUserIncluded(path) {
 		return model.ExcludeNone
 	}
-	ext := extFromPath(path)
+	ext := ExtFromPath(path)
 	if ext != "" && !allowedext.IsAllowedExt(ext) {
 		return model.ExcludeExtension
 	}
@@ -473,7 +473,7 @@ func (a *Agent) whyExcluded(it model.ScanItem) model.ExcludeReason {
 	return model.ExcludeNone
 }
 
-func extFromPath(path string) string {
+func ExtFromPath(path string) string {
 	basename := path
 	if idx := strings.LastIndex(path, "/"); idx >= 0 {
 		basename = path[idx+1:]
@@ -503,7 +503,7 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 	atomic.StoreInt64(&a.subtaskFailed, 0)
 
 	strategy := a.resolveBatchStrategy()
-	batches := groupBatches(a.items, strategy, a.args.Template.BatchSize)
+	batches := GroupBatches(a.items, strategy, a.args.Template.BatchSize)
 	fmt.Fprintf(stdout.Writer(), "[ocr] scan dispatch: %d batch(es) by %s strategy\n", len(batches), strategy)
 
 	var dispatched int64
@@ -582,10 +582,10 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 		// don't even queue work that would blow the budget.
 		if a.args.MaxTokensBudget > 0 {
 			used := a.runner.TotalTokensUsed()
-			projected := used + estimateFileTokens(batch[i], a.planEnabled())
+			projected := used + EstimateFileTokens(batch[i], a.planEnabled())
 			if projected > a.args.MaxTokensBudget {
 				fmt.Fprintf(stdout.Writer(), "[ocr] token budget reached (used %s + next-file est ≈ %s > budget %s) — skipping %s and remaining files\n",
-					humanTokens(used), humanTokens(projected), humanTokens(a.args.MaxTokensBudget), batch[i].Path)
+					HumanTokens(used), HumanTokens(projected), HumanTokens(a.args.MaxTokensBudget), batch[i].Path)
 				a.recordWarning("token_budget_reached", batch[i].Path,
 					fmt.Sprintf("stopped in batch #%d: used %d tokens + next-file estimate exceeds budget %d", batchIdx, used, a.args.MaxTokensBudget))
 				budgetHit = true

@@ -33,13 +33,13 @@ func parseBatchStrategy(s string) BatchStrategy {
 	}
 }
 
-// groupBatches partitions items according to strategy, then slices each
+// GroupBatches partitions items according to strategy, then slices each
 // natural group into BatchSize-sized chunks (when size > 0). Within a batch
 // the input order is preserved; batches themselves are sorted by their
 // group key for determinism.
 //
 // Returns nil when items is empty.
-func groupBatches(items []model.ScanItem, strategy BatchStrategy, size int) [][]model.ScanItem {
+func GroupBatches(items []model.ScanItem, strategy BatchStrategy, size int) [][]model.ScanItem {
 	if len(items) == 0 {
 		return nil
 	}

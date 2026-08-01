@@ -48,6 +48,8 @@ func dispatch() error {
 		return runReview(args[1:])
 	case "scan", "s":
 		return runScan(args[1:])
+	case "refactor", "rf":
+		return runRefactor(args[1:])
 	case "config":
 		return runConfig(args[1:])
 	case "llm":
@@ -77,6 +79,7 @@ Usage:
 Commands:
   review, r    Start a diff-based code review
   scan, s      Scan entire files (no diff required)
+  refactor, rf Analyze code and suggest refactoring improvements
   delegate, d  Output review spec for host-agent delegation (no LLM required)
   rules        Inspect and debug review rules
   config       Manage configuration settings
@@ -90,6 +93,7 @@ Examples:
   ocr review --commit abc123               Review a single commit
   ocr scan                                 Scan every reviewable file in the repo
   ocr scan --path internal/agent           Scan a single directory
+  ocr refactor --path internal/agent       Refactor a directory with suggestions
   ocr config provider                      Interactive provider setup
   ocr config model                         Interactive model selection
   ocr config set llm.model opus-4-6        Set a config value
@@ -100,6 +104,7 @@ Examples:
 
 Use "ocr review -h" for more information about review.
 Use "ocr scan -h" for more information about scan.
+Use "ocr refactor -h" for more information about refactor.
 Use "ocr delegate -h" for more information about delegation mode.
 Use "ocr rules -h" for more information about rules.
 Use "ocr config" for more information about config.

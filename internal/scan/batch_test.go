@@ -54,7 +54,7 @@ func TestGroupBatches_ByLanguage(t *testing.T) {
 		"internal/scan/preview.go",
 		"docs/intro.md",
 	)
-	got := batchPaths(groupBatches(items, BatchByLanguage, 0))
+	got := batchPaths(GroupBatches(items, BatchByLanguage, 0))
 	// Batches are emitted in lexicographic key order: .go < .md < .sh.
 	// Within a batch, input order is preserved.
 	want := [][]string{
@@ -76,7 +76,7 @@ func TestGroupBatches_ByDirectory(t *testing.T) {
 		"cmd/scan.go",     // cmd
 		"LICENSE",         // <root>
 	)
-	got := batchPaths(groupBatches(items, BatchByDirectory, 0))
+	got := batchPaths(GroupBatches(items, BatchByDirectory, 0))
 	want := [][]string{
 		{"README.md", "LICENSE"},               // <root>
 		{"cmd/main.go", "cmd/scan.go"},         // cmd
@@ -89,7 +89,7 @@ func TestGroupBatches_ByDirectory(t *testing.T) {
 
 func TestGroupBatches_None(t *testing.T) {
 	items := itemList("a.go", "b.go", "c.py")
-	got := batchPaths(groupBatches(items, BatchNone, 0))
+	got := batchPaths(GroupBatches(items, BatchNone, 0))
 	want := [][]string{{"a.go"}, {"b.go"}, {"c.py"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v\nwant %v", got, want)
@@ -99,7 +99,7 @@ func TestGroupBatches_None(t *testing.T) {
 func TestGroupBatches_BatchSizeCap(t *testing.T) {
 	items := itemList("a.go", "b.go", "c.go", "d.go", "e.go")
 	// All .go in one natural group; size=2 → 3 chunks of 2,2,1
-	got := batchPaths(groupBatches(items, BatchByLanguage, 2))
+	got := batchPaths(GroupBatches(items, BatchByLanguage, 2))
 	want := [][]string{
 		{"a.go", "b.go"},
 		{"c.go", "d.go"},
@@ -111,7 +111,7 @@ func TestGroupBatches_BatchSizeCap(t *testing.T) {
 }
 
 func TestGroupBatches_Empty(t *testing.T) {
-	if got := groupBatches(nil, BatchByLanguage, 0); got != nil {
+	if got := GroupBatches(nil, BatchByLanguage, 0); got != nil {
 		t.Errorf("expected nil for empty input, got %v", got)
 	}
 }

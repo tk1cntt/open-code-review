@@ -1,0 +1,438 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/alibaba/open-code-review/internal/config/template"
+	"github.com/alibaba/open-code-review/internal/llmloop"
+	"github.com/alibaba/open-code-review/internal/model"
+	"github.com/alibaba/open-code-review/internal/refactor"
+	"github.com/alibaba/open-code-review/internal/reviewstore"
+	"github.com/alibaba/open-code-review/internal/session"
+	"github.com/alibaba/open-code-review/internal/telemetry"
+	"github.com/alibaba/open-code-review/internal/tool"
+	"go.opentelemetry.io/otel/codes"
+)
+
+type refactorOptions struct {
+	toolConfigPath, rulePath, repoDir, paths, excludes string
+	outputFormat, audience, background, resume         string
+	saveResult, savePerFile                            bool
+	resultDir, resultProject                           string
+	concurrency, perFileTimeout, maxTools, maxGitProcs, maxTokensBudget int
+	noPlan                                                               bool
+	model                                              string
+	showHelp                                           bool
+	preview                                            bool
+}
+
+func parseRefactorFlags(args []string) (refactorOptions, error) {
+	a := newOcrFlagSet("ocr refactor")
+	opts := refactorOptions{}
+
+	a.StringVar(&opts.toolConfigPath, "tools", "", "path to JSON tools config file (default: embedded)")
+	a.StringVar(&opts.rulePath, "rule", "", "path to JSON file with system refactoring rules")
+	a.StringVar(&opts.repoDir, "repo", "", "root directory of the git repository (default: current dir)")
+	a.StringVar(&opts.paths, "path", "", "comma-separated repo-relative directories or files to refactor (default: whole repo)")
+	a.StringVar(&opts.excludes, "exclude", "", "comma-separated gitignore-style patterns to exclude; merged with rule.json excludes")
+	a.StringVarP(&opts.outputFormat, "format", "f", "text", "output format: text or json")
+	a.IntVar(&opts.concurrency, "concurrency", 8, "max concurrent file analyses")
+	a.IntVar(&opts.perFileTimeout, "timeout", 10, "concurrent task timeout in minutes")
+	a.StringVar(&opts.audience, "audience", "human", "output audience: human (show progress) or agent (summary only)")
+	a.StringVarP(&opts.background, "background", "b", "", "optional requirement/business context for the refactoring")
+	a.IntVar(&opts.maxTools, "max-tools", 0, "max tool call rounds per file; only takes effect when greater than template default")
+	a.IntVar(&opts.maxGitProcs, "max-git-procs", 16, "max concurrent git subprocesses")
+	a.IntVar(&opts.maxTokensBudget, "max-tokens-budget", 0, "cap total token usage (input+output); dispatch stops once exceeded (0 = unlimited)")
+	a.BoolVarP(&opts.preview, "preview", "p", false, "preview which files will be analyzed without running the LLM")
+	a.BoolVar(&opts.noPlan, "no-plan", false, "skip the per-file PLAN_TASK pre-pass (one fewer LLM call per file; may reduce analysis focus)")
+	a.StringVar(&opts.model, "model", "", "override LLM model for this refactoring (e.g., claude-opus-4-6)")
+	a.StringVar(&opts.resume, "resume", "", "resume from a previous refactoring session id")
+	a.BoolVar(&opts.saveResult, "save-result", true, "persist final refactoring result for the WebUI viewer")
+	a.BoolVar(&opts.savePerFile, "save-per-file", true, "split output into per-file markdown files under a directory tree mirroring the source tree")
+	a.StringVar(&opts.resultDir, "result-dir", "", "refactoring result storage root (env: OCR_REVIEWS_DIR, default: .opencodereview/reviews)")
+	a.StringVar(&opts.resultProject, "result-project", "", "project name/path for persisted refactoring results")
+
+	if err := a.Parse(args); err != nil {
+		return opts, fmt.Errorf("parse flags: %w", err)
+	}
+
+	opts.showHelp = a.showHelp
+	if opts.showHelp {
+		return opts, nil
+	}
+
+	switch opts.audience {
+	case "human", "agent":
+	default:
+		return opts, fmt.Errorf("invalid --audience value %q: must be 'human' or 'agent'", opts.audience)
+	}
+
+	if opts.maxTools < 0 {
+		return opts, fmt.Errorf("--max-tools must be a non-negative integer (0 means use template default)")
+	}
+	if opts.maxGitProcs < 0 {
+		return opts, fmt.Errorf("--max-git-procs must be a non-negative integer (0 means use default 16)")
+	}
+	if opts.maxTokensBudget < 0 {
+		return opts, fmt.Errorf("--max-tokens-budget must be a non-negative integer (0 means unlimited)")
+	}
+	return opts, nil
+}
+
+func runRefactor(args []string) error {
+	opts, err := parseRefactorFlags(args)
+	if err != nil {
+		return err
+	}
+	if opts.showHelp {
+		printRefactorUsage()
+		return nil
+	}
+
+	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, "", opts.maxTools, opts.maxGitProcs, false)
+	if err != nil {
+		return err
+	}
+	applyCLIExcludes(cc, splitPaths(opts.excludes))
+
+	refactorTpl, err := template.LoadRefactorDefault()
+	if err != nil {
+		return fmt.Errorf("load refactor template: %w", err)
+	}
+	if err := refactorTpl.Validate(); err != nil {
+		return fmt.Errorf("invalid refactor template: %w", err)
+	}
+	if opts.maxTools > refactorTpl.MaxToolRequestTimes {
+		refactorTpl.MaxToolRequestTimes = opts.maxTools
+	}
+	if opts.maxTokensBudget > 0 {
+		refactorTpl.MaxTokensBudget = int64(opts.maxTokensBudget)
+	}
+
+	refactorPaths := splitPaths(opts.paths)
+
+	if opts.preview {
+		return runRefactorPreview(cc, refactorTpl, refactorPaths)
+	}
+
+	resumeState, err := loadRefactorResumeState(cc.RepoDir, opts)
+	if err != nil {
+		return err
+	}
+
+	rt, err := loadLLMRuntime(cc.Template, opts.toolConfigPath, opts.model)
+	if err != nil {
+		return err
+	}
+	if rt.AppCfg != nil {
+		refactorTpl.ApplyLanguage(rt.AppCfg.Language)
+	}
+
+	refactorToolDefs := excludeToolDef(rt.MainToolDefs, "file_read_diff")
+
+	fileReader := &tool.FileReader{
+		RepoDir: cc.RepoDir,
+		Mode:    tool.ModeWorkspace,
+		Runner:  cc.GitRunner,
+	}
+	tools := buildToolRegistry(rt.Collector, fileReader)
+
+	var perFileWriter *reviewstore.PerFileWriter
+	var reviewID string
+	if opts.saveResult || opts.savePerFile {
+		var idErr error
+		reviewID, idErr = reviewstore.GenerateID()
+		if idErr != nil {
+			return fmt.Errorf("generate review ID: %w", idErr)
+		}
+	}
+	if opts.savePerFile {
+		if opts.resultDir == "" {
+			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
+				opts.resultDir = d
+			} else {
+				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+			}
+		}
+		projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(cc.RepoDir))
+		projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir))
+		project := reviewstore.ProjectInfo{
+			ID:      projectID,
+			Name:    projectName,
+			RepoDir: cc.RepoDir,
+			WebURL:  os.Getenv("CI_PROJECT_URL"),
+		}
+		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
+		if pfwErr != nil {
+			return fmt.Errorf("create per-file writer: %w", pfwErr)
+		}
+		perFileWriter = pfw
+	}
+
+	ag := refactor.NewAgent(refactor.Args{
+		RepoDir:               cc.RepoDir,
+		Paths:                 refactorPaths,
+		Template:              *refactorTpl,
+		SystemRule:            cc.Resolver,
+		FileFilter:            cc.FileFilter,
+		LLMClient:             rt.Client,
+		Tools:                 tools,
+		MainToolDefs:          refactorToolDefs,
+		CommentCollector:      rt.Collector,
+		CommentWorkerPool:     llmloop.NewCommentWorkerPool(opts.concurrency),
+		MaxConcurrency:        opts.concurrency,
+		ConcurrentTaskTimeout: opts.perFileTimeout,
+		Model:                 rt.Model,
+		Background:            opts.background,
+		GitRunner:             cc.GitRunner,
+		MaxFileSizeBytes:      refactorTpl.MaxFileSizeBytes,
+		MaxTokensBudget:       refactorTpl.MaxTokensBudget,
+		SkipPlan:              opts.noPlan,
+		Resume:                resumeState,
+		OnFileDone: func(filePath string, comments []model.LlmComment) {
+			if perFileWriter != nil {
+				if err := perFileWriter.WriteFile(filePath, comments); err != nil {
+					fmt.Fprintf(os.Stderr, "[ocr] warning: per-file save failed for %s: %v\n", filePath, err)
+				}
+			}
+		},
+	})
+
+	q := newQuietHandle(opts.outputFormat, opts.audience)
+	defer q.Restore()
+
+	ctx, span := telemetry.StartSpan(telemetry.ContextWithTraceParentFromEnv(context.Background()), "refactor.run")
+	defer span.End()
+	var traceID string
+	if telemetry.IsEnabled() {
+		traceID = telemetry.TraceIDFromContext(ctx)
+		if opts.outputFormat != "json" {
+			fmt.Fprintf(os.Stderr, "[ocr] TraceID: %s\n", traceID)
+		}
+	}
+	startTime := time.Now()
+
+	var finalized bool
+	defer func() {
+		if perFileWriter != nil && !finalized {
+			if _, fErr := perFileWriter.Finalize(reviewstore.ReviewInfo{}, reviewstore.GitLabInfo{}, nil); fErr != nil {
+				fmt.Fprintf(os.Stderr, "[ocr] warning: failed to finalize partial per-file output: %v\n", fErr)
+			}
+		}
+	}()
+
+	comments, err := ag.Run(ctx)
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		span.RecordError(err)
+		if id := ag.SessionID(); id != "" {
+			fmt.Fprintf(os.Stderr, "[ocr] Session: %s (retry with: --resume %s)\n", id, id)
+		}
+		return fmt.Errorf("refactor failed: %w", err)
+	}
+
+	if failed := ag.SubtaskFailed(); failed > 0 {
+		if id := ag.SessionID(); id != "" {
+			fmt.Fprintf(os.Stderr, "[ocr] %d file(s) failed — Session: %s (retry with: --resume %s)\n", failed, id, id)
+		}
+	}
+
+	duration := time.Since(startTime)
+	if opts.saveResult {
+		if opts.resultDir == "" {
+			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
+				opts.resultDir = d
+			} else {
+				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+			}
+		}
+		path, mdPath, err := saveRefactorResult(cc.RepoDir, opts, ag, comments, ag.Warnings(), duration, reviewID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to save refactor result: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "[ocr] JSON saved to: %s\n", path)
+			if mdPath != "" {
+				fmt.Fprintf(os.Stderr, "[ocr] Markdown report saved to: %s\n", mdPath)
+			}
+		}
+	}
+	if perFileWriter != nil {
+		sess := ag.Session()
+		gitlab := reviewstore.GitLabInfo{
+			ServerURL:       os.Getenv("CI_SERVER_URL"),
+			ProjectID:       firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir)),
+			MergeRequestIID: os.Getenv("CI_MERGE_REQUEST_IID"),
+			PipelineID:      os.Getenv("CI_PIPELINE_ID"),
+			JobID:           os.Getenv("CI_JOB_ID"),
+		}
+		reviewInfo := reviewstore.ReviewInfo{
+			Mode:             session.ReviewModeFullScan,
+			FilesReviewed:    ag.FilesReviewed(),
+			CommentCount:     int64(len(comments)),
+			TotalTokens:      ag.TotalTokensUsed(),
+			InputTokens:      ag.TotalInputTokens(),
+			OutputTokens:     ag.TotalOutputTokens(),
+			CacheReadTokens:  ag.TotalCacheReadTokens(),
+			CacheWriteTokens: ag.TotalCacheWriteTokens(),
+			Duration:         duration.String(),
+			DurationSeconds:  int64(duration.Seconds()),
+			SessionID:        ag.SessionID(),
+		}
+		if sess != nil {
+			reviewInfo.Model = sess.Model
+		}
+		perFileIdxPath, fErr := perFileWriter.Finalize(reviewInfo, gitlab, mapWarnings(ag.Warnings()))
+		if fErr != nil {
+			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to finalize per-file output: %v\n", fErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "[ocr] Per-file output saved to: %s\n", perFileIdxPath)
+		}
+		finalized = true
+	}
+
+	return emitRunResult(ctx, ag, comments, startTime, opts.outputFormat, opts.audience, q)
+}
+
+func runRefactorPreview(cc *commonContext, refactorTpl *template.RefactorTemplate, refactorPaths []string) error {
+	ag := refactor.NewAgent(refactor.Args{
+		RepoDir:          cc.RepoDir,
+		Paths:            refactorPaths,
+		FileFilter:       cc.FileFilter,
+		GitRunner:        cc.GitRunner,
+		MaxFileSizeBytes: refactorTpl.MaxFileSizeBytes,
+		Template:         *refactorTpl,
+	})
+
+	preview, err := ag.Preview(context.Background())
+	if err != nil {
+		return fmt.Errorf("refactor preview failed: %w", err)
+	}
+	outputPreviewText(preview)
+	return nil
+}
+
+func saveRefactorResult(repoDir string, opts refactorOptions, ag *refactor.Agent, comments []model.LlmComment, warnings []llmloop.AgentWarning, duration time.Duration, resultID string) (string, string, error) {
+	sess := ag.Session()
+	if sess == nil {
+		return "", "", fmt.Errorf("agent session is nil, cannot save refactor result")
+	}
+	projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(repoDir))
+	projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(repoDir))
+
+	result := reviewstore.Result{
+		ID: resultID,
+		Project: reviewstore.ProjectInfo{
+			ID:      projectID,
+			Name:    projectName,
+			RepoDir: repoDir,
+			WebURL:  os.Getenv("CI_PROJECT_URL"),
+		},
+		GitLab: reviewstore.GitLabInfo{
+			ServerURL:       os.Getenv("CI_SERVER_URL"),
+			ProjectID:       projectID,
+			MergeRequestIID: os.Getenv("CI_MERGE_REQUEST_IID"),
+			PipelineID:      os.Getenv("CI_PIPELINE_ID"),
+			JobID:           os.Getenv("CI_JOB_ID"),
+		},
+		Review: reviewstore.ReviewInfo{
+			Mode:             session.ReviewModeFullScan,
+			Model:            sess.Model,
+			FilesReviewed:    ag.FilesReviewed(),
+			CommentCount:     int64(len(comments)),
+			TotalTokens:      ag.TotalTokensUsed(),
+			InputTokens:      ag.TotalInputTokens(),
+			OutputTokens:     ag.TotalOutputTokens(),
+			CacheReadTokens:  ag.TotalCacheReadTokens(),
+			CacheWriteTokens: ag.TotalCacheWriteTokens(),
+			Duration:         duration.String(),
+			DurationSeconds:  int64(duration.Seconds()),
+			SessionID:        ag.SessionID(),
+		},
+		Comments: comments,
+		Warnings: mapWarnings(warnings),
+	}
+
+	jsonPath, mdPath, saveErr := reviewstore.Save(opts.resultDir, result)
+	if saveErr != nil {
+		return "", "", saveErr
+	}
+	return jsonPath, mdPath, nil
+}
+
+func loadRefactorResumeState(repoDir string, opts refactorOptions) (*session.ResumeState, error) {
+	if opts.resume == "" {
+		return nil, nil
+	}
+	current := session.SessionOptions{
+		ReviewMode: session.ReviewModeFullScan,
+	}
+	state, err := session.LoadResumeState(repoDir, opts.resume)
+	if err != nil {
+		return nil, fmt.Errorf("load resume session: %w (run 'ocr session list' to see available sessions)", err)
+	}
+	if err := state.ValidateOptions(current); err != nil {
+		return nil, fmt.Errorf("%w (run 'ocr session list' to see available sessions)", err)
+	}
+	if state.CompletedCount() == 0 && state.FailedCount() == 0 {
+		fmt.Fprintf(os.Stderr, "[ocr] Resume session %q: no completed items or failed files found — analyzing all files fresh\n",
+			opts.resume)
+	} else {
+		fmt.Fprintf(os.Stderr, "[ocr] Resume session %q: reusing %d completed file(s), retrying %d failed file(s)\n",
+			opts.resume, state.CompletedCount(), state.FailedCount())
+	}
+	return state, nil
+}
+
+func printRefactorUsage() {
+	fmt.Println(`OpenCodeReview - AI-Powered Code Refactoring
+
+Usage:
+  ocr refactor [flags]
+  ocr rf       [flags]                (alias)
+
+Examples:
+  # Analyze the entire repository
+  ocr refactor
+
+  # Analyze a single directory
+  ocr refactor --path internal/agent
+
+  # Analyze multiple files
+  ocr refactor --path internal/agent/agent.go,internal/diff/scan.go
+
+  # Preview which files would be analyzed without calling the LLM
+  ocr refactor --preview
+
+  # Skip the per-file PLAN_TASK pre-pass (saves ~1 LLM call per file)
+  ocr refactor --no-plan
+
+  # Exclude generated files / fixtures
+  ocr refactor --exclude '**/generated/*,**/testdata/*'
+
+Flags:
+  --path string           comma-separated repo-relative dirs/files to analyze (default: whole repo)
+  --exclude string        comma-separated gitignore-style patterns to exclude (merged with rule.json)
+  --no-plan               skip the per-file PLAN_TASK pre-pass (faster, less focused)
+  --model string          override LLM model for this refactoring (e.g., claude-opus-4-6)
+  --audience string       output audience: human (show progress) or agent (summary only) (default "human")
+  -b, --background string optional requirement/business context for the refactoring
+  -f, --format string     output format: text or json (default "text")
+  --concurrency int       max concurrent file analyses (default 8)
+  --max-git-procs int     max concurrent git subprocesses (default 16)
+  --max-tokens-budget int  cap total token usage; dispatch stops once exceeded (0 = unlimited)
+  --max-tools int         max tool call rounds per file; only takes effect when greater than template default
+  -p, --preview           preview which files will be analyzed without running the LLM
+  --repo string           root directory of the git repository (default: current dir)
+  --resume string         resume from a previous refactoring session id
+  --save-result           persist refactoring result as JSON + Markdown for the viewer (default true)
+  --save-per-file         split output into per-file markdown files under a directory tree mirroring the source tree
+  --result-dir string     refactoring result storage root (env: OCR_REVIEWS_DIR, default: .opencodereview/reviews)
+  --result-project string project name/path for persisted refactoring results
+  --rule string           path to JSON file with system refactoring rules
+  --timeout int           concurrent task timeout in minutes (default 10)
+  --tools string          path to JSON tools config file (default: embedded)`)
+}

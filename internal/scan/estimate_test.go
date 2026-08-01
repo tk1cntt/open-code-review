@@ -20,8 +20,8 @@ func TestHumanTokens(t *testing.T) {
 		2_400_000: "2.4M",
 	}
 	for in, want := range cases {
-		if got := humanTokens(in); got != want {
-			t.Errorf("humanTokens(%d) = %q, want %q", in, got, want)
+		if got := HumanTokens(in); got != want {
+			t.Errorf("HumanTokens(%d) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -35,7 +35,7 @@ func TestEstimateCost_ScalesWithContentAndPhases(t *testing.T) {
 	}
 
 	// Plan off, dedup off, summary off → only MAIN_TASK cost.
-	base := estimateCost(items, false, false, false)
+	base := EstimateCost(items, false, false, false)
 	if base.Files != 2 {
 		t.Fatalf("expected 2 reviewable files, got %d", base.Files)
 	}
@@ -44,13 +44,13 @@ func TestEstimateCost_ScalesWithContentAndPhases(t *testing.T) {
 	}
 
 	// Turning plan on must increase the estimate.
-	withPlan := estimateCost(items, true, false, false)
+	withPlan := EstimateCost(items, true, false, false)
 	if withPlan.TotalTokens <= base.TotalTokens {
 		t.Errorf("plan should raise estimate: base=%d withPlan=%d", base.TotalTokens, withPlan.TotalTokens)
 	}
 
 	// Summary + dedup on top must increase further.
-	full := estimateCost(items, true, true, true)
+	full := EstimateCost(items, true, true, true)
 	if full.TotalTokens <= withPlan.TotalTokens {
 		t.Errorf("dedup+summary should raise estimate: withPlan=%d full=%d", withPlan.TotalTokens, full.TotalTokens)
 	}
@@ -63,16 +63,16 @@ func TestEstimateCost_ScalesWithContentAndPhases(t *testing.T) {
 
 func TestEstimateFileTokens(t *testing.T) {
 	// Binary / empty → 0 (skipped before dispatch).
-	if got := estimateFileTokens(model.ScanItem{Path: "x", IsBinary: true}, true); got != 0 {
+	if got := EstimateFileTokens(model.ScanItem{Path: "x", IsBinary: true}, true); got != 0 {
 		t.Errorf("binary file should estimate 0, got %d", got)
 	}
-	if got := estimateFileTokens(model.ScanItem{Path: "x", Content: ""}, true); got != 0 {
+	if got := EstimateFileTokens(model.ScanItem{Path: "x", Content: ""}, true); got != 0 {
 		t.Errorf("empty file should estimate 0, got %d", got)
 	}
 
 	it := model.ScanItem{Path: "a.go", Content: strings.Repeat("token ", 400)}
-	withPlan := estimateFileTokens(it, true)
-	noPlan := estimateFileTokens(it, false)
+	withPlan := EstimateFileTokens(it, true)
+	noPlan := EstimateFileTokens(it, false)
 	if withPlan <= 0 || noPlan <= 0 {
 		t.Fatalf("expected positive estimates, got plan=%d noplan=%d", withPlan, noPlan)
 	}
@@ -82,14 +82,14 @@ func TestEstimateFileTokens(t *testing.T) {
 
 	// Per-file estimate must equal the aggregate single-file MAIN+PLAN cost
 	// (sanity that the aggregate and look-ahead share the same model).
-	agg := estimateCost([]model.ScanItem{it}, true, false, false)
+	agg := EstimateCost([]model.ScanItem{it}, true, false, false)
 	if agg.TotalTokens != withPlan {
 		t.Errorf("aggregate single-file total (%d) != per-file estimate (%d)", agg.TotalTokens, withPlan)
 	}
 }
 
 func TestEstimateCost_EmptyItems(t *testing.T) {
-	est := estimateCost(nil, true, true, true)
+	est := EstimateCost(nil, true, true, true)
 	if est.Files != 0 || est.TotalTokens != 0 {
 		t.Errorf("empty input should yield zero estimate, got %+v", est)
 	}

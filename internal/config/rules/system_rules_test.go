@@ -127,7 +127,6 @@ func TestResolve_FallbackToDefault(t *testing.T) {
 		"readme.md",
 		"docs/architecture.txt",
 		"Makefile",
-		"ios/ViewController.swift",
 		"ios/ViewController.m",
 	}
 
@@ -1085,7 +1084,7 @@ func TestNewResolver_BraceExpansionInProjectRule(t *testing.T) {
 	}{
 		{"src/main/foo.java", "jvm-rule"},
 		{"src/main/bar.kt", "jvm-rule"},
-		{"src/main/baz.swift", "Correctness"},
+		{"src/main/baz.rkt", "Correctness"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
@@ -1590,8 +1589,8 @@ func TestNewResolverWithOptions_RulesDirMissingFile(t *testing.T) {
 		t.Fatalf("NewResolverWithOptions should not fail when enterprise rules are missing: %v", err)
 	}
 
-	// Should fall back to system default
-	got := resolver.Resolve("main.go")
+	// Should fall back to system default (use an extension not in path_rule_map)
+	got := resolver.Resolve("main.foo")
 	if !strings.Contains(got, "Correctness") {
 		t.Errorf("expected system default, got %q", truncate(got, 80))
 	}

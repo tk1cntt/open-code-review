@@ -208,9 +208,9 @@ func TestExtFromPath(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
-			got := extFromPath(tt.path)
+			got := ExtFromPath(tt.path)
 			if got != tt.want {
-				t.Errorf("extFromPath(%q) = %q, want %q", tt.path, got, tt.want)
+				t.Errorf("ExtFromPath(%q) = %q, want %q", tt.path, got, tt.want)
 			}
 		})
 	}

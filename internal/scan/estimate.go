@@ -30,16 +30,12 @@ type Estimate struct {
 	TotalTokens  int64
 }
 
-// estimateCost projects token usage for reviewing the given items under the
-// supplied scan template. planEnabled / dedupEnabled / summaryEnabled
-// reflect the effective runtime toggles (template field present AND not
-// disabled by a --no-* flag).
-// estimateFileTokens projects the input+output token cost of reviewing a
+// EstimateFileTokens projects the input+output token cost of reviewing a
 // single file (PLAN_TASK + MAIN_TASK rounds). Excludes the run-level dedup/
 // summary phases. Returns 0 for files that are skipped before dispatch
 // (binary / empty). Used both by the aggregate estimate and by the
 // per-file budget look-ahead in dispatch.
-func estimateFileTokens(it model.ScanItem, planEnabled bool) int64 {
+func EstimateFileTokens(it model.ScanItem, planEnabled bool) int64 {
 	if it.IsBinary || it.Content == "" {
 		return 0
 	}
@@ -56,7 +52,7 @@ func estimateFileTokens(it model.ScanItem, planEnabled bool) int64 {
 	return total
 }
 
-func estimateCost(items []model.ScanItem, planEnabled, dedupEnabled, summaryEnabled bool) Estimate {
+func EstimateCost(items []model.ScanItem, planEnabled, dedupEnabled, summaryEnabled bool) Estimate {
 	var est Estimate
 	var allCommentsApprox int64
 
@@ -104,11 +100,11 @@ func estimateCost(items []model.ScanItem, planEnabled, dedupEnabled, summaryEnab
 // precise dollar figure.
 func (e Estimate) String() string {
 	return fmt.Sprintf("~%d file(s), est. %s input + %s output ≈ %s total tokens (rough; actual reported after run)",
-		e.Files, humanTokens(e.InputTokens), humanTokens(e.OutputTokens), humanTokens(e.TotalTokens))
+		e.Files, HumanTokens(e.InputTokens), HumanTokens(e.OutputTokens), HumanTokens(e.TotalTokens))
 }
 
-// humanTokens formats a token count as e.g. "1.2M" / "850K" / "420".
-func humanTokens(n int64) string {
+// HumanTokens formats a token count as e.g. "1.2M" / "850K" / "420".
+func HumanTokens(n int64) string {
 	switch {
 	case n >= 1_000_000:
 		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)

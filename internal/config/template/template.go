@@ -42,11 +42,32 @@ type ScanTemplate struct {
 	ProjectSummaryTask    *LlmConversation `json:"PROJECT_SUMMARY_TASK,omitempty"`
 }
 
+// RefactorTemplate holds the refactoring task template configuration loaded
+// from refactor_template.json. Follows the ScanTemplate pattern with embedded
+// prompt content directly (no prompt_file indirection).
+type RefactorTemplate struct {
+	MainTask              LlmConversation  `json:"MAIN_TASK"`
+	PlanTask              *LlmConversation `json:"PLAN_TASK,omitempty"`
+	MemoryCompressionTask LlmConversation  `json:"MEMORY_COMPRESSION_TASK"`
+	ReLocationTask        *LlmConversation `json:"RE_LOCATION_TASK,omitempty"`
+	MaxTokens             int              `json:"MAX_TOKENS"`
+	ToolRequestWaitTimeMs int              `json:"TOOL_REQUEST_WAIT_TIME_MS"`
+	MaxToolRequestTimes   int              `json:"MAX_TOOL_REQUEST_TIMES"`
+	MaxSubtaskExecMinutes int              `json:"MAX_SUBTASK_EXECUTION_TIME_MINUTES"`
+	MaxFileSizeBytes      int64            `json:"MAX_FILE_SIZE_BYTES,omitempty"`
+	MaxTokensBudget       int64            `json:"MAX_TOKENS_BUDGET,omitempty"`
+	BatchStrategy         string           `json:"BATCH_STRATEGY,omitempty"`
+	BatchSize             int              `json:"BATCH_SIZE,omitempty"`
+}
+
 //go:embed task_template.json prompts/*
 var templateFS embed.FS
 
 //go:embed scan_template.json
 var defaultScanTemplate []byte
+
+//go:embed refactor_template.json
+var defaultRefactorTemplate []byte
 
 type manifestMessage struct {
 	Role       string `json:"role"`
@@ -208,6 +229,40 @@ func (t *ScanTemplate) Validate() error {
 	}
 	if len(t.MainTask.Messages) == 0 {
 		return fmt.Errorf("scan: main_task.messages must not be empty")
+	}
+	return nil
+}
+
+// LoadRefactorDefault parses the embedded refactor_template.json.
+func LoadRefactorDefault() (*RefactorTemplate, error) {
+	var tpl RefactorTemplate
+	if err := json.Unmarshal(defaultRefactorTemplate, &tpl); err != nil {
+		return nil, fmt.Errorf("unmarshal default refactor template: %w", err)
+	}
+	return &tpl, nil
+}
+
+// ApplyLanguage injects a language directive into all system-role messages
+// of the refactor template.
+func (t *RefactorTemplate) ApplyLanguage(lang string) {
+	instruction := "\n\nAlways respond in " + resolveLang(lang) + "."
+	applyLanguage(&t.MainTask, instruction)
+	if t.PlanTask != nil {
+		applyLanguage(t.PlanTask, instruction)
+	}
+	applyLanguage(&t.MemoryCompressionTask, instruction)
+}
+
+// Validate checks that a RefactorTemplate has the minimum fields populated.
+func (t *RefactorTemplate) Validate() error {
+	if t.MaxTokens <= 0 {
+		return fmt.Errorf("refactor: max_tokens must be positive")
+	}
+	if t.MaxToolRequestTimes <= 0 {
+		return fmt.Errorf("refactor: max_tool_request_times must be positive")
+	}
+	if len(t.MainTask.Messages) == 0 {
+		return fmt.Errorf("refactor: main_task.messages must not be empty")
 	}
 	return nil
 }

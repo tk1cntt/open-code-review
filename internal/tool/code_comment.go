@@ -18,11 +18,25 @@ const (
 	codeCommentCategoryStyle           = "style"
 	codeCommentCategoryDocumentation   = "documentation"
 	codeCommentCategoryOther           = "other"
+	codeCommentCategoryComplexity      = "complexity"
+	codeCommentCategoryNaming          = "naming"
+	codeCommentCategoryDuplication     = "duplication"
+	codeCommentCategoryDesign          = "design"
+	codeCommentCategoryCoupling        = "coupling"
+	codeCommentCategoryData            = "data"
+	codeCommentCategoryControlFlow     = "control_flow"
+	codeCommentCategoryErrorHandling   = "error_handling"
+	codeCommentCategoryDeadCode        = "dead_code"
+	codeCommentCategoryTestability     = "testability"
 
 	codeCommentSeverityCritical = "critical"
 	codeCommentSeverityHigh     = "high"
 	codeCommentSeverityMedium   = "medium"
 	codeCommentSeverityLow      = "low"
+	codeCommentSeverityBlocker  = "blocker"
+	codeCommentSeverityMajor    = "major"
+	codeCommentSeverityMinor    = "minor"
+	codeCommentSeverityInfo     = "info"
 )
 
 var validCodeCommentCategories = map[string]struct{}{
@@ -34,6 +48,16 @@ var validCodeCommentCategories = map[string]struct{}{
 	codeCommentCategoryStyle:           {},
 	codeCommentCategoryDocumentation:   {},
 	codeCommentCategoryOther:           {},
+	codeCommentCategoryComplexity:      {},
+	codeCommentCategoryNaming:          {},
+	codeCommentCategoryDuplication:     {},
+	codeCommentCategoryDesign:          {},
+	codeCommentCategoryCoupling:        {},
+	codeCommentCategoryData:            {},
+	codeCommentCategoryControlFlow:     {},
+	codeCommentCategoryErrorHandling:   {},
+	codeCommentCategoryDeadCode:        {},
+	codeCommentCategoryTestability:     {},
 }
 
 var validCodeCommentSeverities = map[string]struct{}{
@@ -41,6 +65,10 @@ var validCodeCommentSeverities = map[string]struct{}{
 	codeCommentSeverityHigh:     {},
 	codeCommentSeverityMedium:   {},
 	codeCommentSeverityLow:      {},
+	codeCommentSeverityBlocker:  {},
+	codeCommentSeverityMajor:    {},
+	codeCommentSeverityMinor:    {},
+	codeCommentSeverityInfo:     {},
 }
 
 // CodeCommentProvider submits review comments to the per-Agent CommentCollector.
