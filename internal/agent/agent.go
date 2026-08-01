@@ -618,7 +618,7 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 					// fixed, safe reason in the manifest and keep the detailed value
 					// only in the local checkpoint / warning.
 					a.markFailed(d, session.FailurePanic, "subtask panicked during review")
-					a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, fmt.Sprintf("panic: %v", r))
+					a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, fmt.Sprintf("panic: %v", r), nil)
 					if a.args.OnFileDone != nil {
 						a.args.OnFileDone(d.NewPath, nil)
 					}
@@ -689,7 +689,7 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 				if stop != nil {
 					a.markFailed(d, stop.class, stop.reason)
 					if stop.checkpoint != "" {
-						a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, stop.checkpoint)
+						a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, stop.checkpoint, nil)
 					}
 					if stop.reportAsError {
 						atomic.AddInt64(&a.subtaskFailed, 1)
