@@ -221,7 +221,7 @@ func registerRefactorFlags(cmd *cobra.Command, opts *refactorOptions) {
 	cmd.Flags().StringVar(&opts.resume, "resume", "", "resume from a previous refactoring session id")
 	cmd.Flags().BoolVar(&opts.saveResult, "save-result", true, "persist final refactoring result for the WebUI viewer")
 	cmd.Flags().BoolVar(&opts.savePerFile, "save-per-file", true, "split output into per-file markdown files")
-	cmd.Flags().StringVar(&opts.resultDir, "result-dir", "", "refactoring result storage root (env: OCR_REVIEWS_DIR, default: .opencodereview/reviews)")
+	cmd.Flags().StringVar(&opts.resultDir, "result-dir", "", "refactoring result storage root (env: OCR_REVIEWS_DIR, default: .opencodereview/refactors)")
 	cmd.Flags().StringVar(&opts.resultProject, "result-project", "", "project name/path for persisted refactoring results")
 }
 

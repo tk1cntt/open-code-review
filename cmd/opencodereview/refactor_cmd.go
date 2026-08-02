@@ -157,7 +157,7 @@ func executeRefactor(opts refactorOptions) error {
 			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
 				opts.resultDir = d
 			} else {
-				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "refactors")
 			}
 		}
 		projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(cc.RepoDir))
@@ -220,7 +220,7 @@ func executeRefactor(opts refactorOptions) error {
 			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
 				opts.resultDir = d
 			} else {
-				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "refactors")
 			}
 		}
 		path, mdPath, err := saveRefactorResult(cc.RepoDir, opts, ag, comments, ag.Warnings(), duration, reviewID)
