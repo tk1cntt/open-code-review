@@ -1,4 +1,4 @@
-// Package refactor implements `ocr refactor` — full-file refactoring analysis.
+﻿// Package refactor implements `ocr refactor` — full-file refactoring analysis.
 // It follows the same architecture as internal/scan but uses refactoring-specific
 // templates, rules (ResolveRefactor), and output categories/severities.
 package refactor
@@ -471,17 +471,9 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 	)
 
 	for i := range batch {
-		if a.args.MaxTokensBudget > 0 {
-			used := a.runner.TotalTokensUsed()
-			projected := used + scan.EstimateFileTokens(batch[i], a.planEnabled())
-			if projected > a.args.MaxTokensBudget {
-				fmt.Fprintf(stdout.Writer(), "[ocr] token budget reached (used %s + next-file est ≈ %s > budget %s) — skipping %s and remaining files\n",
-					scan.HumanTokens(used), scan.HumanTokens(projected), scan.HumanTokens(a.args.MaxTokensBudget), batch[i].Path)
-				a.recordWarning("token_budget_reached", batch[i].Path,
-					fmt.Sprintf("stopped in batch #%d: used %d tokens + next-file estimate exceeds budget %d", batchIdx, used, a.args.MaxTokensBudget))
-				budgetHit = true
-				break
-			}
+		if a.tokenBudgetHit(batch[i], batchIdx) {
+			budgetHit = true
+			break
 		}
 
 		select {
@@ -498,63 +490,14 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 			defer func() { <-sem }()
 
 			fingerprint := scan.ScanItemFingerprint(it.Path)
+			err := a.executeWithRetries(ctx, it, batchIdx, timeout)
+			comments := a.args.CommentCollector.CommentsForPath(it.Path)
 
-			const maxRetries = 3
-			var lastErr error
-			for attempt := 0; attempt < maxRetries; attempt++ {
-				var fileCtx context.Context
-				var cancel context.CancelFunc
-				if timeout > 0 {
-					retryTimeout := timeout * time.Duration(attempt+1)
-					fileCtx, cancel = context.WithTimeout(ctx, retryTimeout)
-				} else {
-					fileCtx = ctx
-				}
-
-				lastErr = a.executeSubtask(fileCtx, it)
-				if cancel != nil {
-					cancel()
-				}
-
-				if lastErr == nil {
-					break
-				}
-
-				shouldRetry := errors.Is(lastErr, context.DeadlineExceeded) ||
-					llm.IsRetryableHTTPStatus(lastErr)
-				if !shouldRetry || attempt == maxRetries-1 {
-					break
-				}
-
-				a.args.CommentCollector.RemoveByPath(it.Path)
-
-				if errors.Is(lastErr, context.DeadlineExceeded) {
-					fmt.Fprintf(stdout.Writer(), "[ocr] Refactor subtask timeout for %s (batch #%d, attempt %d/%d), retrying with extended timeout...\n",
-						it.Path, batchIdx, attempt+1, maxRetries)
-				} else {
-					fmt.Fprintf(stdout.Writer(), "[ocr] Refactor subtask rate-limited (429/502) for %s (batch #%d, attempt %d/%d), retrying...\n",
-						it.Path, batchIdx, attempt+1, maxRetries)
-				}
-			}
-			if lastErr != nil {
-				atomic.AddInt64(&a.subtaskFailed, 1)
-				comments := a.args.CommentCollector.CommentsForPath(it.Path)
-				a.session.RecordReviewItemFailed(it.Path, it.Path, it.Path, fingerprint, lastErr.Error(), comments)
-				if a.args.OnFileDone != nil {
-					a.args.OnFileDone(it.Path, comments)
-				}
-				fmt.Fprintf(stdout.Writer(), "[ocr] Refactor subtask error for %s (batch #%d): %v\n", it.Path, batchIdx, lastErr)
-				telemetry.ErrorEvent(context.WithoutCancel(ctx), "refactor.subtask.error", lastErr,
-					telemetry.AnyToAttr("file.path", it.Path),
-					telemetry.AnyToAttr("batch.index", batchIdx))
-				a.recordWarning("refactor_subtask_error", it.Path, lastErr.Error())
+			if err != nil {
+				a.recordFileFailure(ctx, it, fingerprint, batchIdx, err, comments)
 				return
 			}
-			comments := a.args.CommentCollector.CommentsForPath(it.Path)
-			a.session.RecordReviewItemDone(it.Path, it.Path, it.Path, fingerprint, comments)
-			if a.args.OnFileDone != nil {
-				a.args.OnFileDone(it.Path, comments)
-			}
+			a.recordFileSuccess(it, fingerprint, comments)
 		}(batch[i])
 	}
 
@@ -597,6 +540,88 @@ func (a *Agent) executeSubtask(ctx context.Context, it model.ScanItem) error {
 	return err
 }
 
+// executeWithRetries runs executeSubtask with up to 3 retries for transient failures.
+// On each retry the timeout is extended (attempt+1 * base timeout).
+func (a *Agent) executeWithRetries(ctx context.Context, it model.ScanItem, batchIdx int, timeout time.Duration) error {
+	const maxRetries = 3
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		var fileCtx context.Context
+		var cancel context.CancelFunc
+		if timeout > 0 {
+			retryTimeout := timeout * time.Duration(attempt+1)
+			fileCtx, cancel = context.WithTimeout(ctx, retryTimeout)
+		} else {
+			fileCtx = ctx
+		}
+
+		lastErr = a.executeSubtask(fileCtx, it)
+		if cancel != nil {
+			cancel()
+		}
+
+		if lastErr == nil {
+			return nil
+		}
+
+		shouldRetry := errors.Is(lastErr, context.DeadlineExceeded) ||
+			llm.IsRetryableHTTPStatus(lastErr)
+		if !shouldRetry || attempt == maxRetries-1 {
+			break
+		}
+
+		a.args.CommentCollector.RemoveByPath(it.Path)
+
+		if errors.Is(lastErr, context.DeadlineExceeded) {
+			fmt.Fprintf(stdout.Writer(), "[ocr] Refactor subtask timeout for %s (batch #%d, attempt %d/%d), retrying with extended timeout...\n",
+				it.Path, batchIdx, attempt+1, maxRetries)
+		} else {
+			fmt.Fprintf(stdout.Writer(), "[ocr] Refactor subtask rate-limited (429/502) for %s (batch #%d, attempt %d/%d), retrying...\n",
+				it.Path, batchIdx, attempt+1, maxRetries)
+		}
+	}
+	return lastErr
+}
+
+// tokenBudgetHit checks whether processing item would exceed the token budget.
+func (a *Agent) tokenBudgetHit(it model.ScanItem, batchIdx int) bool {
+	if a.args.MaxTokensBudget <= 0 {
+		return false
+	}
+	used := a.runner.TotalTokensUsed()
+	projected := used + scan.EstimateFileTokens(it, a.planEnabled())
+	if projected <= a.args.MaxTokensBudget {
+		return false
+	}
+	fmt.Fprintf(stdout.Writer(), "[ocr] token budget reached (used %s + next-file est ≈ %s > budget %s) — skipping %s and remaining files\n",
+		scan.HumanTokens(used), scan.HumanTokens(projected), scan.HumanTokens(a.args.MaxTokensBudget), it.Path)
+	a.recordWarning("token_budget_reached", it.Path,
+		fmt.Sprintf("stopped in batch #%d: used %d tokens + next-file estimate exceeds budget %d", batchIdx, used, a.args.MaxTokensBudget))
+	return true
+}
+
+// recordFileFailure increments the failure counter, logs, wires telemetry, and records in session.
+func (a *Agent) recordFileFailure(ctx context.Context, it model.ScanItem, fingerprint string, batchIdx int, err error, comments []model.LlmComment) {
+	atomic.AddInt64(&a.subtaskFailed, 1)
+	a.session.RecordReviewItemFailed(it.Path, it.Path, it.Path, fingerprint, err.Error(), comments)
+	if a.args.OnFileDone != nil {
+		a.args.OnFileDone(it.Path, comments)
+	}
+	fmt.Fprintf(stdout.Writer(), "[ocr] Refactor subtask error for %s (batch #%d): %v\n", it.Path, batchIdx, err)
+	telemetry.ErrorEvent(context.WithoutCancel(ctx), "refactor.subtask.error", err,
+		telemetry.AnyToAttr("file.path", it.Path),
+		telemetry.AnyToAttr("batch.index", batchIdx))
+	a.recordWarning("refactor_subtask_error", it.Path, err.Error())
+}
+
+// recordFileSuccess records the item as done in session and fires onFileDone callback.
+func (a *Agent) recordFileSuccess(it model.ScanItem, fingerprint string, comments []model.LlmComment) {
+	a.session.RecordReviewItemDone(it.Path, it.Path, it.Path, fingerprint, comments)
+	if a.args.OnFileDone != nil {
+		a.args.OnFileDone(it.Path, comments)
+	}
+}
+
 func (a *Agent) maybeRunPlan(ctx context.Context, it model.ScanItem, rule string) string {
 	const noPlan = "(no pre-analysis plan; analyze the entire file as usual)"
 
@@ -607,11 +632,7 @@ func (a *Agent) maybeRunPlan(ctx context.Context, it model.ScanItem, rule string
 
 	messages := make([]llm.Message, 0, len(pt.Messages))
 	for _, m := range pt.Messages {
-		content := m.Content
-		content = strings.ReplaceAll(content, "{{current_system_date_time}}", a.currentDate)
-		content = strings.ReplaceAll(content, "{{current_file_path}}", it.Path)
-		content = strings.ReplaceAll(content, "{{system_rule}}", rule)
-		content = strings.ReplaceAll(content, "{{file_content}}", it.Content)
+		content := a.fillPlaceholders(m.Content, it, rule, nil)
 		messages = append(messages, llm.NewTextMessage(m.Role, content))
 	}
 
@@ -681,17 +702,27 @@ func formatPlanGuidance(raw string) string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
+// fillPlaceholders replaces standard template variables in content.
+func (a *Agent) fillPlaceholders(content string, it model.ScanItem, rule string, extra map[string]string) string {
+	content = strings.ReplaceAll(content, "{{current_system_date_time}}", a.currentDate)
+	content = strings.ReplaceAll(content, "{{current_file_path}}", it.Path)
+	content = strings.ReplaceAll(content, "{{system_rule}}", rule)
+	content = strings.ReplaceAll(content, "{{file_content}}", it.Content)
+	for k, v := range extra {
+		content = strings.ReplaceAll(content, k, v)
+	}
+	return content
+}
+
 func (a *Agent) renderMessages(it model.ScanItem, rule, planGuidance string) []llm.Message {
 	rawMsgs := a.args.Template.MainTask.Messages
 	messages := make([]llm.Message, 0, len(rawMsgs))
 	for _, m := range rawMsgs {
-		content := m.Content
-		content = strings.ReplaceAll(content, "{{plan_guidance}}", planGuidance)
-		content = strings.ReplaceAll(content, "{{current_system_date_time}}", a.currentDate)
-		content = strings.ReplaceAll(content, "{{current_file_path}}", it.Path)
-		content = strings.ReplaceAll(content, "{{system_rule}}", rule)
-		content = strings.ReplaceAll(content, "{{file_content}}", it.Content)
-		content = strings.ReplaceAll(content, "{{requirement_background}}", a.args.Background)
+		extra := map[string]string{
+			"{{plan_guidance}}":          planGuidance,
+			"{{requirement_background}}": a.args.Background,
+		}
+		content := a.fillPlaceholders(m.Content, it, rule, extra)
 		messages = append(messages, llm.NewTextMessage(m.Role, content))
 	}
 	return messages
