@@ -1,0 +1,66 @@
+{
+  "default": {
+    "max_fn_lines": 80,
+    "max_params": 4,
+    "max_nesting": 3,
+    "max_switch_cases": 7,
+    "max_findings": 8,
+    "max_component_lines": 300
+  },
+  "go_idiomatic": {
+    "max_fn_lines": 60,
+    "max_params": 5,
+    "max_nesting": 3,
+    "max_switch_cases": 7,
+    "max_findings": 8,
+    "max_component_lines": 0
+  },
+  "jvm": {
+    "max_fn_lines": 80,
+    "max_params": 4,
+    "max_nesting": 3,
+    "max_switch_cases": 7,
+    "max_findings": 8,
+    "max_component_lines": 0
+  },
+  "react_web": {
+    "max_fn_lines": 80,
+    "max_params": 4,
+    "max_nesting": 3,
+    "max_switch_cases": 7,
+    "max_findings": 8,
+    "max_component_lines": 300
+  },
+  "systems": {
+    "max_fn_lines": 70,
+    "max_params": 5,
+    "max_nesting": 3,
+    "max_switch_cases": 8,
+    "max_findings": 8,
+    "max_component_lines": 0
+  },
+  "scripting": {
+    "max_fn_lines": 80,
+    "max_params": 5,
+    "max_nesting": 3,
+    "max_switch_cases": 7,
+    "max_findings": 8,
+    "max_component_lines": 0
+  },
+  "dotnet": {
+    "max_fn_lines": 80,
+    "max_params": 4,
+    "max_nesting": 3,
+    "max_switch_cases": 7,
+    "max_findings": 8,
+    "max_component_lines": 0
+  },
+  "mobile": {
+    "max_fn_lines": 80,
+    "max_params": 4,
+    "max_nesting": 3,
+    "max_switch_cases": 7,
+    "max_findings": 8,
+    "max_component_lines": 200
+  }
+}

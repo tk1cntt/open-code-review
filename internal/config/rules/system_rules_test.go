@@ -50,6 +50,294 @@ func TestExpandBraces_UnclosedBrace(t *testing.T) {
 	}
 }
 
+func TestResolveRefactor_ComposeCodeLanguage(t *testing.T) {
+	rule, err := LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault: %v", err)
+	}
+	if rule.DefaultRefactorRule == "" {
+		t.Fatal("DefaultRefactorRule is empty")
+	}
+
+	// AC1: code languages receive common ∪ language delta.
+	codeCases := []struct {
+		path       string
+		langMarker string
+	}{
+		{"src/Foo.java", "Optional"},
+		{"internal/pkg/service.go", "goroutine"},
+		{"app/main.py", "type hint"},
+		{"src/index.ts", "TypeScript"},
+		{"lib/Widget.kt", "!!"},
+		{"src/main.rs", "unwrap()"},
+		{"Domain/User.cs", "record"},
+	}
+	for _, tt := range codeCases {
+		got := rule.ResolveRefactor(tt.path)
+		if !strings.Contains(got, rule.DefaultRefactorRule) {
+			t.Errorf("ResolveRefactor(%q): expected common refactor rules to be composed in", tt.path)
+		}
+		if !strings.Contains(got, "Language-Specific Refactoring Rules") {
+			t.Errorf("ResolveRefactor(%q): expected language-specific section separator", tt.path)
+		}
+		if !strings.Contains(got, "Threshold Profile") {
+			t.Errorf("ResolveRefactor(%q): expected threshold profile section", tt.path)
+		}
+		if !strings.Contains(got, "Family-Specific Refactoring Rules") &&
+			!strings.Contains(got, "#### Family:") {
+			// Family section present for mapped languages.
+			t.Errorf("ResolveRefactor(%q): expected family section", tt.path)
+		}
+		if !strings.Contains(got, "REF-COMPLEX-001") {
+			t.Errorf("ResolveRefactor(%q): expected catalog rule ID index", tt.path)
+		}
+		if !strings.Contains(got, tt.langMarker) {
+			t.Errorf("ResolveRefactor(%q): expected language marker %q, got %q",
+				tt.path, tt.langMarker, truncate(got, 200))
+		}
+		// Common policy markers (present after Phase 1 common.md rewrite).
+		for _, marker := range []string{"Priority and Finding Budget", "Evidence Requirements", "Immutability"} {
+			if !strings.Contains(got, marker) {
+				t.Errorf("ResolveRefactor(%q): expected common marker %q", tt.path, marker)
+			}
+		}
+	}
+}
+
+func TestResolveRefactor_ConfigStandalone(t *testing.T) {
+	rule, err := LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault: %v", err)
+	}
+
+	// AC2: config/data paths must NOT compose function-oriented common rules.
+	configCases := []struct {
+		path         string
+		wantContains string
+	}{
+		{"package.json", "package.json"},
+		{"module/pom.xml", "pom.xml"},
+		{"config/app.yaml", "YAML"},
+		{"src/main/resources/application.properties", "Properties"},
+		{"api/schema.proto", "Protocol Buffers"},
+		{"infra/main.tf", "Terraform"},
+		{"styles/app.css", "CSS"},
+	}
+	commonMarkers := []string{
+		"Priority and Finding Budget",
+		"Immutability (CRITICAL)",
+		"Dependency Injection (DI)",
+		"Language-Specific Refactoring Rules",
+		"Threshold Profile",
+		"Family-Specific Refactoring Rules",
+		"REF-COMPLEX-001",
+	}
+	for _, tt := range configCases {
+		got := rule.ResolveRefactor(tt.path)
+		if !strings.Contains(got, tt.wantContains) {
+			t.Errorf("ResolveRefactor(%q): expected config marker %q, got %q",
+				tt.path, tt.wantContains, truncate(got, 200))
+		}
+		for _, marker := range commonMarkers {
+			if strings.Contains(got, marker) {
+				t.Errorf("ResolveRefactor(%q): config path must not include common marker %q", tt.path, marker)
+			}
+		}
+		if strings.Contains(got, rule.DefaultRefactorRule) {
+			t.Errorf("ResolveRefactor(%q): config path must not compose full common rules", tt.path)
+		}
+	}
+}
+
+func TestResolveRefactor_UnmatchedFallsBackToCommon(t *testing.T) {
+	rule, err := LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault: %v", err)
+	}
+	got := rule.ResolveRefactor("notes.unknownext")
+	if got != rule.DefaultRefactorRule {
+		t.Errorf("unmatched path: expected DefaultRefactorRule only, got %q", truncate(got, 120))
+	}
+}
+
+func TestIsStandaloneRefactorPath(t *testing.T) {
+	standalone := []string{
+		"package.json",
+		"pom.xml",
+		"Cargo.toml",
+		"a/b/config.yaml",
+		".github/workflows/ci.yml",
+		"schema.proto",
+		"app.properties",
+		"styles/main.scss",
+	}
+	for _, p := range standalone {
+		if !isStandaloneRefactorPath(p) {
+			t.Errorf("isStandaloneRefactorPath(%q) = false, want true", p)
+		}
+	}
+	code := []string{"main.go", "App.java", "index.ts", "lib.rs", "Main.kt"}
+	for _, p := range code {
+		if isStandaloneRefactorPath(p) {
+			t.Errorf("isStandaloneRefactorPath(%q) = true, want false", p)
+		}
+	}
+}
+
+func TestComposeRefactorRules(t *testing.T) {
+	got := composeRefactorRules("COMMON", "LANG", false)
+	if !strings.Contains(got, "COMMON") || !strings.Contains(got, "LANG") {
+		t.Fatalf("compose expected both parts: %q", got)
+	}
+	if composeRefactorRules("COMMON", "LANG", true) != "LANG" {
+		t.Error("standalone should return language only")
+	}
+	if got := composeRefactorRules("", "LANG", false); !strings.Contains(got, "LANG") {
+		t.Errorf("empty common should still include language, got %q", got)
+	}
+	if composeRefactorRules("COMMON", "", false) != "COMMON" {
+		t.Error("empty language should return common only")
+	}
+	if composeRefactorRules("COMMON", "LANG", true) != "LANG" {
+		t.Error("standalone ignores common")
+	}
+}
+
+func TestResolveRefactor_PayloadNotLargerThanNaiveSum(t *testing.T) {
+	// AC3 soft check: composed payload = common + profile + family + lang delta.
+	// Guard against accidental full-language re-bloat (legacy ~6KB lang files).
+	rule, err := LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault: %v", err)
+	}
+	commonLen := len(rule.DefaultRefactorRule)
+	paths := []string{"src/Foo.java", "main.go", "app.py", "index.ts", "lib.rs"}
+	for _, p := range paths {
+		got := rule.ResolveRefactor(p)
+		// common + family(~2KB) + profile(~0.5KB) + lang delta(~2KB) + separators.
+		if len(got) > commonLen+8192 {
+			t.Errorf("ResolveRefactor(%q): composed size %d looks bloated (common=%d)",
+				p, len(got), commonLen)
+		}
+		if len(got) <= commonLen {
+			t.Errorf("ResolveRefactor(%q): expected composed text longer than common alone", p)
+		}
+	}
+}
+
+func TestResolveRefactor_GoProfileThresholds(t *testing.T) {
+	rule, err := LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault: %v", err)
+	}
+	got := rule.ResolveRefactor("pkg/service.go")
+	if !strings.Contains(got, "go_idiomatic") {
+		t.Errorf("expected go_idiomatic profile, got %q", truncate(got, 300))
+	}
+	if !strings.Contains(got, "max function lines: **60**") {
+		t.Errorf("expected go max_fn_lines=60 in profile block")
+	}
+	if !strings.Contains(got, "Family: Systems") {
+		t.Errorf("expected systems family for Go")
+	}
+}
+
+func TestResolveRefactor_DisableCatalogIDs(t *testing.T) {
+	rule, err := LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault: %v", err)
+	}
+	full := rule.ResolveRefactor("src/Foo.java")
+	if !strings.Contains(full, "REF-DI-001") {
+		t.Fatal("precondition: REF-DI-001 should appear in full payload")
+	}
+	filtered := rule.ResolveRefactorWithOptions("src/Foo.java", ResolveRefactorOptions{
+		DisabledRuleIDs: []string{"REF-DI-001"},
+	})
+	if strings.Contains(filtered, "REF-DI-001") {
+		t.Error("disabled REF-DI-001 should be stripped from payload")
+	}
+	// Unrelated IDs remain.
+	if !strings.Contains(filtered, "REF-COMPLEX-001") {
+		t.Error("unrelated catalog IDs should remain")
+	}
+}
+
+func TestResolveRefactor_ForcedProfile(t *testing.T) {
+	rule, err := LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault: %v", err)
+	}
+	got := rule.ResolveRefactorWithOptions("src/Foo.java", ResolveRefactorOptions{
+		ForcedProfile: "go_idiomatic",
+	})
+	if !strings.Contains(got, "go_idiomatic") {
+		t.Errorf("forced profile not applied: %q", truncate(got, 200))
+	}
+}
+
+func TestRefactorPayloadStats(t *testing.T) {
+	rule, err := LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault: %v", err)
+	}
+	st := rule.RefactorPayloadStats("main.go")
+	if st.Bytes == 0 {
+		t.Fatal("expected non-zero payload bytes")
+	}
+	if st.Standalone {
+		t.Fatal("go should not be standalone")
+	}
+	if st.Profile != "go_idiomatic" {
+		t.Errorf("profile = %q, want go_idiomatic", st.Profile)
+	}
+	joined := strings.Join(st.Layers, ",")
+	for _, want := range []string{"common", "profile:go_idiomatic", "family", "language"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("layers %v missing %q", st.Layers, want)
+		}
+	}
+
+	cfg := rule.RefactorPayloadStats("package.json")
+	if !cfg.Standalone {
+		t.Error("package.json should be standalone")
+	}
+	if cfg.Bytes == 0 {
+		t.Error("package.json payload should be non-empty")
+	}
+}
+
+func TestFilterDisabledRefactorRules(t *testing.T) {
+	in := "keep\n- bad REF-DI-001 stuff\nkeep2 REF-COMPLEX-001\n"
+	got := filterDisabledRefactorRules(in, []string{"REF-DI-001"})
+	if strings.Contains(got, "REF-DI-001") {
+		t.Fatalf("still contains disabled id: %q", got)
+	}
+	if !strings.Contains(got, "REF-COMPLEX-001") {
+		t.Fatalf("removed unrelated line: %q", got)
+	}
+}
+
+func TestComposedResolver_DisabledRefactorRules(t *testing.T) {
+	sys, err := LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault: %v", err)
+	}
+	resolver := &composedResolver{
+		project: &ProjectRule{
+			DisabledRefactorRules: []string{"REF-DI-001"},
+		},
+		system: sys,
+	}
+	got := resolver.ResolveRefactor("src/Main.java")
+	if strings.Contains(got, "REF-DI-001") {
+		t.Error("project disabled_refactor_rules should strip REF-DI-001")
+	}
+	if !strings.Contains(got, "Optional") {
+		t.Error("java language delta should still be present")
+	}
+}
+
 func TestResolve_DefaultRules(t *testing.T) {
 	rule, err := LoadDefault()
 	if err != nil {

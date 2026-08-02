@@ -1,48 +1,25 @@
-#### Astro Refactoring Rules
+#### Astro Refactoring Rules (delta)
+
+Overrides common where noted.
 
 ##### Component Design
-- `.astro` components with excessive frontmatter logic should extract business logic to separate modules
-- Framework components used only for static markup should be replaced with plain Astro markup
-- Repeated islands with similar hydration patterns should be consolidated
-- Large components with many responsibilities should be split by concern
+- Keep frontmatter thin — extract business logic to modules
+- Prefer plain Astro markup when hydration is unnecessary
+- Split large multi-responsibility components
 
 ##### Hydration Optimization
-- `client:load` on non-critical UI should be `client:idle`, `client:visible`, or `client:media` where appropriate
-- `client:only` without fallback content or framework string should be fixed
-- Over-hydration from large or overly numerous islands should be reduced
-- Heavy framework components that could be server-rendered Astro should be refactored
+- Prefer `client:idle` / `client:visible` / `client:media` over blanket `client:load`
+- Fix `client:only` missing fallback/framework string
+- Reduce over-hydration of islands
 
 ##### Data Flow
-- Frontmatter data that reaches multiple hydrated islands should be structured to minimize payload
-- Props passing through multiple component layers should be consolidated
-- `Astro.locals`, cookies, headers, or request-only data exposed to client unintentionally
-- Server-only values reaching client bundles should be stripped
-
-##### Duplication
-- Repeated layout patterns should be extracted into layout components or base layouts
-- Repeated `<script>` or `<style>` blocks suggest missing component extraction
-- Similar content fetching logic across pages suggests a shared content loader
-- Duplicated SEO/meta tags across pages should use a shared `BaseHead` component
-
-##### Dead Code and Simplification
-- Unused island imports and framework components should be removed
-- Empty or no-op `<script>`/`<style>` blocks should be cleaned
-- Commented-out template sections should be deleted
-- Unused slots, props, and content collection references
+- Minimize payload to hydrated islands
+- Do not leak server-only values (`Astro.locals`, cookies, secrets) to client bundles
 
 ##### Content and Assets
-- Ad-hoc Markdown/MDX loading when content collections would provide better typing and validation
-- Plain `<img>` where Astro's `<Image />` component would provide optimization
-- Repeated content queries across pages should use shared query functions
-
-##### Template Organization
-- Templates with deeply nested conditional rendering should use components or helper functions
-- Repeated `set:html` usage patterns should be extracted with consistent sanitization
-- `is:global` overuse should be narrowed to scoped styles with targeted `:global()` escapes
-- Selectors assuming scoped CSS can pierce child component internals should be fixed
+- Prefer content collections over ad-hoc MD/MDX loading
+- Prefer Astro `<Image />` over plain `<img>` when optimization matters
+- Share SEO/meta via base head/layout components
 
 ##### Error and Loading States
-- Server islands (`server:defer`) without fallback slots should add loading states
-- Missing error boundaries for dynamic islands that can fail
-
-For each finding, indicate severity (blocker/critical/major/minor/info), confidence (VERY_HIGH/HIGH/MEDIUM/LOW), rule reference, and include before/after code snippets.
+- `server:defer` islands should provide fallback slots

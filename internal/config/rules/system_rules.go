@@ -32,6 +32,19 @@ type SystemRule struct {
 	// Refactoring rules (same structure as review rules, different purpose).
 	DefaultRefactorRule string     `json:"default_refactor_rule"`
 	RefactorPathRules   []PathRule `json:"refactor_rule_map,omitempty"`
+
+	// Phase 2: family / profile / catalog (populated by LoadDefault).
+	// RefactorFamilyMap: pattern → family markdown content (after load).
+	RefactorFamilyMap []PathRule
+	// RefactorProfileMap: pattern → profile name (string in Rule field).
+	RefactorProfileMap []PathRule
+	// RefactorProfiles: name → thresholds.
+	RefactorProfiles map[string]RefactorProfile
+	// RefactorCatalog: structured rule IDs.
+	RefactorCatalog []CatalogRule
+
+	// raw family file paths (name → relative path under rule_docs/), used only during load.
+	refactorFamilyFiles map[string]string
 }
 
 // UnmarshalJSON preserves the key order from JSON's path_rule_map and
@@ -39,7 +52,7 @@ type SystemRule struct {
 func (r *SystemRule) UnmarshalJSON(data []byte) error {
 	// Decode scalar fields normally.
 	var wrapper struct {
-		DefaultRule        string `json:"default_rule"`
+		DefaultRule         string `json:"default_rule"`
 		DefaultRefactorRule string `json:"default_refactor_rule"`
 	}
 	if err := json.Unmarshal(data, &wrapper); err != nil {
@@ -70,6 +83,33 @@ func (r *SystemRule) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("refactor_rule_map: %w", err)
 		}
 		r.RefactorPathRules = refRules
+	}
+
+	// Parse refactor_families: name → file path.
+	if mapData, ok := raw["refactor_families"]; ok && len(mapData) > 0 && string(mapData) != "null" {
+		var files map[string]string
+		if err := json.Unmarshal(mapData, &files); err != nil {
+			return fmt.Errorf("refactor_families: %w", err)
+		}
+		r.refactorFamilyFiles = files
+	}
+
+	// Parse refactor_family_map: pattern → family name (stored temporarily in Rule).
+	if mapData, ok := raw["refactor_family_map"]; ok && len(mapData) > 0 && string(mapData) != "null" {
+		famRules, err := parseOrderedRuleMap(mapData)
+		if err != nil {
+			return fmt.Errorf("refactor_family_map: %w", err)
+		}
+		r.RefactorFamilyMap = famRules
+	}
+
+	// Parse refactor_profile_map: pattern → profile name.
+	if mapData, ok := raw["refactor_profile_map"]; ok && len(mapData) > 0 && string(mapData) != "null" {
+		profRules, err := parseOrderedRuleMap(mapData)
+		if err != nil {
+			return fmt.Errorf("refactor_profile_map: %w", err)
+		}
+		r.RefactorProfileMap = profRules
 	}
 
 	return nil
@@ -103,7 +143,7 @@ func parseOrderedRuleMap(data json.RawMessage) ([]PathRule, error) {
 	return rules, nil
 }
 
-//go:embed system_rules.json rule_docs/* rule_docs/refactoring/*
+//go:embed system_rules.json rule_docs/* rule_docs/refactoring/* rule_docs/refactoring/family/*
 var rulesFS embed.FS
 
 // LoadDefault parses the embedded system_rules.json and resolves rule file references.
@@ -143,7 +183,77 @@ func LoadDefault() (*SystemRule, error) {
 		}
 		rule.RefactorPathRules[i].Rule = strings.TrimRight(string(content), "\n")
 	}
+
+	// Phase 2: load family markdown by name, then rewrite family map to content.
+	familyContent := map[string]string{}
+	for name, rel := range rule.refactorFamilyFiles {
+		content, err := rulesFS.ReadFile("rule_docs/" + rel)
+		if err != nil {
+			return nil, fmt.Errorf("read refactor family %q file %q: %w", name, rel, err)
+		}
+		familyContent[name] = strings.TrimRight(string(content), "\n")
+	}
+	for i := range rule.RefactorFamilyMap {
+		name := rule.RefactorFamilyMap[i].Rule
+		body, ok := familyContent[name]
+		if !ok {
+			return nil, fmt.Errorf("refactor_family_map pattern %q references unknown family %q",
+				rule.RefactorFamilyMap[i].Pattern, name)
+		}
+		rule.RefactorFamilyMap[i].Rule = body
+	}
+
+	// Phase 2: load threshold profiles.
+	if err := loadRefactorProfiles(&rule); err != nil {
+		return nil, err
+	}
+
+	// Phase 2: load structured catalog and append ID index to common rules.
+	if err := loadRefactorCatalog(&rule); err != nil {
+		return nil, err
+	}
+	if idx := renderCatalogIndex(rule.RefactorCatalog); idx != "" && rule.DefaultRefactorRule != "" {
+		rule.DefaultRefactorRule = rule.DefaultRefactorRule + "\n\n" + idx
+	}
+
 	return &rule, nil
+}
+
+func loadRefactorProfiles(rule *SystemRule) error {
+	data, err := rulesFS.ReadFile("rule_docs/refactoring/profiles.json")
+	if err != nil {
+		// Optional file — ignore missing for forward compatibility.
+		if strings.Contains(err.Error(), "file does not exist") || strings.Contains(err.Error(), "no such file") {
+			return nil
+		}
+		// embed.FS returns path error; treat not exist as optional.
+		return nil
+	}
+	var profiles map[string]RefactorProfile
+	if err := json.Unmarshal(data, &profiles); err != nil {
+		return fmt.Errorf("unmarshal refactoring/profiles.json: %w", err)
+	}
+	for name, p := range profiles {
+		p.Name = name
+		profiles[name] = p
+	}
+	rule.RefactorProfiles = profiles
+	return nil
+}
+
+func loadRefactorCatalog(rule *SystemRule) error {
+	data, err := rulesFS.ReadFile("rule_docs/refactoring/catalog.json")
+	if err != nil {
+		return nil // optional
+	}
+	var wrapper struct {
+		Rules []CatalogRule `json:"rules"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return fmt.Errorf("unmarshal refactoring/catalog.json: %w", err)
+	}
+	rule.RefactorCatalog = wrapper.Rules
+	return nil
 }
 
 // RuleDetail contains the resolved rule along with metadata about its source.
@@ -201,19 +311,60 @@ func (r *SystemRule) resolveDetail(path string) RuleDetail {
 	return RuleDetail{Rule: r.DefaultRule, Source: "system", Pattern: "default"}
 }
 
-// ResolveRefactor returns the refactoring rule text for a given file path.
-// Same resolution logic as Resolve but uses refactor-specific rule maps and default.
-func (r *SystemRule) ResolveRefactor(path string) string {
+// standaloneRefactorPatterns are path globs whose refactor rules are self-contained
+// (config, data, markup, IaC, i18n). They do NOT compose with common.md, which is
+// oriented toward programming-language source.
+//
+// Keep in sync with config-like entries in system_rules.json refactor_rule_map
+// (see REFACTOR_RULES_OPTIMIZATION_ADR.md Appendix B).
+var standaloneRefactorPatterns = []string{
+	"**/*.properties",
+	"**/*{mapper,dao}*.xml",
+	"**/pom.xml",
+	"**/build.gradle",
+	"**/package.json",
+	"**/Cargo.toml",
+	"**/composer.json",
+	"**/*.{json,json5}",
+	".github/workflows/**/*.{yaml,yml}",
+	".github/**/*.{yaml,yml}",
+	"**/*.{yaml,yml}",
+	"**/*.{ftl,ftlh,ftlx}",
+	"**/*.proto",
+	"**/*.po",
+	"**/*.pot",
+	"**/*.{graphql,gql}",
+	"**/*.prisma",
+	"**/*.{tf,hcl,tfvars}",
+	"**/*.bicep",
+	"**/*.{css,scss,sass,less,html,svelte}",
+}
+
+// isStandaloneRefactorPath reports whether path should receive only its path
+// rule (no common.md composition).
+func isStandaloneRefactorPath(path string) bool {
 	lowerPath := strings.ToLower(path)
-	for _, pr := range r.RefactorPathRules {
-		expanded := expandBraces(pr.Pattern)
-		for _, p := range expanded {
+	for _, pattern := range standaloneRefactorPatterns {
+		for _, p := range expandBraces(pattern) {
 			if matched, _ := doublestar.Match(strings.ToLower(p), lowerPath); matched {
-				return pr.Rule
+				return true
 			}
 		}
 	}
-	return r.DefaultRefactorRule
+	return false
+}
+
+// composeRefactorRules is kept for tests; prefer composeRefactorLayers.
+func composeRefactorRules(common, language string, standalone bool) string {
+	return composeRefactorLayers(common, "", language, nil, standalone)
+}
+
+// ResolveRefactor returns the refactoring rule text for a given file path.
+// Code-language paths compose: common → threshold profile → family → language delta.
+// Config/data/markup paths use the path rule alone. Unmatched paths fall back to
+// default_refactor_rule (plus default profile when available).
+func (r *SystemRule) ResolveRefactor(path string) string {
+	return r.ResolveRefactorWithOptions(path, ResolveRefactorOptions{})
 }
 
 // expandBraces turns "{a,b,c}" style patterns into individual strings.
@@ -258,6 +409,12 @@ type ProjectRule struct {
 	RefactorRules []ProjectRuleEntry `json:"refactor_rules,omitempty"`
 	Include       []string           `json:"include,omitempty"`
 	Exclude       []string           `json:"exclude,omitempty"`
+
+	// Phase 2 project knobs for system refactor composition.
+	// DisabledRefactorRules lists catalog IDs (e.g. REF-DI-001) to strip from system rules.
+	DisabledRefactorRules []string `json:"disabled_refactor_rules,omitempty"`
+	// RefactorProfile forces a named threshold profile for all paths in this layer.
+	RefactorProfile string `json:"refactor_profile,omitempty"`
 }
 
 // FileFilter holds the merged user-configured include/exclude glob patterns
@@ -584,15 +741,37 @@ func (c *composedResolver) Resolve(path string) string {
 }
 
 func (c *composedResolver) ResolveRefactor(path string) string {
+	opts := c.refactorResolveOptions()
 	for _, layer := range []*ProjectRule{c.custom, c.project, c.enterpriseProject, c.enterpriseGlobal, c.global} {
 		if entry := matchRefactorRuleEntry(layer, path); entry != nil {
 			if entry.MergeSystemRule {
 				return c.mergeWithSystemRefactorRule(path, entry.Rule)
 			}
-			return entry.Rule
+			// User-supplied rule text; still apply disabled-ID filter if present.
+			return filterDisabledRefactorRules(entry.Rule, opts.DisabledRuleIDs)
 		}
 	}
-	return c.system.ResolveRefactor(path)
+	if c.system == nil {
+		return ""
+	}
+	return c.system.ResolveRefactorWithOptions(path, opts)
+}
+
+// refactorResolveOptions collects the highest-priority non-empty project knobs.
+func (c *composedResolver) refactorResolveOptions() ResolveRefactorOptions {
+	opts := ResolveRefactorOptions{}
+	for _, layer := range []*ProjectRule{c.custom, c.project, c.enterpriseProject, c.enterpriseGlobal, c.global} {
+		if layer == nil {
+			continue
+		}
+		if opts.ForcedProfile == "" && layer.RefactorProfile != "" {
+			opts.ForcedProfile = layer.RefactorProfile
+		}
+		if len(opts.DisabledRuleIDs) == 0 && len(layer.DisabledRefactorRules) > 0 {
+			opts.DisabledRuleIDs = append([]string(nil), layer.DisabledRefactorRules...)
+		}
+	}
+	return opts
 }
 
 // matchRefactorRuleEntry matches against a layer's RefactorRules first.
@@ -611,7 +790,7 @@ func matchRefactorRuleEntry(pr *ProjectRule, path string) *ProjectRuleEntry {
 }
 
 func (c *composedResolver) mergeWithSystemRefactorRule(path, rule string) string {
-	systemRule := c.system.ResolveRefactor(path)
+	systemRule := c.system.ResolveRefactorWithOptions(path, c.refactorResolveOptions())
 	if systemRule == "" {
 		return rule
 	}
@@ -623,6 +802,14 @@ func (c *composedResolver) mergeWithSystemRefactorRule(path, rule string) string
 		"\n\n---\n\n" +
 		"## User-Specific Refactoring Rules (Mandatory)\n\n" +
 		rule
+}
+
+// RefactorPayloadStats delegates to the system rule set for payload telemetry.
+func (c *composedResolver) RefactorPayloadStats(path string) RefactorRulePayloadStats {
+	if c.system == nil {
+		return RefactorRulePayloadStats{Path: path}
+	}
+	return c.system.RefactorPayloadStats(path)
 }
 
 // CanonicalConfig returns a deterministic, order-stable field list describing the

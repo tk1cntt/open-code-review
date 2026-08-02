@@ -1,0 +1,130 @@
+{
+  "rules": [
+    {
+      "id": "REF-BUDGET-001",
+      "category": "priority",
+      "tier": "P0",
+      "severity_default": "info",
+      "confidence_min": "HIGH",
+      "trigger": "Finding budget and priority ordering",
+      "action": "Prefer P0 then P1; cap findings per file; suppress speculative P2"
+    },
+    {
+      "id": "REF-EVIDENCE-001",
+      "category": "evidence",
+      "tier": "P0",
+      "severity_default": "info",
+      "confidence_min": "HIGH",
+      "trigger": "Cross-module claim without local evidence",
+      "action": "Do not report coupling/cycles/fan-out without imports or usages in the current file"
+    },
+    {
+      "id": "REF-COMPLEX-001",
+      "category": "complexity",
+      "tier": "P1",
+      "severity_default": "major",
+      "confidence_min": "HIGH",
+      "trigger": "Function body exceeds profile max_fn_lines",
+      "action": "Split by responsibility"
+    },
+    {
+      "id": "REF-COMPLEX-002",
+      "category": "complexity",
+      "tier": "P1",
+      "severity_default": "major",
+      "confidence_min": "HIGH",
+      "trigger": "Parameter count exceeds profile max_params",
+      "action": "Group related parameters into a struct/object/options type"
+    },
+    {
+      "id": "REF-COMPLEX-003",
+      "category": "complexity",
+      "tier": "P1",
+      "severity_default": "major",
+      "confidence_min": "HIGH",
+      "trigger": "Nesting deeper than profile max_nesting",
+      "action": "Use guard clauses with early returns"
+    },
+    {
+      "id": "REF-ERROR-001",
+      "category": "error_handling",
+      "tier": "P0",
+      "severity_default": "critical",
+      "confidence_min": "VERY_HIGH",
+      "trigger": "Errors silently ignored or swallowed",
+      "action": "Handle or propagate with context"
+    },
+    {
+      "id": "REF-ERROR-002",
+      "category": "error_handling",
+      "tier": "P0",
+      "severity_default": "critical",
+      "confidence_min": "HIGH",
+      "trigger": "Resource not cleaned on all paths",
+      "action": "Use language resource pattern (defer / try-with-resources / RAII / use)"
+    },
+    {
+      "id": "REF-DEAD-001",
+      "category": "dead_code",
+      "tier": "P1",
+      "severity_default": "minor",
+      "confidence_min": "VERY_HIGH",
+      "trigger": "Unused imports, functions, variables, or commented-out code",
+      "action": "Remove dead code"
+    },
+    {
+      "id": "REF-DUP-001",
+      "category": "duplication",
+      "tier": "P1",
+      "severity_default": "major",
+      "confidence_min": "HIGH",
+      "trigger": "Verbatim duplicate blocks (>=2) or near-duplicates differing only by literals/types",
+      "action": "Extract shared helper; avoid premature abstraction"
+    },
+    {
+      "id": "REF-IMMUT-001",
+      "category": "immutability",
+      "tier": "P0",
+      "severity_default": "critical",
+      "confidence_min": "HIGH",
+      "trigger": "Shared mutable state or public exposure of internal mutable collections",
+      "action": "Prefer immutability, defensive copies, or isolation"
+    },
+    {
+      "id": "REF-DI-001",
+      "category": "dependency",
+      "tier": "P2",
+      "severity_default": "major",
+      "confidence_min": "HIGH",
+      "trigger": "Hard-coded collaborators or service locator in domain code",
+      "action": "Prefer constructor injection of abstractions"
+    },
+    {
+      "id": "REF-TEST-001",
+      "category": "testability",
+      "tier": "P1",
+      "severity_default": "major",
+      "confidence_min": "HIGH",
+      "trigger": "Direct clock/filesystem/network/random in production logic",
+      "action": "Inject abstractions for deterministic tests"
+    },
+    {
+      "id": "REF-NAME-001",
+      "category": "naming",
+      "tier": "P1",
+      "severity_default": "minor",
+      "confidence_min": "MEDIUM",
+      "trigger": "Names that hide intent or boolean without is/has/can/should",
+      "action": "Rename for intent; use boolean prefixes"
+    },
+    {
+      "id": "REF-VALID-001",
+      "category": "validation",
+      "tier": "P1",
+      "severity_default": "major",
+      "confidence_min": "HIGH",
+      "trigger": "Invalid data accepted at system boundaries",
+      "action": "Validate at boundaries; fail fast with actionable messages"
+    }
+  ]
+}

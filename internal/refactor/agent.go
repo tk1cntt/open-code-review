@@ -517,6 +517,26 @@ func (a *Agent) executeSubtask(ctx context.Context, it model.ScanItem) error {
 	rule := ""
 	if a.args.SystemRule != nil {
 		rule = a.args.SystemRule.ResolveRefactor(strings.ToLower(it.Path))
+		// Phase 1/2 telemetry: rule payload size and composition layers.
+		if statsProvider, ok := a.args.SystemRule.(interface {
+			RefactorPayloadStats(path string) rules.RefactorRulePayloadStats
+		}); ok {
+			st := statsProvider.RefactorPayloadStats(strings.ToLower(it.Path))
+			telemetry.SetAttr(span, "refactor.rule.bytes", st.Bytes)
+			telemetry.SetAttr(span, "refactor.rule.standalone", st.Standalone)
+			if st.Profile != "" {
+				telemetry.SetAttr(span, "refactor.rule.profile", st.Profile)
+			}
+			if len(st.Layers) > 0 {
+				telemetry.SetAttr(span, "refactor.rule.layers", strings.Join(st.Layers, ","))
+			}
+			telemetry.Event(ctx, "refactor.rule.payload",
+				telemetry.AnyToAttr("file.path", it.Path),
+				telemetry.AnyToAttr("rule.bytes", st.Bytes),
+				telemetry.AnyToAttr("rule.standalone", st.Standalone),
+				telemetry.AnyToAttr("rule.profile", st.Profile),
+				telemetry.AnyToAttr("rule.layers", strings.Join(st.Layers, ",")))
+		}
 	}
 
 	planGuidance := a.maybeRunPlan(ctx, it, rule)
