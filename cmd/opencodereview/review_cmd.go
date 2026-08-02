@@ -260,6 +260,7 @@ func executeReview(opts reviewOptions) error {
 	}()
 
 	comments, runErr := ag.Run(ctx)
+	duration := time.Since(startTime)
 	manifest := ag.RunManifest()
 	resultErr := reviewResultError(runErr, manifest)
 	if resultErr != nil {
@@ -272,14 +273,14 @@ func executeReview(opts reviewOptions) error {
 	// error so JSON consumers retain the complete coverage diagnosis.
 	var emitErr error
 	if manifest != nil || runErr == nil {
-		emitErr = emitRunResult(ctx, ag, comments, startTime, opts.outputFormat, opts.audience, q)
+		emitErr = emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q)
 		if emitErr != nil {
 			emitErr = fmt.Errorf("emit review result: %w", emitErr)
 		}
 	}
 	if resultErr != nil {
 		q.Restore()
-		emitFailureUsage(ag, time.Since(startTime), opts.outputFormat)
+		emitFailureUsage(ag, duration, opts.outputFormat)
 		if id := ag.SessionID(); id != "" {
 			fmt.Fprintf(os.Stderr, "[ocr] Session: %s (retry with: --resume %s)\n", id, id)
 		}
@@ -292,7 +293,6 @@ func executeReview(opts reviewOptions) error {
 		}
 	}
 
-	duration := time.Since(startTime)
 	if opts.saveResult {
 		if opts.resultDir == "" {
 			opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")

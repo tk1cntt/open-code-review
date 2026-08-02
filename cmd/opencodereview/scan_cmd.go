@@ -327,6 +327,7 @@ func executeScan(opts scanOptions) error {
 	}()
 
 	comments, err := ag.Run(ctx)
+	duration := time.Since(startTime)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
@@ -342,7 +343,6 @@ func executeScan(opts scanOptions) error {
 		}
 	}
 
-	duration := time.Since(startTime)
 	if opts.saveResult {
 		if opts.resultDir == "" {
 			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
@@ -395,7 +395,7 @@ func executeScan(opts scanOptions) error {
 		finalized = true
 	}
 
-	return emitRunResult(ctx, ag, comments, startTime, opts.outputFormat, opts.audience, q)
+	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q)
 }
 
 func runScanPreview(cc *commonContext, scanTpl *template.ScanTemplate, scanPaths []string) error {

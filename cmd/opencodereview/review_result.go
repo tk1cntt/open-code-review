@@ -152,15 +152,19 @@ func mergeResults(existing, current reviewstore.Result) reviewstore.Result {
 	}
 	merged.Review.FilesReviewed = int64(len(seenPaths))
 
-	// Merge warnings: deduplicate by message
+	// Merge warnings: deduplicate by type + file + message. Including
+	// type in the key prevents two warnings with the same message text
+	// but different severity/type from colliding.
 	existingWarn := make(map[string]bool)
 	for _, w := range existing.Warnings {
-		existingWarn[w.Message] = true
+		key := w.Type + "\x00" + w.File + "\x00" + w.Message
+		existingWarn[key] = true
 	}
 	for _, w := range current.Warnings {
-		if !existingWarn[w.Message] {
+		key := w.Type + "\x00" + w.File + "\x00" + w.Message
+		if !existingWarn[key] {
 			merged.Warnings = append(merged.Warnings, w)
-			existingWarn[w.Message] = true
+			existingWarn[key] = true
 		}
 	}
 

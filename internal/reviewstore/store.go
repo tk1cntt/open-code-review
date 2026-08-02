@@ -729,6 +729,11 @@ func (w *PerFileWriter) Finalize(review ReviewInfo, gitlab GitLabInfo, warnings 
 		index = mergePerFileIndex(existing, &index)
 	}
 
+	// Override FilesReviewed to reflect the actual number of files that
+	// produced per-file output (len(w.entries)), not the dispatchable diff
+	// count that callers pass in via ReviewInfo.FilesReviewed.
+	index.Review.FilesReviewed = int64(len(index.Files))
+
 	if err := writePerFileJSON(indexPath, index); err != nil {
 		return "", fmt.Errorf("write index.json: %w", err)
 	}
@@ -814,14 +819,14 @@ func mergePerFileIndex(existing *PerFileIndex, newIdx *PerFileIndex) PerFileInde
 	merged.Review.CacheWriteTokens = existing.Review.CacheWriteTokens + newIdx.Review.CacheWriteTokens
 
 	// Merge warnings: keep warnings from both runs, deduplicated by
-	// file + message.
+	// type + file + message.
 	seen := make(map[string]bool)
 	for _, w := range newIdx.Warnings {
-		key := w.File + "\x00" + w.Message
+		key := w.Type + "\x00" + w.File + "\x00" + w.Message
 		seen[key] = true
 	}
 	for _, w := range existing.Warnings {
-		key := w.File + "\x00" + w.Message
+		key := w.Type + "\x00" + w.File + "\x00" + w.Message
 		if !seen[key] {
 			merged.Warnings = append(merged.Warnings, w)
 			seen[key] = true

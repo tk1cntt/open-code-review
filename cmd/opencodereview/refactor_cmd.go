@@ -199,6 +199,7 @@ func executeRefactor(opts refactorOptions) error {
 	}()
 
 	comments, err := ag.Run(ctx)
+	duration := time.Since(startTime)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
@@ -214,7 +215,6 @@ func executeRefactor(opts refactorOptions) error {
 		}
 	}
 
-	duration := time.Since(startTime)
 	if opts.saveResult {
 		if opts.resultDir == "" {
 			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
@@ -267,7 +267,7 @@ func executeRefactor(opts refactorOptions) error {
 		finalized = true
 	}
 
-	return emitRunResult(ctx, ag, comments, startTime, opts.outputFormat, opts.audience, q)
+	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q)
 }
 
 func runRefactorPreview(cc *commonContext, refactorTpl *template.RefactorTemplate, refactorPaths []string) error {

@@ -323,13 +323,12 @@ func emitRunResult(
 	ctx context.Context,
 	ag ResultProvider,
 	comments []model.LlmComment,
-	startTime time.Time,
+	duration time.Duration,
 	outputFormat, audience string,
 	q *quietHandle,
 ) error {
 	comments = diff.ResolveLineNumbers(comments, ag.Diffs())
 
-	duration := time.Since(startTime)
 	telemetry.RecordReviewDuration(ctx, duration)
 	if len(comments) > 0 {
 		telemetry.RecordCommentsGenerated(ctx, int64(len(comments)))
