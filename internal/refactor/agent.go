@@ -20,6 +20,7 @@ import (
 	"github.com/alibaba/open-code-review/internal/llm"
 	"github.com/alibaba/open-code-review/internal/llmloop"
 	"github.com/alibaba/open-code-review/internal/model"
+	"github.com/alibaba/open-code-review/internal/refactor/crossfile"
 	"github.com/alibaba/open-code-review/internal/scan"
 	"github.com/alibaba/open-code-review/internal/session"
 	"github.com/alibaba/open-code-review/internal/stdout"
@@ -50,6 +51,16 @@ type Args struct {
 	MaxTokensBudget       int64
 	Resume                *session.ResumeState
 	OnFileDone            func(filePath string, comments []model.LlmComment)
+
+	// Multi-file pipeline (ADR F0–F3).
+	// Mode: local | cross | full (default local).
+	Mode string
+	// CrossFileHints enables F0 related-path citations in per-file MAIN_TASK.
+	CrossFileHints bool
+	// Apply enables F3 write+verify for architect plans that include suggestion_code.
+	Apply bool
+	// ApplyRunTests runs go test during verify when Apply is true.
+	ApplyRunTests bool
 }
 
 // Agent orchestrates full-file refactoring analysis. It delegates the per-file
@@ -194,10 +205,13 @@ func (a *Agent) recordWarning(warningType, file, message string) {
 }
 
 // Run executes the full refactoring pipeline: enumerate → filter → token-filter →
-// dispatch one subtask per file → collect comments.
+// dispatch (local and/or cross-file) → collect comments.
 func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
-	if len(a.args.Template.MainTask.Messages) == 0 {
-		return nil, fmt.Errorf("refactor template MAIN_TASK is missing or empty")
+	mode := crossfile.ParseMode(a.args.Mode)
+	if mode == crossfile.ModeLocal || mode == crossfile.ModeFull {
+		if len(a.args.Template.MainTask.Messages) == 0 {
+			return nil, fmt.Errorf("refactor template MAIN_TASK is missing or empty")
+		}
 	}
 
 	ctx, span := telemetry.StartSpan(ctx, "refactor.enumerate")
@@ -212,7 +226,9 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 
 	a.items = items
 	a.injectScanContentMap()
-	a.args.Tools.Freeze()
+	if a.args.Tools != nil {
+		a.args.Tools.Freeze()
+	}
 
 	totalDiscovered := len(a.items)
 	a.items = a.filterScanItems(a.items)
@@ -226,8 +242,8 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 	}
 
 	reviewable := len(a.items)
-	fmt.Fprintf(stdout.Writer(), "[ocr] refactor: %d file(s) discovered, analyzing %d in %s\n",
-		totalDiscovered, reviewable, a.args.RepoDir)
+	fmt.Fprintf(stdout.Writer(), "[ocr] refactor: %d file(s) discovered, analyzing %d in %s (mode=%s)\n",
+		totalDiscovered, reviewable, a.args.RepoDir, mode)
 
 	if reviewable == 0 {
 		fmt.Fprintln(stdout.Writer(), "[ocr] No analyzable files. Skipping refactor.")
@@ -253,16 +269,46 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 		telemetry.AnyToAttr("file.count", totalDiscovered),
 		telemetry.AnyToAttr("review.count", reviewable),
 		telemetry.AnyToAttr("est.total.tokens", est.TotalTokens),
-		telemetry.AnyToAttr("repo.dir", a.args.RepoDir))
+		telemetry.AnyToAttr("repo.dir", a.args.RepoDir),
+		telemetry.AnyToAttr("mode", string(mode)),
+		telemetry.AnyToAttr("cross_file_hints", a.args.CrossFileHints),
+		telemetry.AnyToAttr("apply", a.args.Apply))
 	telemetry.RecordFilesReviewed(ctx, int64(reviewable))
 
-	comments, err := a.dispatchSubtasks(ctx)
+	var comments []model.LlmComment
+	var runErr error
+
+	// Phase L — per-file
+	if mode == crossfile.ModeLocal || mode == crossfile.ModeFull {
+		comments, runErr = a.dispatchSubtasks(ctx)
+		if runErr != nil {
+			a.session.Finalize()
+			return comments, runErr
+		}
+	}
+
+	// Phase X — cross-file detect + architect (+ optional apply)
+	if mode == crossfile.ModeCross || mode == crossfile.ModeFull {
+		crossComments, xerr := a.runCrossFilePhase(ctx)
+		if xerr != nil {
+			// Cross failures are non-fatal if local already produced comments.
+			if mode == crossfile.ModeCross {
+				runErr = xerr
+			} else {
+				fmt.Fprintf(stdout.Writer(), "[ocr] WARNING: cross-file phase error: %v\n", xerr)
+				a.recordWarning("cross_file_phase_error", "(cross_file_phase)", xerr.Error())
+			}
+		}
+		fmt.Fprintf(stdout.Writer(), "[ocr] cross-file phase: %d comment(s)\n", len(crossComments))
+		comments = a.args.CommentCollector.Comments()
+	}
+
 	if len(comments) > 0 {
 		telemetry.RecordCommentsGenerated(ctx, int64(len(comments)))
 	}
 
 	a.session.Finalize()
-	return comments, err
+	return comments, runErr
 }
 
 // lookupDiff returns the synthetic Diff for a path.
@@ -737,10 +783,15 @@ func (a *Agent) fillPlaceholders(content string, it model.ScanItem, rule string,
 func (a *Agent) renderMessages(it model.ScanItem, rule, planGuidance string) []llm.Message {
 	rawMsgs := a.args.Template.MainTask.Messages
 	messages := make([]llm.Message, 0, len(rawMsgs))
+	hints := ""
+	if a.args.CrossFileHints {
+		hints = crossFileHintsBlock
+	}
 	for _, m := range rawMsgs {
 		extra := map[string]string{
 			"{{plan_guidance}}":          planGuidance,
 			"{{requirement_background}}": a.args.Background,
+			"{{cross_file_hints}}":       hints,
 		}
 		content := a.fillPlaceholders(m.Content, it, rule, extra)
 		messages = append(messages, llm.NewTextMessage(m.Role, content))

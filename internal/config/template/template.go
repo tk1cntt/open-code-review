@@ -48,6 +48,8 @@ type ScanTemplate struct {
 type RefactorTemplate struct {
 	MainTask              LlmConversation  `json:"MAIN_TASK"`
 	PlanTask              *LlmConversation `json:"PLAN_TASK,omitempty"`
+	CrossDetectTask       *LlmConversation `json:"CROSS_DETECT_TASK,omitempty"`
+	CrossArchitectTask    *LlmConversation `json:"CROSS_ARCHITECT_TASK,omitempty"`
 	MemoryCompressionTask LlmConversation  `json:"MEMORY_COMPRESSION_TASK"`
 	ReLocationTask        *LlmConversation `json:"RE_LOCATION_TASK,omitempty"`
 	MaxTokens             int              `json:"MAX_TOKENS"`
@@ -249,6 +251,12 @@ func (t *RefactorTemplate) ApplyLanguage(lang string) {
 	applyLanguage(&t.MainTask, instruction)
 	if t.PlanTask != nil {
 		applyLanguage(t.PlanTask, instruction)
+	}
+	if t.CrossDetectTask != nil {
+		applyLanguage(t.CrossDetectTask, instruction)
+	}
+	if t.CrossArchitectTask != nil {
+		applyLanguage(t.CrossArchitectTask, instruction)
 	}
 	applyLanguage(&t.MemoryCompressionTask, instruction)
 }

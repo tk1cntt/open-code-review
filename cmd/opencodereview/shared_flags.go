@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
+	"github.com/alibaba/open-code-review/internal/refactor/crossfile"
 	"github.com/spf13/cobra"
 )
 
@@ -217,6 +219,10 @@ func registerRefactorFlags(cmd *cobra.Command, opts *refactorOptions) {
 	cmd.Flags().IntVar(&opts.maxTokensBudget, "max-tokens-budget", 0, "cap total token usage; dispatch stops once exceeded (0 = unlimited)")
 	cmd.Flags().BoolVarP(&opts.preview, "preview", "p", false, "preview which files will be analyzed without running the LLM")
 	cmd.Flags().BoolVar(&opts.noPlan, "no-plan", false, "skip the per-file PLAN_TASK pre-pass")
+	cmd.Flags().StringVar(&opts.mode, "mode", "local", "refactor pipeline: local (per-file), cross (multi-file detect+architect), full (local then cross)")
+	cmd.Flags().StringVar(&opts.crossFile, "cross-file", "off", "per-file cross-file hints: off | hints (cite related paths via tools)")
+	cmd.Flags().BoolVar(&opts.apply, "apply", false, "apply cross-file architect plans that include suggestion_code (verify+rollback; default false)")
+	cmd.Flags().BoolVar(&opts.applyRunTests, "apply-run-tests", false, "when --apply, also run go test on touched packages during verify")
 	addModelFlag(cmd, &opts.model)
 	cmd.Flags().StringVar(&opts.resume, "resume", "", "resume from a previous refactoring session id")
 	cmd.Flags().BoolVar(&opts.saveResult, "save-result", true, "persist final refactoring result for the WebUI viewer")
@@ -237,6 +243,25 @@ func validateRefactorOptions(opts *refactorOptions) error {
 	}
 	if opts.maxTokensBudget < 0 {
 		return fmt.Errorf("--max-tokens-budget must be a non-negative integer (0 means unlimited)")
+	}
+	mode := crossfile.ParseMode(opts.mode)
+	switch mode {
+	case crossfile.ModeLocal, crossfile.ModeCross, crossfile.ModeFull:
+		opts.mode = string(mode)
+	default:
+		return fmt.Errorf("--mode must be one of: local, cross, full")
+	}
+	cf := strings.ToLower(strings.TrimSpace(opts.crossFile))
+	if cf == "" {
+		cf = "off"
+	}
+	if cf != "off" && cf != "hints" {
+		return fmt.Errorf("--cross-file must be one of: off, hints")
+	}
+	opts.crossFile = cf
+	if opts.apply && mode == crossfile.ModeLocal && cf != "hints" {
+		// allow apply only with cross/full; warn via validation error for clarity
+		return fmt.Errorf("--apply requires --mode=cross or --mode=full")
 	}
 	return nil
 }

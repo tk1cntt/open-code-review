@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/alibaba/open-code-review/internal/config/template"
@@ -29,6 +30,11 @@ type refactorOptions struct {
 	model                                              string
 	showHelp                                           bool
 	preview                                            bool
+	// Multi-file (F0–F3)
+	mode           string
+	crossFile      string // off | hints
+	apply          bool
+	applyRunTests  bool
 }
 
 var refactorOpts refactorOptions
@@ -53,6 +59,18 @@ var refactorCmd = &cobra.Command{
 
   # Skip the per-file PLAN_TASK pre-pass (saves ~1 LLM call per file)
   ocr refactor --no-plan
+
+  # Cross-file analysis (detect + architect multi-file smells)
+  ocr refactor --mode=cross --path internal/config
+
+  # Local then cross-file
+  ocr refactor --mode=full --path internal/agent
+
+  # Per-file with cross-file citation hints
+  ocr refactor --cross-file=hints
+
+  # Apply architect plans that include suggestion_code (verify+rollback)
+  ocr refactor --mode=cross --apply --path pkg/foo
 
   # Exclude generated files / fixtures
   ocr refactor --exclude '**/generated/*,**/testdata/*'`,
@@ -120,6 +138,7 @@ func executeRefactor(opts refactorOptions) error {
 
 	var perFileWriter *reviewstore.PerFileWriter
 
+	crossHints := strings.EqualFold(opts.crossFile, "hints")
 	ag := refactor.NewAgent(refactor.Args{
 		RepoDir:               cc.RepoDir,
 		Paths:                 refactorPaths,
@@ -140,6 +159,10 @@ func executeRefactor(opts refactorOptions) error {
 		MaxTokensBudget:       refactorTpl.MaxTokensBudget,
 		SkipPlan:              opts.noPlan,
 		Resume:                resumeState,
+		Mode:                  opts.mode,
+		CrossFileHints:        crossHints,
+		Apply:                 opts.apply,
+		ApplyRunTests:         opts.applyRunTests,
 		OnFileDone: func(filePath string, comments []model.LlmComment) {
 			if perFileWriter != nil {
 				if err := perFileWriter.WriteFile(filePath, comments); err != nil {

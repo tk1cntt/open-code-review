@@ -143,7 +143,7 @@ func parseOrderedRuleMap(data json.RawMessage) ([]PathRule, error) {
 	return rules, nil
 }
 
-//go:embed system_rules.json rule_docs/* rule_docs/refactoring/* rule_docs/refactoring/family/*
+//go:embed system_rules.json rule_docs/* rule_docs/refactoring/* rule_docs/refactoring/family/* rule_docs/refactoring/cross_file/*
 var rulesFS embed.FS
 
 // LoadDefault parses the embedded system_rules.json and resolves rule file references.
@@ -254,6 +254,15 @@ func loadRefactorCatalog(rule *SystemRule) error {
 	}
 	rule.RefactorCatalog = wrapper.Rules
 	return nil
+}
+
+// LoadCrossFileRefactorRule returns the embedded multi-file refactor rule pack.
+func LoadCrossFileRefactorRule() (string, error) {
+	content, err := rulesFS.ReadFile("rule_docs/refactoring/cross_file/common.md")
+	if err != nil {
+		return "", fmt.Errorf("read cross-file refactor rules: %w", err)
+	}
+	return strings.TrimRight(string(content), "\n"), nil
 }
 
 // RuleDetail contains the resolved rule along with metadata about its source.

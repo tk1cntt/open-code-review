@@ -28,6 +28,8 @@ const (
 	codeCommentCategoryErrorHandling   = "error_handling"
 	codeCommentCategoryDeadCode        = "dead_code"
 	codeCommentCategoryTestability     = "testability"
+	codeCommentCategoryCrossDuplication = "cross_duplication"
+	codeCommentCategoryCrossFile       = "cross_file"
 
 	codeCommentSeverityCritical = "critical"
 	codeCommentSeverityHigh     = "high"
@@ -56,8 +58,10 @@ var validCodeCommentCategories = map[string]struct{}{
 	codeCommentCategoryData:            {},
 	codeCommentCategoryControlFlow:     {},
 	codeCommentCategoryErrorHandling:   {},
-	codeCommentCategoryDeadCode:        {},
-	codeCommentCategoryTestability:     {},
+	codeCommentCategoryDeadCode:         {},
+	codeCommentCategoryTestability:      {},
+	codeCommentCategoryCrossDuplication: {},
+	codeCommentCategoryCrossFile:        {},
 }
 
 var validCodeCommentSeverities = map[string]struct{}{
@@ -139,6 +143,51 @@ func ParseComments(args map[string]any) ([]model.LlmComment, string) {
 		}
 		if path, ok := args["path"].(string); ok {
 			cm.Path = path
+		}
+		if path, ok := obj["path"].(string); ok && path != "" {
+			cm.Path = path
+		}
+		if v, ok := obj["start_line"].(float64); ok {
+			cm.StartLine = int(v)
+		}
+		if v, ok := obj["end_line"].(float64); ok {
+			cm.EndLine = int(v)
+		}
+		if planID, ok := obj["plan_id"].(string); ok {
+			cm.PlanID = planID
+		}
+		if smell, ok := obj["smell_type"].(string); ok {
+			cm.SmellType = smell
+		}
+		if kind, ok := obj["refactor_kind"].(string); ok {
+			cm.RefactorKind = kind
+		}
+		if sym, ok := obj["proposed_symbol"].(string); ok {
+			cm.ProposedSymbol = sym
+		}
+		if rel, ok := obj["related_locations"].([]any); ok {
+			for _, rawLoc := range rel {
+				locObj, ok := rawLoc.(map[string]any)
+				if !ok {
+					continue
+				}
+				loc := model.RelatedLocation{}
+				if p, ok := locObj["path"].(string); ok {
+					loc.Path = p
+				}
+				if v, ok := locObj["start_line"].(float64); ok {
+					loc.StartLine = int(v)
+				}
+				if v, ok := locObj["end_line"].(float64); ok {
+					loc.EndLine = int(v)
+				}
+				if n, ok := locObj["note"].(string); ok {
+					loc.Note = n
+				}
+				if loc.Path != "" {
+					cm.RelatedLocations = append(cm.RelatedLocations, loc)
+				}
+			}
 		}
 
 		if cm.Path == "" || cm.Content == "" {
