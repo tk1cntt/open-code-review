@@ -19,6 +19,17 @@ import (
 	"github.com/google/uuid"
 )
 
+// RoundCheckpointInfo is emitted after each successful main-loop round
+// (LLM OK + tools executed + messages extended). Callers persist this for
+// mid-file resume.
+type RoundCheckpointInfo struct {
+	FilePath string
+	Messages []llm.Message
+	// Round is the absolute completed successful tool rounds (1-based),
+	// including any CompletedRounds carried in from a prior resume.
+	Round int
+}
+
 // Deps bundles all per-call dependencies the Runner needs. Both
 // internal/agent (diff review) and internal/scan (full-file scan) build a
 // Deps from their own state and hand it to NewRunner.
@@ -36,6 +47,12 @@ type Deps struct {
 	// in scan mode — scan adapters return a synthetic Diff whose
 	// NewFileContent is the whole file and Diff is empty).
 	DiffLookup func(path string) *model.Diff
+	// CheckpointHook is called after each successful main-loop round with
+	// the extended message transcript. Nil disables mid-file checkpointing.
+	CheckpointHook func(info RoundCheckpointInfo)
+	// CompletedRounds is the number of successful tool rounds already done
+	// (from a prior checkpoint). Remaining budget = MaxToolRequestTimes - CompletedRounds.
+	CompletedRounds int
 }
 
 // Runner is a per-session (across files) executor of the LLM tool-use
@@ -172,10 +189,24 @@ const (
 // MainLoopStop return classifies a non-completed, non-error stop at its trigger
 // point so the caller never has to infer the cause from text or context state.
 func (r *Runner) RunPerFile(ctx context.Context, messages []llm.Message, newPath string) (bool, MainLoopStop, error) {
-	toolReqCount := r.deps.Template.MaxToolRequestTimes
+	maxRounds := r.deps.Template.MaxToolRequestTimes
+	if maxRounds <= 0 {
+		maxRounds = 10
+	}
+	completedRounds := r.deps.CompletedRounds
+	if completedRounds < 0 {
+		completedRounds = 0
+	}
+	toolReqCount := maxRounds - completedRounds
+	if toolReqCount < 1 {
+		// Always allow at least one more attempt when resuming a saturated file.
+		toolReqCount = 1
+	}
 	const maxConsecutiveEmptyRounds = 3
 	consecutiveEmptyRounds := 0
 	sessionID := uuid.NewString()
+	// absoluteRound tracks successful tool rounds across resume boundaries.
+	absoluteRound := completedRounds
 
 	// Async compression is owned by this conversation alone; the deferred
 	// cancel aborts any job still in flight when the conversation ends.
@@ -199,6 +230,11 @@ func (r *Runner) RunPerFile(ctx context.Context, messages []llm.Message, newPath
 		rec := fs.AppendTaskRecord(session.MainTask, append([]llm.Message(nil), messages...))
 		startTime := time.Now()
 
+		estTokens := CountMessagesTokens(messages)
+		remainingRounds := toolReqCount + 1
+		fmt.Fprintf(stdout.Writer(), "[ocr]   >> LLM round %d/%d (%d msgs, ~%d tokens)...",
+			absoluteRound+1, absoluteRound+remainingRounds, len(messages), estTokens)
+
 		_, llmSpan := telemetry.StartLLMSpan(ctx, r.deps.Model)
 		resp, err := r.deps.LLMClient.CompletionsWithCtx(ctx, llm.ChatRequest{
 			Model:     r.deps.Model,
@@ -213,6 +249,7 @@ func (r *Runner) RunPerFile(ctx context.Context, messages []llm.Message, newPath
 			telemetry.RecordLLMResult(llmSpan, duration, 0, err)
 			llmSpan.End()
 			telemetry.RecordLLMRequest(ctx, r.deps.Model, duration, 0, "error")
+			fmt.Fprintf(stdout.Writer(), " FAILED (%.1fs)\n", duration.Seconds())
 			return false, StopNone, fmt.Errorf("LLM completion error: %w", err)
 		}
 		rec.SetResponse(resp, duration)
@@ -227,6 +264,7 @@ func (r *Runner) RunPerFile(ctx context.Context, messages []llm.Message, newPath
 		telemetry.RecordLLMResult(llmSpan, duration, totalTokens, nil)
 		llmSpan.End()
 		telemetry.RecordLLMRequest(ctx, r.deps.Model, duration, totalTokens, "ok")
+		fmt.Fprintf(stdout.Writer(), " done (%.1fs, %d tokens)\n", duration.Seconds(), totalTokens)
 
 		content := resp.Content()
 		calls := resp.ToolCalls()
@@ -292,12 +330,43 @@ func (r *Runner) RunPerFile(ctx context.Context, messages []llm.Message, newPath
 			stop = StopCompression
 			break
 		}
+
+		// Successful round: await async comments then flush a conversation checkpoint.
+		if r.deps.CommentWorkerPool != nil {
+			r.deps.CommentWorkerPool.AwaitKey(newPath)
+		}
+		absoluteRound++
+		if r.deps.CheckpointHook != nil {
+			// Snapshot messages so the hook cannot mutate the live transcript.
+			msgCopy := make([]llm.Message, len(messages))
+			copy(msgCopy, messages)
+			r.deps.CheckpointHook(RoundCheckpointInfo{
+				FilePath: newPath,
+				Messages: msgCopy,
+				Round:    absoluteRound,
+			})
+		}
 	}
 
 	if stop == StopMaxRounds {
 		fmt.Fprintf(stdout.Writer(), "[ocr] Max tool requests reached for %s.\n", newPath)
 	}
 	return false, stop, nil
+}
+
+// SetCheckpointHook updates the checkpoint callback (safe for sequential use
+// across files when the runner is shared).
+func (r *Runner) SetCheckpointHook(hook func(info RoundCheckpointInfo)) {
+	r.deps.CheckpointHook = hook
+}
+
+// SetCompletedRounds sets how many successful rounds were already done
+// (from a mid-file checkpoint) before this RunPerFile call.
+func (r *Runner) SetCompletedRounds(n int) {
+	if n < 0 {
+		n = 0
+	}
+	r.deps.CompletedRounds = n
 }
 
 // executeToolCall dispatches a single tool call from the LLM response and
