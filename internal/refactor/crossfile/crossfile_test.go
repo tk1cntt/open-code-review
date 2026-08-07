@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/alibaba/open-code-review/internal/model"
 )
 
 func TestParseMode(t *testing.T) {
@@ -129,6 +131,61 @@ func TestParseSmellAndPlan(t *testing.T) {
 	}
 }
 
+func TestParseSmellReports_EmptyAndProse(t *testing.T) {
+	// Empty / no-op cases.
+	for _, raw := range []string{"", "[]", "null", "```json\n[]\n```"} {
+		smells, err := ParseSmellReports(raw)
+		if err != nil || len(smells) != 0 {
+			t.Fatalf("empty %q: smells=%v err=%v", raw, smells, err)
+		}
+	}
+
+	// Prose-wrapped JSON still parses.
+	prose := "Here are the smells I found:\n[{\"smell_type\":\"DUPLICATED_FLOW\",\"affected_files\":[\"a.go\"],\"evidence\":[{\"path\":\"a.go\",\"start_line\":1,\"end_line\":2}],\"message\":\"dup\"}]\nThanks."
+	smells, err := ParseSmellReports(prose)
+	if err != nil || len(smells) != 1 {
+		t.Fatalf("prose wrap: %v %v", err, smells)
+	}
+
+	// Non-empty garbage must error, not silently succeed.
+	if _, err := ParseSmellReports("I looked carefully but found nothing structured."); err == nil {
+		t.Fatal("expected error for non-JSON prose")
+	}
+}
+
+func TestParseRefactorPlans_EmptyAndProse(t *testing.T) {
+	for _, raw := range []string{"", "[]", "{}", "null"} {
+		plans, err := ParseRefactorPlans(raw)
+		if err != nil || len(plans) != 0 {
+			t.Fatalf("empty %q: plans=%v err=%v", raw, plans, err)
+		}
+	}
+
+	prose := "Plan below:\n{\"plan_id\":\"p9\",\"summary\":\"extract helper\",\"steps\":[{\"order\":1,\"action\":\"create_file\",\"path\":\"h.go\"}]}\n"
+	plans, err := ParseRefactorPlans(prose)
+	if err != nil || len(plans) != 1 || plans[0].PlanID != "p9" {
+		t.Fatalf("prose wrap: %v %+v", err, plans)
+	}
+
+	if _, err := ParseRefactorPlans("no json here at all"); err == nil {
+		t.Fatal("expected error for non-JSON prose")
+	}
+}
+
+func TestExtractJSON_StringAware(t *testing.T) {
+	// Braces inside strings must not end the object early.
+	raw := `note: {"msg":"use {curly} braces","n":1} trailing`
+	got := extractJSON(raw)
+	want := `{"msg":"use {curly} braces","n":1}`
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	// Mismatched outer pair should not be treated as clean JSON.
+	if extractJSON(`{not closed`) != "" {
+		t.Fatal("unbalanced should return empty")
+	}
+}
+
 func TestRenderClusterPrompt(t *testing.T) {
 	files := []FileInput{
 		{Path: "a.go", Content: "package a\nfunc A(){}\n"},
@@ -194,5 +251,132 @@ func TestCrossFileRulesEmbeddedPathConvention(t *testing.T) {
 	const want = "refactoring/cross_file/common.md"
 	if want == "" {
 		t.Fatal("empty")
+	}
+}
+
+func TestApplyComments_BasicLineReplacement(t *testing.T) {
+	dir := t.TempDir()
+	src := "package main\n\nvar message = \"hello\"\n\nfunc main() {\n\tprintln(message)\n}\n"
+	p := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	comments := []model.LlmComment{{
+		Path:           "main.go",
+		StartLine:      3,
+		EndLine:        3,
+		SuggestionCode: "var message = \"hello, world\"",
+	}}
+	res := ApplyComments(dir, comments, false)
+	if !res.Verify.OK || len(res.Written) != 1 {
+		t.Fatalf("expected 1 written, verify ok; got written=%v verify=%v msgs=%v", res.Written, res.Verify.OK, res.Messages)
+	}
+	data, _ := os.ReadFile(p)
+	if !strings.Contains(string(data), "hello, world") {
+		t.Fatalf("file not modified: %s", string(data))
+	}
+}
+
+func TestApplyComments_RollbackOnInvalidGo(t *testing.T) {
+	dir := t.TempDir()
+	src := "package main\n\nfunc main() {\n\tx := 1\n}\n"
+	p := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	comments := []model.LlmComment{{
+		Path:           "main.go",
+		StartLine:      3,
+		EndLine:        3,
+		SuggestionCode: "func main( {", // syntax error
+	}}
+	res := ApplyComments(dir, comments, false)
+	if res.Verify.OK {
+		t.Fatal("expected verify failure for invalid Go")
+	}
+	if !res.RolledBack {
+		t.Fatal("expected rollback")
+	}
+	data, _ := os.ReadFile(p)
+	if !strings.Contains(string(data), "x := 1") {
+		t.Fatalf("rollback failed, file is: %s", string(data))
+	}
+}
+
+func TestApplyComments_SkipsEmptySuggestion(t *testing.T) {
+	dir := t.TempDir()
+	comments := []model.LlmComment{
+		{Path: "main.go", StartLine: 1, EndLine: 1, SuggestionCode: ""},
+		{Path: "", StartLine: 1, EndLine: 1, SuggestionCode: "x"},
+		{Path: "main.go", StartLine: 0, EndLine: 0, SuggestionCode: "x"},
+	}
+	res := ApplyComments(dir, comments, false)
+	if len(res.Skipped) != 3 || len(res.Written) != 0 {
+		t.Fatalf("expected all skipped: written=%v skipped=%v", res.Written, res.Skipped)
+	}
+}
+
+func TestApplyComments_MultipleFiles(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.go"), []byte("package main\nfunc a() { return }\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "b.go"), []byte("package main\nfunc b() { return }\n"), 0o644)
+
+	comments := []model.LlmComment{
+		{Path: "a.go", StartLine: 2, EndLine: 2, SuggestionCode: "func a() int { return 1 }"},
+		{Path: "b.go", StartLine: 2, EndLine: 2, SuggestionCode: "func b() int { return 2 }"},
+	}
+	res := ApplyComments(dir, comments, false)
+	if !res.Verify.OK || len(res.Written) != 2 {
+		t.Fatalf("expected 2 written; written=%v ok=%v msgs=%v", res.Written, res.Verify.OK, res.Messages)
+	}
+}
+
+func TestApplyComments_OverlappingRanges(t *testing.T) {
+	dir := t.TempDir()
+	src := "package main\n\nvar x int\nvar y int\nvar z int\n"
+	p := filepath.Join(dir, "main.go")
+	os.WriteFile(p, []byte(src), 0o644)
+
+	// Two comments with overlapping line ranges on the same file.
+	comments := []model.LlmComment{
+		{Path: "main.go", StartLine: 3, EndLine: 4, SuggestionCode: "var a int"},
+		{Path: "main.go", StartLine: 4, EndLine: 5, SuggestionCode: "var b int"},
+	}
+	res := ApplyComments(dir, comments, false)
+	if len(res.Written) != 0 {
+		t.Fatal("expected overlapping range comments to be skipped")
+	}
+	found := false
+	for _, s := range res.Skipped {
+		if strings.Contains(s, "overlapping") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected overlapping skip message in: %v", res.Skipped)
+	}
+}
+
+func TestApplyComments_EndLineNormalized(t *testing.T) {
+	dir := t.TempDir()
+	src := "package main\n\nvar a = 1\nvar b = 2\nvar c = 3\n"
+	p := filepath.Join(dir, "main.go")
+	os.WriteFile(p, []byte(src), 0o644)
+
+	comments := []model.LlmComment{
+		{Path: "main.go", StartLine: 3, EndLine: 0, SuggestionCode: "var a = 10"},
+	}
+	res := ApplyComments(dir, comments, false)
+	if !res.Verify.OK || len(res.Written) != 1 {
+		t.Fatalf("expected 1 written, verify ok; got written=%v ok=%v msgs=%v", res.Written, res.Verify.OK, res.Messages)
+	}
+	data, _ := os.ReadFile(p)
+	if strings.Count(string(data), "var a") != 1 {
+		t.Fatalf("expected exactly 1 'var a' (no duplication); got: %s", string(data))
+	}
+	if !strings.Contains(string(data), "var b = 2") {
+		t.Fatal("expected var b to be preserved")
 	}
 }

@@ -24,46 +24,138 @@ func StripMarkdownFences(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// ParseSmellReports accepts a JSON array or {"smells":[...]}.
+// ParseSmellReports accepts a JSON array, {"smells":[...]}, or prose containing
+// a JSON array/object. Empty output ("", "[]", "null") is treated as no smells.
+// Non-empty responses that contain no parseable JSON return an error so callers
+// do not silently drop LLM output.
 func ParseSmellReports(raw string) ([]SmellReport, error) {
 	raw = StripMarkdownFences(raw)
-	if raw == "" {
-		return nil, fmt.Errorf("empty smell report")
+	if raw == "" || raw == "null" || raw == "[]" {
+		return nil, nil
+	}
+	jsonStr := extractJSON(raw)
+	if jsonStr == "" {
+		return nil, fmt.Errorf("parse smell reports: no JSON found in LLM response")
+	}
+	if jsonStr == "[]" || jsonStr == "null" {
+		return nil, nil
 	}
 	var arr []SmellReport
-	if err := json.Unmarshal([]byte(raw), &arr); err == nil {
+	if err := json.Unmarshal([]byte(jsonStr), &arr); err == nil {
 		return arr, nil
 	}
 	var wrap struct {
 		Smells []SmellReport `json:"smells"`
 	}
-	if err := json.Unmarshal([]byte(raw), &wrap); err != nil {
+	if err := json.Unmarshal([]byte(jsonStr), &wrap); err != nil {
 		return nil, fmt.Errorf("parse smell reports: %w", err)
 	}
 	return wrap.Smells, nil
 }
 
-// ParseRefactorPlans accepts a single plan, array, or {"plans":[...]}.
+// ParseRefactorPlans accepts a single plan, array, {"plans":[...]}, or prose
+// containing JSON. Empty/null output is treated as no plans. Non-empty responses
+// without parseable JSON return an error.
 func ParseRefactorPlans(raw string) ([]RefactorPlan, error) {
 	raw = StripMarkdownFences(raw)
-	if raw == "" {
-		return nil, fmt.Errorf("empty refactor plan")
+	if raw == "" || raw == "null" || raw == "[]" || raw == "{}" {
+		return nil, nil
+	}
+	jsonStr := extractJSON(raw)
+	if jsonStr == "" {
+		return nil, fmt.Errorf("parse refactor plans: no JSON found in LLM response")
+	}
+	if jsonStr == "[]" || jsonStr == "{}" || jsonStr == "null" {
+		return nil, nil
 	}
 	var one RefactorPlan
-	if err := json.Unmarshal([]byte(raw), &one); err == nil && (one.PlanID != "" || one.Summary != "" || len(one.Steps) > 0) {
+	if err := json.Unmarshal([]byte(jsonStr), &one); err == nil && (one.PlanID != "" || one.Summary != "" || len(one.Steps) > 0) {
 		return []RefactorPlan{one}, nil
 	}
 	var arr []RefactorPlan
-	if err := json.Unmarshal([]byte(raw), &arr); err == nil {
+	if err := json.Unmarshal([]byte(jsonStr), &arr); err == nil {
 		return arr, nil
 	}
 	var wrap struct {
 		Plans []RefactorPlan `json:"plans"`
 	}
-	if err := json.Unmarshal([]byte(raw), &wrap); err != nil {
+	if err := json.Unmarshal([]byte(jsonStr), &wrap); err != nil {
 		return nil, fmt.Errorf("parse refactor plans: %w", err)
 	}
 	return wrap.Plans, nil
+}
+
+// extractJSON finds the first JSON array or object in a text blob that may be
+// surrounded by prose (LLM introduction, closing remarks, etc.). Returns ""
+// if no JSON candidate is found. Bracket matching ignores braces inside strings
+// and requires matching pair types.
+func extractJSON(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	// Clean JSON: matching outer brackets.
+	if (s[0] == '[' && s[len(s)-1] == ']') || (s[0] == '{' && s[len(s)-1] == '}') {
+		return s
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] != '[' && s[i] != '{' {
+			continue
+		}
+		if end := matchBalancedJSON(s, i); end >= i {
+			return s[i : end+1]
+		}
+	}
+	return ""
+}
+
+// matchBalancedJSON returns the index of the closing bracket that balances the
+// opener at start, or -1 if unmatched. Tracks a stack of openers and skips
+// content inside JSON strings (including escaped quotes).
+func matchBalancedJSON(s string, start int) int {
+	stack := make([]byte, 0, 8)
+	inString := false
+	escape := false
+	for j := start; j < len(s); j++ {
+		c := s[j]
+		if inString {
+			if escape {
+				escape = false
+				continue
+			}
+			if c == '\\' {
+				escape = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '[', '{':
+			stack = append(stack, c)
+		case ']', '}':
+			if len(stack) == 0 {
+				return -1
+			}
+			top := stack[len(stack)-1]
+			wantOpen := byte('[')
+			if c == '}' {
+				wantOpen = '{'
+			}
+			if top != wantOpen {
+				return -1
+			}
+			stack = stack[:len(stack)-1]
+			if len(stack) == 0 {
+				return j
+			}
+		}
+	}
+	return -1
 }
 
 // SmellsToComments converts detector output into multi-anchor comments.
