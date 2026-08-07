@@ -80,7 +80,7 @@ var refactorCmd = &cobra.Command{
 		if err := validateRefactorOptions(&refactorOpts); err != nil {
 			return err
 		}
-		return executeRefactor(refactorOpts)
+		return executeRefactor(cmd.Context(), refactorOpts)
 	},
 }
 
@@ -88,7 +88,7 @@ func init() {
 	registerRefactorFlags(refactorCmd, &refactorOpts)
 }
 
-func executeRefactor(opts refactorOptions) error {
+func executeRefactor(ctx context.Context, opts refactorOptions) error {
 
 	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, "", opts.maxTools, opts.maxGitProcs, false)
 	if err != nil {
@@ -211,7 +211,7 @@ func executeRefactor(opts refactorOptions) error {
 	q := newQuietHandle(opts.outputFormat, opts.audience)
 	defer q.Restore()
 
-	ctx, span := telemetry.StartSpan(telemetry.ContextWithTraceParentFromEnv(context.Background()), "refactor.run")
+	ctx, span := telemetry.StartSpan(telemetry.ContextWithTraceParentFromEnv(ctx), "refactor.run")
 	defer span.End()
 	var traceID string
 	if telemetry.IsEnabled() {

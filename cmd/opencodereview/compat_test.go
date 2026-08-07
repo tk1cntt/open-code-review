@@ -3,7 +3,11 @@
 
 package main
 
-import "github.com/spf13/cobra"
+import (
+	"context"
+
+	"github.com/spf13/cobra"
+)
 
 // parseReviewFlags provides test compatibility: parses args through a fresh
 // cobra command instance and returns the resulting reviewOptions.
@@ -30,7 +34,7 @@ func runReview(args []string) error {
 	if err != nil {
 		return err
 	}
-	return executeReview(opts)
+	return executeReview(context.Background(), opts)
 }
 
 // parseScanFlags provides test compatibility: parses args through a fresh

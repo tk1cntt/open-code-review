@@ -80,7 +80,7 @@ var scanCmd = &cobra.Command{
 		if err := validateScanOptions(&scanOpts); err != nil {
 			return err
 		}
-		return executeScan(scanOpts)
+		return executeScan(cmd.Context(), scanOpts)
 	},
 }
 
@@ -182,7 +182,7 @@ func loadScanResumeState(repoDir string, opts scanOptions) (*session.ResumeState
 	return state, nil
 }
 
-func executeScan(opts scanOptions) error {
+func executeScan(ctx context.Context, opts scanOptions) error {
 	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, "", opts.maxTools, opts.maxGitProcs, false)
 	if err != nil {
 		return err
@@ -317,7 +317,7 @@ func executeScan(opts scanOptions) error {
 	q := newQuietHandle(opts.outputFormat, opts.audience)
 	defer q.Restore()
 
-	ctx, span := telemetry.StartSpan(telemetry.ContextWithTraceParentFromEnv(context.Background()), "scan.run")
+	ctx, span := telemetry.StartSpan(telemetry.ContextWithTraceParentFromEnv(ctx), "scan.run")
 	defer span.End()
 	var traceID string
 	if telemetry.IsEnabled() {

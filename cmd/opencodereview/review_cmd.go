@@ -101,7 +101,7 @@ var reviewCmd = &cobra.Command{
 		if err := validateReviewOptions(&reviewOpts); err != nil {
 			return err
 		}
-		return executeReview(reviewOpts)
+		return executeReview(cmd.Context(), reviewOpts)
 	},
 }
 
@@ -109,7 +109,7 @@ func init() {
 	registerReviewFlags(reviewCmd, &reviewOpts)
 }
 
-func executeReview(opts reviewOptions) error {
+func executeReview(ctx context.Context, opts reviewOptions) error {
 	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, opts.rulesDir, opts.maxTools, opts.maxGitProcs, true)
 	if err != nil {
 		return err
@@ -174,7 +174,7 @@ func executeReview(opts reviewOptions) error {
 	}
 	tools := buildToolRegistry(rt.Collector, fileReader)
 
-	mcpClients := initMCPClients(context.Background(), rt.AppCfg, tools, cc.RepoDir, Version)
+	mcpClients := initMCPClients(ctx, rt.AppCfg, tools, cc.RepoDir, Version)
 	defer func() {
 		for _, mc := range mcpClients {
 			if err := mc.Close(); err != nil {
@@ -270,7 +270,7 @@ func executeReview(opts reviewOptions) error {
 	q := newQuietHandle(opts.outputFormat, opts.audience)
 	defer q.Restore()
 
-	ctx, span := telemetry.StartSpan(telemetry.ContextWithTraceParentFromEnv(context.Background()), "review.run")
+	ctx, span := telemetry.StartSpan(telemetry.ContextWithTraceParentFromEnv(ctx), "review.run")
 	defer span.End()
 	telemetry.SetAttr(span, "review.repo", cc.RepoDir)
 	telemetry.SetAttr(span, "review.from", opts.from)
