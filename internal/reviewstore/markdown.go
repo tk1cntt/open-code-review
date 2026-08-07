@@ -226,12 +226,39 @@ func groupBySeverity(comments []model.LlmComment) map[string][]model.LlmComment 
 	m := make(map[string][]model.LlmComment)
 	for _, c := range comments {
 		sev := strings.ToLower(c.Severity)
-		if sev == "" {
-			sev = "low"
-		}
+		sev = normalizeSeverityForReport(sev)
 		m[sev] = append(m[sev], c)
 	}
 	return m
+}
+
+// normalizeSeverityForReport maps both review severities (critical/high/medium/low)
+// and refactoring severities (blocker/critical/major/minor/info) into the 4-bucket
+// schema used by markdown reports and summary tables.
+//
+//	blocker → critical          (must fix immediately)
+//	critical → critical
+//	high → high
+//	major → medium              (clear maintainability impact)
+//	medium → medium
+//	minor/info → low            (nice-to-have, optional)
+func normalizeSeverityForReport(s string) string {
+	switch s {
+	case "blocker":
+		return "critical"
+	case "critical":
+		return "critical"
+	case "high":
+		return "high"
+	case "major":
+		return "medium"
+	case "medium":
+		return "medium"
+	case "minor", "info":
+		return "low"
+	default:
+		return "low"
+	}
 }
 
 func groupByFile(comments []model.LlmComment) map[string][]model.LlmComment {
