@@ -614,3 +614,11 @@ func buildToolRegistry(collector *tool.CommentCollector, fr *tool.FileReader) *t
 	reg.Register(&tool.CodeCommentProvider{Collector: collector})
 	return reg
 }
+
+func buildToolRegistryWithEditors(collector *tool.CommentCollector, fr *tool.FileReader, repoDir string) *tool.Registry {
+	reg := buildToolRegistry(collector, fr)
+	reg.Register(tool.NewFileEdit(repoDir))
+	reg.Register(tool.NewFileWrite(repoDir))
+	reg.Register(tool.NewShellRun(repoDir))
+	return reg
+}
