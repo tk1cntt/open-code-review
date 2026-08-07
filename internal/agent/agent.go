@@ -1499,7 +1499,7 @@ func (a *Agent) executeApplyPhase(ctx context.Context, d model.Diff, newPath str
 	applyToolDefs := a.args.ApplyToolDefs
 	if len(applyToolDefs) == 0 {
 		// Fallback: filter main tool defs to only apply-relevant tools.
-		applyToolDefs = filterApplyTools(a.args.MainToolDefs)
+		applyToolDefs = FilterApplyTools(a.args.MainToolDefs)
 	}
 	if len(applyToolDefs) == 0 {
 		fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: no apply tools configured, skipping\n")
@@ -1562,9 +1562,9 @@ func (a *Agent) executeApplyPhase(ctx context.Context, d model.Diff, newPath str
 	fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: %d fix(es) applied to %s\n", len(actionable), newPath)
 }
 
-// filterApplyTools returns tool definitions for the apply phase:
+// FilterApplyTools returns tool definitions for the apply phase:
 // file_read, file_edit, file_write, shell_run, task_done.
-func filterApplyTools(mainToolDefs []llm.ToolDef) []llm.ToolDef {
+func FilterApplyTools(mainToolDefs []llm.ToolDef) []llm.ToolDef {
 	applyNames := map[string]bool{
 		"file_read":  true,
 		"file_edit":  true,

@@ -22,6 +22,9 @@ var (
 	FileFind     = Tool{name: "file_find"}
 	FileReadDiff = Tool{name: "file_read_diff"}
 	CodeSearch   = Tool{name: "code_search"}
+	FileEdit     = Tool{name: "file_edit"}
+	FileWrite    = Tool{name: "file_write"}
+	ShellRun     = Tool{name: "shell_run"}
 )
 
 func OfName(name string) Tool {
@@ -34,7 +37,7 @@ func OfName(name string) Tool {
 }
 
 func allTools() []Tool {
-	return []Tool{Unknown, TaskDone, CodeComment, FileRead, FileFind, FileReadDiff, CodeSearch}
+	return []Tool{Unknown, TaskDone, CodeComment, FileRead, FileFind, FileReadDiff, CodeSearch, FileEdit, FileWrite, ShellRun}
 }
 
 // IsReserved reports whether name matches any built-in tool name (including Unknown).

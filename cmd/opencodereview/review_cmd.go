@@ -56,6 +56,7 @@ type reviewOptions struct {
 	resultTargetBranch  string
 	apply               bool
 	applyRunTests       bool
+	applyAgentic        bool
 }
 
 var reviewOpts reviewOptions
@@ -172,7 +173,12 @@ func executeReview(ctx context.Context, opts reviewOptions) error {
 		Ref:     ref,
 		Runner:  cc.GitRunner,
 	}
-	tools := buildToolRegistry(rt.Collector, fileReader)
+	var tools *tool.Registry
+	if opts.applyAgentic {
+		tools = buildToolRegistryWithEditors(rt.Collector, fileReader, cc.RepoDir)
+	} else {
+		tools = buildToolRegistry(rt.Collector, fileReader)
+	}
 
 	mcpClients := initMCPClients(ctx, rt.AppCfg, tools, cc.RepoDir, Version)
 	defer func() {
@@ -186,6 +192,12 @@ func executeReview(ctx context.Context, opts reviewOptions) error {
 	mcpToolDefs := mcp.CollectToolDefs(mcpClients, tools)
 	rt.PlanToolDefs = append(rt.PlanToolDefs, mcpToolDefs...)
 	rt.MainToolDefs = append(rt.MainToolDefs, mcpToolDefs...)
+
+	// Build apply-specific tool definitions for the agentic apply phase.
+	var applyToolDefs []llm.ToolDef
+	if opts.applyAgentic {
+		applyToolDefs = agent.FilterApplyTools(rt.MainToolDefs)
+	}
 
 	var perFileWriter *reviewstore.PerFileWriter
 
@@ -213,8 +225,10 @@ func executeReview(ctx context.Context, opts reviewOptions) error {
 		GitRunner:             cc.GitRunner,
 		Resume:                resumeState,
 		ResumeMode:            opts.resumeMode,
-		MaxTokensBudget:       int64(opts.maxTokensBudget),
-		OnFileDone: func(filePath string, comments []model.LlmComment) {
+			MaxTokensBudget:       int64(opts.maxTokensBudget),
+			ApplyAgentic:          opts.applyAgentic,
+			ApplyToolDefs:         applyToolDefs,
+			OnFileDone: func(filePath string, comments []model.LlmComment) {
 			if perFileWriter != nil {
 				if err := perFileWriter.WriteFile(filePath, comments); err != nil {
 					fmt.Fprintf(os.Stderr, "[ocr] warning: per-file save failed for %s: %v\n", filePath, err)
@@ -222,7 +236,7 @@ func executeReview(ctx context.Context, opts reviewOptions) error {
 			}
 		},
 		OnFileSuccess: func(filePath string, comments []model.LlmComment) {
-			if !opts.apply {
+			if !opts.apply || opts.applyAgentic {
 				return
 			}
 			resolved := diff.ResolveLineNumbers(comments, ag.Diffs())

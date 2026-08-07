@@ -37,6 +37,7 @@ type refactorOptions struct {
 	crossFile      string // off | hints
 	apply          bool
 	applyRunTests  bool
+	applyAgentic   bool
 }
 
 var refactorOpts refactorOptions

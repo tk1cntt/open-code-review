@@ -205,5 +205,87 @@
         ]
       }
     }
+  },
+  {
+    "name": "file_edit",
+    "plan_task": false,
+    "main_task": true,
+    "definition": {
+      "name": "file_edit",
+      "description": "Edit a file by replacing a specific block of text with new content. You must provide the exact text to replace (old_str) — including indentation and line endings — copied verbatim from a file_read result. The tool locates old_str via exact substring match and replaces it with new_str.\n\n**Important rules:**\n- old_str must match EXACTLY once in the file. Include enough surrounding context lines to make the match unambiguous.\n- Use file_read FIRST to see the current file content before crafting old_str.\n- new_str is the replacement text. Can be empty to delete the matching block.\n- After editing, use shell_run to verify the change compiles/tests pass.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "description": "The relative path of the file to edit."
+          },
+          "old_str": {
+            "type": "string",
+            "description": "The exact text to find and replace. Must match exactly once in the file. Copy-paste from file_read output."
+          },
+          "new_str": {
+            "type": "string",
+            "description": "The replacement text. Can be empty to delete the matching block."
+          }
+        },
+        "required": [
+          "file_path",
+          "old_str",
+          "new_str"
+        ]
+      }
+    }
+  },
+  {
+    "name": "file_write",
+    "plan_task": false,
+    "main_task": true,
+    "definition": {
+      "name": "file_write",
+      "description": "Write (create or overwrite) a file with the given content. Use this to create new files or completely rewrite small files.\n\n**Important rules:**\n- This overwrites the ENTIRE file. For partial edits, use file_edit instead.\n- Ensure the content is complete and syntactically correct.\n- After writing, use shell_run to verify the file compiles/tests pass.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "description": "The relative path of the file to write."
+          },
+          "content": {
+            "type": "string",
+            "description": "The complete file content to write."
+          }
+        },
+        "required": [
+          "file_path",
+          "content"
+        ]
+      }
+    }
+  },
+  {
+    "name": "shell_run",
+    "plan_task": false,
+    "main_task": true,
+    "definition": {
+      "name": "shell_run",
+      "description": "Run a shell command in the repository directory to verify your changes. Use this tool to run build, lint, or test commands.\n\n**Important rules:**\n- Only safe, non-destructive commands are allowed (e.g., go build, go test, npm test, cargo check, python -m py_compile).\n- Commands that delete files, chain commands (with ;, &&, ||), use pipes, or redirect output are blocked.\n- Each command has a 30-second timeout.\n- Use this to VERIFY your changes compile and pass tests before calling task_done.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The shell command to execute. Must be a single safe command (e.g., go build ./..., go test ./..., npm test, cargo check)."
+          },
+          "timeout_sec": {
+            "type": "integer",
+            "description": "Optional timeout in seconds (1-60). Defaults to 30."
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    }
   }
 ]
