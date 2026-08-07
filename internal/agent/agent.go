@@ -127,12 +127,19 @@ type Args struct {
 
 	// Resume is an optional read-only checkpoint index from a previous review session.
 	Resume *session.ResumeState
+	// ResumeMode is session.ResumeModeContinue (default) or ResumeModeRestartFailed.
+	ResumeMode string
 
 	// OnFileDone is called when each file completes (success or failure).
 	// filePath is the new-path; comments are the collected review findings
 	// (may be nil/empty). The callback is invoked from the per-file dispatch
 	// goroutine and should be safe for concurrent use.
 	OnFileDone func(filePath string, comments []model.LlmComment)
+
+	// OnFileSuccess is called only when a file completes successfully.
+	// It does NOT fire for reused (resume replay), failed, or deleted files.
+	// The callback is invoked from the per-file dispatch goroutine.
+	OnFileSuccess func(filePath string, comments []model.LlmComment)
 
 	// MaxTokensBudget caps the aggregate token usage (input+output) across the
 	// whole run; dispatch stops once the running total + a per-file look-ahead
@@ -658,24 +665,45 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 				stop      *subtaskStop
 				lastErr   error
 			)
+			start := a.prepareFileStart(d)
 			for attempt := 0; attempt < maxRetries; attempt++ {
 				if attempt > 0 {
-					// Clear stale comments from the failed attempt before retrying
-					a.args.CommentCollector.RemoveByPath(d.NewPath)
-					backoff := time.Duration(1<<(attempt-1)) * time.Second
-					fmt.Fprintf(stdout.Writer(), "[ocr] Retry %d/%d for %s after %v\n", attempt, maxRetries-1, d.NewPath, backoff)
-					select {
-					case <-time.After(backoff):
-					case <-fileCtx.Done():
-						break
-					}
-					if fileCtx.Err() != nil {
-						lastErr = fileCtx.Err()
-						break
+					if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok && len(cp.Messages) > 0 {
+						start = session.FileStart{
+							Mode:         session.ModeContinue,
+							Messages:     cp.Messages,
+							PlanGuidance: cp.PlanGuidance,
+							SeedComments: cp.Comments,
+							Round:        cp.Round,
+							Checkpoint:   cp,
+						}
+						if llm.RetryReason(lastErr) == llm.RetryReasonRateLimit {
+							select {
+							case <-time.After(2 * time.Second):
+							case <-fileCtx.Done():
+							}
+						}
+						fmt.Fprintf(stdout.Writer(), "[ocr] Retry %d/%d for %s continuing from checkpoint (round %d)\n",
+							attempt, maxRetries-1, d.NewPath, cp.Round)
+					} else {
+						// Clear stale comments from the failed attempt before cold retry
+						a.args.CommentCollector.RemoveByPath(d.NewPath)
+						start = session.FileStart{Mode: session.ModeCold}
+						backoff := time.Duration(1<<(attempt-1)) * time.Second
+						fmt.Fprintf(stdout.Writer(), "[ocr] Retry %d/%d for %s after %v\n", attempt, maxRetries-1, d.NewPath, backoff)
+						select {
+						case <-time.After(backoff):
+						case <-fileCtx.Done():
+							break
+						}
+						if fileCtx.Err() != nil {
+							lastErr = fileCtx.Err()
+							break
+						}
 					}
 				}
 
-				completed, stop, lastErr = a.executeSubtask(fileCtx, d)
+				completed, stop, lastErr = a.executeSubtask(fileCtx, d, start)
 				if lastErr == nil {
 					break
 				}
@@ -689,6 +717,18 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 				class, reason := classifyItemError(lastErr)
 				a.markFailed(d, class, reason)
 				comments := a.args.CommentCollector.CommentsForPath(d.NewPath)
+				status := session.CheckpointFailed
+				if class == session.FailureTimeout {
+					status = session.CheckpointTimedOut
+				}
+				planGuidance := ""
+				round := 0
+				if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok {
+					planGuidance = cp.PlanGuidance
+					round = cp.Round
+					a.session.MarkCheckpointStopped(fingerprint, status, lastErr.Error())
+				}
+				a.session.RecordReviewItemPartial(d.NewPath, fingerprint, session.PhaseMain, planGuidance, lastErr.Error(), round, comments)
 				a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, lastErr.Error(), comments)
 				if a.args.OnFileDone != nil {
 					a.args.OnFileDone(d.NewPath, comments)
@@ -703,7 +743,12 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 				if stop != nil {
 					a.markFailed(d, stop.class, stop.reason)
 					if stop.checkpoint != "" {
-						a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, stop.checkpoint, nil)
+						comments := a.args.CommentCollector.CommentsForPath(d.NewPath)
+						if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok {
+							a.session.MarkCheckpointStopped(fingerprint, session.CheckpointFailed, stop.checkpoint)
+							a.session.RecordReviewItemPartial(d.NewPath, fingerprint, session.PhaseMain, cp.PlanGuidance, stop.checkpoint, cp.Round, comments)
+						}
+						a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, stop.checkpoint, comments)
 					}
 					if stop.reportAsError {
 						atomic.AddInt64(&a.subtaskFailed, 1)
@@ -725,6 +770,9 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 			a.session.RecordReviewItemDone(d.NewPath, d.OldPath, d.NewPath, fingerprint, comments)
 			if a.args.OnFileDone != nil {
 				a.args.OnFileDone(d.NewPath, comments)
+			}
+			if a.args.OnFileSuccess != nil {
+				a.args.OnFileSuccess(d.NewPath, comments)
 			}
 		}(toDispatch[i])
 	}
@@ -763,29 +811,38 @@ func (a *Agent) applyResume(diffs []model.Diff) []model.Diff {
 
 	mode := a.reviewMode()
 	toDispatch := make([]model.Diff, 0, len(diffs))
-	var reused, retried int64
+	var reused, continuing, coldRetry, newFiles int64
+	opts := session.PrepareOpts{
+		ResumeMode:   session.NormalizeResumeMode(a.args.ResumeMode),
+		CurrentModel: a.args.Model,
+		TemplateHash: a.templateHash(),
+	}
 	for _, d := range diffs {
 		if d.IsDeleted {
 			toDispatch = append(toDispatch, d)
 			continue
 		}
 		fingerprint := reviewItemFingerprint(mode, d)
-		item, ok := resume.Item(fingerprint)
-		if !ok {
-			// Log explicitly when a file was previously failed and is now retried.
-			if prevPath, wasFailed := resume.FailedFiles[fingerprint]; wasFailed {
-				fmt.Fprintf(stdout.Writer(), "[ocr] Resume retrying previously failed file: %s\n", prevPath)
-				retried++
+		start := session.PrepareFileStart(resume, fingerprint, d.NewPath, opts)
+		if start.Mode == session.ModeReuse {
+			for _, cm := range start.SeedComments {
+				a.args.CommentCollector.Add(cm)
 			}
-			toDispatch = append(toDispatch, d)
+			a.session.RecordReviewItemReused(effectivePath(d), d.OldPath, d.NewPath, fingerprint, resume.SessionID, start.SeedComments)
+			a.markReused(d)
+			reused++
 			continue
 		}
-		for _, cm := range item.Comments {
-			a.args.CommentCollector.Add(cm)
+		if start.Mode == session.ModeContinue {
+			fmt.Fprintf(stdout.Writer(), "[ocr] Resume continuing mid-file: %s (round %d)\n", d.NewPath, start.Round)
+			continuing++
+		} else if prevPath, wasFailed := resume.FailedFiles[fingerprint]; wasFailed {
+			fmt.Fprintf(stdout.Writer(), "[ocr] Resume retrying previously failed file (cold): %s\n", prevPath)
+			coldRetry++
+		} else {
+			newFiles++
 		}
-		a.session.RecordReviewItemReused(effectivePath(d), d.OldPath, d.NewPath, fingerprint, resume.SessionID, item.Comments)
-		a.markReused(d)
-		reused++
+		toDispatch = append(toDispatch, d)
 	}
 
 	rerun := countDispatchable(toDispatch)
@@ -797,9 +854,34 @@ func (a *Agent) applyResume(diffs []model.Diff) []model.Diff {
 		PreviousModel: resume.Model,
 		CurrentModel:  a.args.Model,
 	}
-	fmt.Fprintf(stdout.Writer(), "[ocr] Resume %s: reusing %d file(s), retrying %d failed file(s), reviewing %d new file(s)\n",
-		resume.SessionID, reused, retried, rerun-retried)
+	fmt.Fprintln(stdout.Writer(), session.FormatResumeSummary(resume.SessionID, reused, continuing, coldRetry, newFiles))
 	return toDispatch
+}
+
+func (a *Agent) templateHash() string {
+	return session.ComputeTemplateHashFrom(&a.args.Template)
+}
+
+func (a *Agent) prepareFileStart(d model.Diff) session.FileStart {
+	fingerprint := reviewItemFingerprint(a.reviewMode(), d)
+	if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok && len(cp.Messages) > 0 {
+		return session.FileStart{
+			Mode:         session.ModeContinue,
+			Messages:     cp.Messages,
+			PlanGuidance: cp.PlanGuidance,
+			SeedComments: cp.Comments,
+			Round:        cp.Round,
+			Checkpoint:   cp,
+		}
+	}
+	if a.args.Resume == nil {
+		return session.FileStart{Mode: session.ModeCold}
+	}
+	return session.PrepareFileStart(a.args.Resume, fingerprint, d.NewPath, session.PrepareOpts{
+		ResumeMode:   session.NormalizeResumeMode(a.args.ResumeMode),
+		CurrentModel: a.args.Model,
+		TemplateHash: a.templateHash(),
+	})
 }
 
 func countDispatchable(diffs []model.Diff) int64 {
@@ -1183,7 +1265,8 @@ func resumedFromSession(resume *session.ResumeState) string {
 // failures the caller classifies via classifyItemError, or a structured *stop
 // for a non-error early exit (token budget, main-loop stop) carrying the manifest
 // class recorded at its trigger point. A completed review returns (true, nil, nil).
-func (a *Agent) executeSubtask(ctx context.Context, d model.Diff) (bool, *subtaskStop, error) {
+// start controls mid-file continue vs cold start (plan + render).
+func (a *Agent) executeSubtask(ctx context.Context, d model.Diff, start session.FileStart) (bool, *subtaskStop, error) {
 	ctx, span := telemetry.StartSpan(ctx, "subtask.execute."+d.NewPath)
 	defer span.End()
 	telemetry.SetAttr(span, "file.path", d.NewPath)
@@ -1196,61 +1279,83 @@ func (a *Agent) executeSubtask(ctx context.Context, d model.Diff) (bool, *subtas
 	}
 
 	newPath := d.NewPath
+	fingerprint := reviewItemFingerprint(a.reviewMode(), d)
+	a.session.RecordFileStarted(newPath, fingerprint, session.PhaseMain)
+	defer llmloop.ClearCheckpointHook(a.runner)
+
+	for _, cm := range start.SeedComments {
+		a.args.CommentCollector.Add(cm)
+	}
 
 	// Build change-files list excluding current file
 	changeFilesExcludingCurrent := a.buildChangeFilesExcept(newPath)
 
 	rule := a.resolveSystemRule(strings.ToLower(newPath))
 
-	threshold := a.args.Template.PlanModeLineThreshold
-	changeLines := d.Insertions + d.Deletions
+	var (
+		messages        []llm.Message
+		planResult      string
+		completedRounds int
+	)
 
-	// Phase 1: Plan (skip when changes are below threshold)
-	var planResult string
-	if a.args.Template.PlanTask != nil && len(a.args.Template.PlanTask.Messages) > 0 && threshold > 0 && changeLines < int64(threshold) {
-		fmt.Fprintf(stdout.Writer(), "[ocr] Skipping plan phase for %s (%d lines < threshold %d)\n", newPath, changeLines, threshold)
-		telemetry.Event(ctx, "plan.skipped",
-			telemetry.AnyToAttr("file.path", newPath),
-			telemetry.AnyToAttr("lines.changed", changeLines),
-			telemetry.AnyToAttr("threshold", threshold))
-	} else if a.args.Template.PlanTask != nil && len(a.args.Template.PlanTask.Messages) > 0 {
-		var err error
-		planResult, err = a.executePlanPhase(ctx, newPath, d.Diff, changeFilesExcludingCurrent, rule)
-		if err != nil {
-			fmt.Fprintf(stdout.Writer(), "[ocr] Plan phase failed for %s: %v (continuing without plan)\n", newPath, err)
-			telemetry.Eventf(ctx, "plan.failed", err.Error(),
-				telemetry.AnyToAttr("file.path", newPath))
-			planResult = ""
+	if start.Mode == session.ModeContinue && len(start.Messages) > 0 {
+		messages = start.Messages
+		planResult = start.PlanGuidance
+		completedRounds = start.Round
+		fmt.Fprintf(stdout.Writer(), "[ocr] Mid-file continue %s from round %d (%d messages)\n",
+			newPath, completedRounds, len(messages))
+	} else {
+		threshold := a.args.Template.PlanModeLineThreshold
+		changeLines := d.Insertions + d.Deletions
+
+		// Phase 1: Plan (skip when changes are below threshold or plan guidance already present)
+		if start.PlanGuidance != "" {
+			planResult = start.PlanGuidance
+		} else if a.args.Template.PlanTask != nil && len(a.args.Template.PlanTask.Messages) > 0 && threshold > 0 && changeLines < int64(threshold) {
+			fmt.Fprintf(stdout.Writer(), "[ocr] Skipping plan phase for %s (%d lines < threshold %d)\n", newPath, changeLines, threshold)
+			telemetry.Event(ctx, "plan.skipped",
+				telemetry.AnyToAttr("file.path", newPath),
+				telemetry.AnyToAttr("lines.changed", changeLines),
+				telemetry.AnyToAttr("threshold", threshold))
+		} else if a.args.Template.PlanTask != nil && len(a.args.Template.PlanTask.Messages) > 0 {
+			var err error
+			planResult, err = a.executePlanPhase(ctx, newPath, d.Diff, changeFilesExcludingCurrent, rule)
+			if err != nil {
+				fmt.Fprintf(stdout.Writer(), "[ocr] Plan phase failed for %s: %v (continuing without plan)\n", newPath, err)
+				telemetry.Eventf(ctx, "plan.failed", err.Error(),
+					telemetry.AnyToAttr("file.path", newPath))
+				planResult = ""
+			}
 		}
-	}
 
-	// Phase 2: Main task loop
-	if len(a.args.Template.MainTask.Messages) == 0 {
-		return false, nil, errMainTaskEmpty
-	}
-
-	rawMsgs := a.args.Template.MainTask.Messages
-	messages := make([]llm.Message, 0, len(rawMsgs))
-	for _, m := range rawMsgs {
-		content := m.Content
-		content = strings.ReplaceAll(content, "{{current_system_date_time}}", a.currentDate)
-		content = strings.ReplaceAll(content, "{{current_file_path}}", newPath)
-		content = strings.ReplaceAll(content, "{{system_rule}}", rule)
-		content = strings.ReplaceAll(content, "{{change_files}}", changeFilesExcludingCurrent)
-		content = strings.ReplaceAll(content, "{{diff}}", d.Diff)
-		content = strings.ReplaceAll(content, "{{requirement_background}}", a.args.Background)
-		// Always substitute the {{plan_guidance}} token so the literal placeholder
-		// never leaks into the rendered prompt. When the plan phase produced no
-		// output, strip the surrounding "### Review Plan (Optional)\n…\n\n" wrapper
-		// (any language variant) so the LLM does not see a dangling section header.
-		// Strip MUST run before ReplaceAll: the regex requires the literal
-		// {{plan_guidance}} token to be present; if we replace first, the token
-		// is gone and the wrapper can't be matched.
-		if planResult == "" {
-			content = stripEmptyPlanBlock(content)
+		// Phase 2: Main task loop
+		if len(a.args.Template.MainTask.Messages) == 0 {
+			return false, nil, errMainTaskEmpty
 		}
-		content = strings.ReplaceAll(content, "{{plan_guidance}}", planResult)
-		messages = append(messages, llm.NewTextMessage(m.Role, content))
+
+		rawMsgs := a.args.Template.MainTask.Messages
+		messages = make([]llm.Message, 0, len(rawMsgs))
+		for _, m := range rawMsgs {
+			content := m.Content
+			content = strings.ReplaceAll(content, "{{current_system_date_time}}", a.currentDate)
+			content = strings.ReplaceAll(content, "{{current_file_path}}", newPath)
+			content = strings.ReplaceAll(content, "{{system_rule}}", rule)
+			content = strings.ReplaceAll(content, "{{change_files}}", changeFilesExcludingCurrent)
+			content = strings.ReplaceAll(content, "{{diff}}", d.Diff)
+			content = strings.ReplaceAll(content, "{{requirement_background}}", a.args.Background)
+			// Always substitute the {{plan_guidance}} token so the literal placeholder
+			// never leaks into the rendered prompt. When the plan phase produced no
+			// output, strip the surrounding "### Review Plan (Optional)\n…\n\n" wrapper
+			// (any language variant) so the LLM does not see a dangling section header.
+			// Strip MUST run before ReplaceAll: the regex requires the literal
+			// {{plan_guidance}} token to be present; if we replace first, the token
+			// is gone and the wrapper can't be matched.
+			if planResult == "" {
+				content = stripEmptyPlanBlock(content)
+			}
+			content = strings.ReplaceAll(content, "{{plan_guidance}}", planResult)
+			messages = append(messages, llm.NewTextMessage(m.Role, content))
+		}
 	}
 
 	tokenCount := llmloop.CountMessagesTokens(messages)
@@ -1273,6 +1378,9 @@ func (a *Agent) executeSubtask(ctx context.Context, d model.Diff) (bool, *subtas
 			checkpoint: msg,
 		}, nil
 	}
+
+	llmloop.BindSessionCheckpoint(a.runner, a.session, fingerprint, planResult, a.args.Model, a.templateHash())
+	a.runner.SetCompletedRounds(completedRounds)
 
 	mainCompleted, mainStop, err := func() (bool, llmloop.MainLoopStop, error) {
 		ctx, mainSpan := telemetry.StartSpan(ctx, "main.loop")

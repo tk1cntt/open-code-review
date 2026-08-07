@@ -430,7 +430,7 @@ func TestExecuteSubtask_EmptyMainTask(t *testing.T) {
 	})
 	a.currentDate = "2025-06-26 10:00"
 
-	completed, stop, err := a.executeSubtask(context.Background(), model.Diff{NewPath: "a.go", Diff: "+x", Insertions: 1})
+	completed, stop, err := a.executeSubtask(context.Background(), model.Diff{NewPath: "a.go", Diff: "+x", Insertions: 1}, session.FileStart{})
 	if err == nil {
 		t.Fatal("expected error for empty main_task messages")
 	}
@@ -466,7 +466,7 @@ func TestExecuteSubtask_TokenThresholdExceeded(t *testing.T) {
 	a.currentDate = "2025-06-26 10:00"
 	a.diffs = []model.Diff{{NewPath: "a.go", Diff: strings.Repeat("code ", 200), Insertions: 100}}
 
-	completed, stop, err := a.executeSubtask(context.Background(), a.diffs[0])
+	completed, stop, err := a.executeSubtask(context.Background(), a.diffs[0], session.FileStart{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -550,7 +550,7 @@ func TestExecuteSubtask_WithPlanPhase(t *testing.T) {
 	a.currentDate = "2025-06-26 10:00"
 	a.diffs = []model.Diff{{NewPath: "main.go", OldPath: "main.go", Diff: "+new code", Insertions: 5}}
 
-	completed, stop, err := a.executeSubtask(context.Background(), a.diffs[0])
+	completed, stop, err := a.executeSubtask(context.Background(), a.diffs[0], session.FileStart{})
 	if err != nil {
 		t.Fatalf("executeSubtask: %v", err)
 	}
@@ -580,7 +580,7 @@ func TestExecuteSubtask_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	completed, stop, err := a.executeSubtask(ctx, model.Diff{NewPath: "a.go", Diff: "+x", Insertions: 1})
+	completed, stop, err := a.executeSubtask(ctx, model.Diff{NewPath: "a.go", Diff: "+x", Insertions: 1}, session.FileStart{})
 	if err == nil {
 		t.Fatal("expected error for cancelled context")
 	}
