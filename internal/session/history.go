@@ -25,6 +25,7 @@ const (
 	MemoryCompressionTask TaskType = "memory_compression_task"
 	ReLocationTask        TaskType = "re_location_task"
 	ReviewFilterTask      TaskType = "review_filter_task"
+	ApplyTask             TaskType = "apply_task"
 )
 
 const (

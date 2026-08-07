@@ -13,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"runtime/debug"
 	"slices"
 	"sort"
@@ -151,6 +153,15 @@ type Args struct {
 	// whole run; dispatch stops once the running total + a per-file look-ahead
 	// would exceed it. 0 = unlimited. Mirrors scan.Args.MaxTokensBudget.
 	MaxTokensBudget int64
+
+	// ApplyAgentic enables the agentic apply phase after review, where the LLM
+	// uses file_edit + file_write + shell_run tools to directly fix code.
+	ApplyAgentic bool
+
+	// ApplyToolDefs holds llm.ToolDef entries for the apply phase (file_edit,
+	// file_write, shell_run, file_read, task_done). When nil or empty, the
+	// apply phase is skipped.
+	ApplyToolDefs []llm.ToolDef
 
 	// RuntimeConfig carries the non-secret, allowlisted runtime settings that
 	// identify how this run was configured, for the manifest's
@@ -1405,6 +1416,13 @@ func (a *Agent) executeSubtask(ctx context.Context, d model.Diff, start session.
 			a.args.CommentWorkerPool.AwaitKey(newPath)
 		}
 		a.executeReviewFilter(ctx, d, newPath)
+
+		// APPLY_TASK runs after the review filter when agentic apply is enabled.
+		// The LLM gets file_edit, file_write, shell_run tools and applies
+		// suggestion_code directly to source files.
+		if a.args.ApplyAgentic && a.args.Template.ApplyTask != nil && len(a.args.Template.ApplyTask.Messages) > 0 {
+			a.executeApplyPhase(ctx, d, newPath)
+		}
 	}
 	if err != nil {
 		return false, nil, err
@@ -1421,6 +1439,170 @@ func (a *Agent) executeSubtask(ctx context.Context, d model.Diff, start session.
 		}, nil
 	}
 	return true, nil, nil
+}
+
+// executeApplyPhase runs the agentic apply phase after review is done.
+// The LLM gets file_edit, file_write, shell_run tools and applies
+// suggestion_code directly to source files. Files are backed up before
+// the LLM can modify them; on failure, they are restored.
+func (a *Agent) executeApplyPhase(ctx context.Context, d model.Diff, newPath string) {
+	ctx, span := telemetry.StartSpan(ctx, "apply.execute")
+	defer span.End()
+	telemetry.SetAttr(span, "file.path", newPath)
+
+	// Collect comments with suggestion_code for this file.
+	comments := a.args.CommentCollector.CommentsForPath(newPath)
+	var actionable []model.LlmComment
+	for _, cm := range comments {
+		if cm.SuggestionCode != "" {
+			actionable = append(actionable, cm)
+		}
+	}
+	if len(actionable) == 0 {
+		fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: no actionable comments for %s, skipping\n", newPath)
+		return
+	}
+
+	// Build the apply comments JSON for the prompt.
+	commentsJSON := buildApplyCommentsJSON(actionable)
+	at := a.args.Template.ApplyTask
+
+	// Build messages from ApplyTask template.
+	messages := make([]llm.Message, 0, len(at.Messages))
+	for _, m := range at.Messages {
+		content := strings.ReplaceAll(m.Content, "{{apply_comments}}", commentsJSON)
+		messages = append(messages, llm.NewTextMessage(m.Role, content))
+	}
+
+	// Backup files before LLM can edit them.
+	backup := make(map[string][]byte)
+	defer func() {
+		// Restore backup on panic or failure.
+		for path, data := range backup {
+			_ = os.WriteFile(path, data, 0o644)
+		}
+	}()
+	for _, cm := range actionable {
+		abs := filepath.Join(a.args.RepoDir, filepath.FromSlash(cm.Path))
+		if _, exists := backup[abs]; exists {
+			continue
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: cannot backup %s: %v, skipping\n", cm.Path, err)
+			continue
+		}
+		backup[abs] = data
+	}
+
+	// Use a separate runner for the apply phase with apply tool defs.
+	applyToolDefs := a.args.ApplyToolDefs
+	if len(applyToolDefs) == 0 {
+		// Fallback: filter main tool defs to only apply-relevant tools.
+		applyToolDefs = filterApplyTools(a.args.MainToolDefs)
+	}
+	if len(applyToolDefs) == 0 {
+		fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: no apply tools configured, skipping\n")
+		return
+	}
+
+	deps := llmloop.Deps{
+		LLMClient:         a.args.LLMClient,
+		Model:             a.args.Model,
+		Template:          a.args.Template,
+		Tools:             a.args.Tools,
+		MainToolDefs:      applyToolDefs,
+		CommentCollector:  tool.NewCommentCollector(),
+		CommentWorkerPool: nil,
+		Session:           a.session,
+		DiffLookup:        a.findDiff,
+	}
+	applyRunner := llmloop.NewRunner(deps)
+
+	// Max 15 rounds for apply phase.
+	// Temporarily reduce MaxToolRequestTimes for the apply loop.
+	origMax := a.args.Template.MaxToolRequestTimes
+	a.args.Template.MaxToolRequestTimes = 15
+	defer func() { a.args.Template.MaxToolRequestTimes = origMax }()
+
+	fs := a.session.GetOrCreateFileSession(newPath)
+	rec := fs.AppendTaskRecord(session.ApplyTask, append([]llm.Message(nil), messages...))
+	startTime := time.Now()
+
+	completed, stop, err := applyRunner.RunPerFile(ctx, messages, newPath)
+	duration := time.Since(startTime)
+
+	if err != nil {
+		rec.SetError(err, duration)
+		fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: failed for %s: %v\n", newPath, err)
+		// Restore backups.
+		for abs, data := range backup {
+			_ = os.WriteFile(abs, data, 0o644)
+		}
+		return
+	}
+	if !completed {
+		rec.SetError(fmt.Errorf("apply did not complete: %v", stop), duration)
+		fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: incomplete for %s (stop=%v), rolling back\n", newPath, stop)
+		// Restore backups.
+		for abs, data := range backup {
+			_ = os.WriteFile(abs, data, 0o644)
+		}
+		return
+	}
+
+	// Apply successful: record completion without an LLM response object
+	// (the apply loop records its own tool results internally).
+	rec.Duration = duration
+
+	// Clear backups — apply was successful!
+	for abs := range backup {
+		delete(backup, abs)
+	}
+	fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: %d fix(es) applied to %s\n", len(actionable), newPath)
+}
+
+// filterApplyTools returns tool definitions for the apply phase:
+// file_read, file_edit, file_write, shell_run, task_done.
+func filterApplyTools(mainToolDefs []llm.ToolDef) []llm.ToolDef {
+	applyNames := map[string]bool{
+		"file_read":  true,
+		"file_edit":  true,
+		"file_write": true,
+		"shell_run":  true,
+		"task_done":  true,
+	}
+	var out []llm.ToolDef
+	for _, td := range mainToolDefs {
+		if applyNames[td.Function.Name] {
+			out = append(out, td)
+		}
+	}
+	return out
+}
+
+// buildApplyCommentsJSON serializes actionable comments into a JSON array
+// readable by the LLM in the apply phase.
+func buildApplyCommentsJSON(comments []model.LlmComment) string {
+	type applyComment struct {
+		Path           string `json:"path"`
+		Content        string `json:"content"`
+		StartLine      int    `json:"start_line"`
+		EndLine        int    `json:"end_line"`
+		SuggestionCode string `json:"suggestion_code"`
+	}
+	items := make([]applyComment, len(comments))
+	for i, cm := range comments {
+		items[i] = applyComment{
+			Path:           cm.Path,
+			Content:        cm.Content,
+			StartLine:      cm.StartLine,
+			EndLine:        cm.EndLine,
+			SuggestionCode: cm.SuggestionCode,
+		}
+	}
+	data, _ := json.Marshal(items)
+	return string(data)
 }
 
 // executeReviewFilter runs the REVIEW_FILTER_TASK to remove comments that are
