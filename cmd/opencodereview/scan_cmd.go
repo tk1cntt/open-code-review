@@ -31,6 +31,7 @@ type scanOptions struct {
 	audience        string
 	background      string
 	resume          string // --resume: resume from a previous scan session id
+	resumeMode      string // --resume-mode: continue | restart-failed
 	saveResult      bool   // --save-result: persist final scan result for the WebUI review viewer
 	savePerFile     bool   // --save-per-file: split output into per-file markdown files
 	resultDir       string // --result-dir: root directory for persisted scan results
@@ -169,12 +170,12 @@ func loadScanResumeState(repoDir string, opts scanOptions) (*session.ResumeState
 	if err := state.ValidateOptions(current); err != nil {
 		return nil, fmt.Errorf("%w (run 'ocr session list' to see available sessions)", err)
 	}
-	if state.CompletedCount() == 0 && state.FailedCount() == 0 {
-		fmt.Fprintf(os.Stderr, "[ocr] Resume session %q: no completed items or failed files found — scanning all files fresh\n",
+	if !state.HasSessionScope() {
+		fmt.Fprintf(os.Stderr, "[ocr] Resume session %q: no completed/failed/in-progress files found — scanning all files fresh\n",
 			opts.resume)
 	} else {
-		fmt.Fprintf(os.Stderr, "[ocr] Resume session %q: reusing %d completed file(s), retrying %d failed file(s)\n",
-			opts.resume, state.CompletedCount(), state.FailedCount())
+		fmt.Fprintf(os.Stderr, "[ocr] Resume session %q: reusing %d completed, re-running %d session file(s) (%d mid-file)\n",
+			opts.resume, state.CompletedCount(), state.FailedCount(), state.InProgressCount())
 	}
 	return state, nil
 }
@@ -268,6 +269,7 @@ func executeScan(opts scanOptions) error {
 		SkipDedup:             opts.noDedup,
 		SkipSummary:           opts.noSummary,
 		Resume:                resumeState,
+		ResumeMode:            opts.resumeMode,
 		OnFileDone: func(filePath string, comments []model.LlmComment) {
 			if perFileWriter != nil {
 				if err := perFileWriter.WriteFile(filePath, comments); err != nil {
@@ -328,11 +330,21 @@ func executeScan(opts scanOptions) error {
 
 	comments, err := ag.Run(ctx)
 	duration := time.Since(startTime)
+
+	// Persist/emit partial results even when every file fails (e.g. timeout).
+	persistScanOutputs(cc.RepoDir, opts, ag, comments, duration, reviewID, perFileWriter, &finalized)
+
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
 		if id := ag.SessionID(); id != "" {
 			fmt.Fprintf(os.Stderr, "[ocr] Session: %s (retry with: --resume %s)\n", id, id)
+		}
+		if len(comments) > 0 {
+			fmt.Fprintf(os.Stderr, "[ocr] Wrote %d partial finding(s) before failure\n", len(comments))
+		}
+		if emitErr := emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q); emitErr != nil {
+			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to emit partial scan result: %v\n", emitErr)
 		}
 		return fmt.Errorf("scan failed: %w", err)
 	}
@@ -343,17 +355,30 @@ func executeScan(opts scanOptions) error {
 		}
 	}
 
+	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q)
+}
+
+func persistScanOutputs(
+	repoDir string,
+	opts scanOptions,
+	ag *scan.Agent,
+	comments []model.LlmComment,
+	duration time.Duration,
+	reviewID string,
+	perFileWriter *reviewstore.PerFileWriter,
+	finalized *bool,
+) {
 	if opts.saveResult {
 		if opts.resultDir == "" {
 			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
 				opts.resultDir = d
 			} else {
-				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+				opts.resultDir = filepath.Join(repoDir, ".opencodereview", "reviews")
 			}
 		}
-		path, mdPath, err := saveScanResult(cc.RepoDir, opts, ag, comments, ag.Warnings(), duration, reviewID)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to save scan result: %v\n", err)
+		path, mdPath, saveErr := saveScanResult(repoDir, opts, ag, comments, ag.Warnings(), duration, reviewID)
+		if saveErr != nil {
+			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to save scan result: %v\n", saveErr)
 		} else {
 			fmt.Fprintf(os.Stderr, "[ocr] JSON saved to: %s\n", path)
 			if mdPath != "" {
@@ -365,7 +390,7 @@ func executeScan(opts scanOptions) error {
 		sess := ag.Session()
 		gitlab := reviewstore.GitLabInfo{
 			ServerURL:       os.Getenv("CI_SERVER_URL"),
-			ProjectID:       firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir)),
+			ProjectID:       firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(repoDir)),
 			MergeRequestIID: os.Getenv("CI_MERGE_REQUEST_IID"),
 			PipelineID:      os.Getenv("CI_PIPELINE_ID"),
 			JobID:           os.Getenv("CI_JOB_ID"),
@@ -392,10 +417,10 @@ func executeScan(opts scanOptions) error {
 		} else {
 			fmt.Fprintf(os.Stderr, "[ocr] Per-file output saved to: %s\n", perFileIdxPath)
 		}
-		finalized = true
+		if finalized != nil {
+			*finalized = true
+		}
 	}
-
-	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q)
 }
 
 func runScanPreview(cc *commonContext, scanTpl *template.ScanTemplate, scanPaths []string) error {

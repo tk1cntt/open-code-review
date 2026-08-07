@@ -22,7 +22,7 @@ import (
 
 type refactorOptions struct {
 	toolConfigPath, rulePath, repoDir, paths, excludes string
-	outputFormat, audience, background, resume         string
+	outputFormat, audience, background, resume, resumeMode string
 	saveResult, savePerFile                            bool
 	resultDir, resultProject                           string
 	concurrency, perFileTimeout, maxTools, maxGitProcs, maxTokensBudget int
@@ -159,6 +159,7 @@ func executeRefactor(opts refactorOptions) error {
 		MaxTokensBudget:       refactorTpl.MaxTokensBudget,
 		SkipPlan:              opts.noPlan,
 		Resume:                resumeState,
+		ResumeMode:            opts.resumeMode,
 		Mode:                  opts.mode,
 		CrossFileHints:        crossHints,
 		Apply:                 opts.apply,
@@ -223,11 +224,23 @@ func executeRefactor(opts refactorOptions) error {
 
 	comments, err := ag.Run(ctx)
 	duration := time.Since(startTime)
+
+	// Always try to persist/emit whatever was collected — including partial
+	// findings after all-file timeout/failure — before returning an error.
+	persistRefactorOutputs(cc.RepoDir, opts, ag, comments, duration, reviewID, perFileWriter, &finalized)
+
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
 		if id := ag.SessionID(); id != "" {
 			fmt.Fprintf(os.Stderr, "[ocr] Session: %s (retry with: --resume %s)\n", id, id)
+		}
+		if len(comments) > 0 {
+			fmt.Fprintf(os.Stderr, "[ocr] Wrote %d partial finding(s) before failure\n", len(comments))
+		}
+		// Emit partial stdout/json (comments + token summary) even on hard failure.
+		if emitErr := emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q); emitErr != nil {
+			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to emit partial refactor result: %v\n", emitErr)
 		}
 		return fmt.Errorf("refactor failed: %w", err)
 	}
@@ -238,17 +251,32 @@ func executeRefactor(opts refactorOptions) error {
 		}
 	}
 
+	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q)
+}
+
+// persistRefactorOutputs writes JSON/markdown/per-file artifacts for both
+// successful runs and partial results after a hard failure (e.g. all timeouts).
+func persistRefactorOutputs(
+	repoDir string,
+	opts refactorOptions,
+	ag *refactor.Agent,
+	comments []model.LlmComment,
+	duration time.Duration,
+	reviewID string,
+	perFileWriter *reviewstore.PerFileWriter,
+	finalized *bool,
+) {
 	if opts.saveResult {
 		if opts.resultDir == "" {
 			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
 				opts.resultDir = d
 			} else {
-				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "refactors")
+				opts.resultDir = filepath.Join(repoDir, ".opencodereview", "refactors")
 			}
 		}
-		path, mdPath, err := saveRefactorResult(cc.RepoDir, opts, ag, comments, ag.Warnings(), duration, reviewID)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to save refactor result: %v\n", err)
+		path, mdPath, saveErr := saveRefactorResult(repoDir, opts, ag, comments, ag.Warnings(), duration, reviewID)
+		if saveErr != nil {
+			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to save refactor result: %v\n", saveErr)
 		} else {
 			fmt.Fprintf(os.Stderr, "[ocr] JSON saved to: %s\n", path)
 			if mdPath != "" {
@@ -260,7 +288,7 @@ func executeRefactor(opts refactorOptions) error {
 		sess := ag.Session()
 		gitlab := reviewstore.GitLabInfo{
 			ServerURL:       os.Getenv("CI_SERVER_URL"),
-			ProjectID:       firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir)),
+			ProjectID:       firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(repoDir)),
 			MergeRequestIID: os.Getenv("CI_MERGE_REQUEST_IID"),
 			PipelineID:      os.Getenv("CI_PIPELINE_ID"),
 			JobID:           os.Getenv("CI_JOB_ID"),
@@ -287,10 +315,10 @@ func executeRefactor(opts refactorOptions) error {
 		} else {
 			fmt.Fprintf(os.Stderr, "[ocr] Per-file output saved to: %s\n", perFileIdxPath)
 		}
-		finalized = true
+		if finalized != nil {
+			*finalized = true
+		}
 	}
-
-	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q)
 }
 
 func runRefactorPreview(cc *commonContext, refactorTpl *template.RefactorTemplate, refactorPaths []string) error {
@@ -380,12 +408,12 @@ func loadRefactorResumeState(repoDir string, opts refactorOptions) (*session.Res
 	if err := state.ValidateOptions(current); err != nil {
 		return nil, fmt.Errorf("%w (run 'ocr session list' to see available sessions)", err)
 	}
-	if state.CompletedCount() == 0 && state.FailedCount() == 0 {
-		fmt.Fprintf(os.Stderr, "[ocr] Resume session %q: no completed items or failed files found — analyzing all files fresh\n",
+	if !state.HasSessionScope() {
+		fmt.Fprintf(os.Stderr, "[ocr] Resume session %q: no completed/failed/in-progress files found — analyzing all files fresh\n",
 			opts.resume)
 	} else {
-		fmt.Fprintf(os.Stderr, "[ocr] Resume session %q: reusing %d completed file(s), retrying %d failed file(s)\n",
-			opts.resume, state.CompletedCount(), state.FailedCount())
+		fmt.Fprintf(os.Stderr, "[ocr] Resume session %q: reusing %d completed, re-running %d session file(s) (%d mid-file)\n",
+			opts.resume, state.CompletedCount(), state.FailedCount(), state.InProgressCount())
 	}
 	return state, nil
 }

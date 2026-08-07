@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/alibaba/open-code-review/internal/agent"
+	"github.com/alibaba/open-code-review/internal/diff"
 	"github.com/alibaba/open-code-review/internal/mcp"
 	"github.com/alibaba/open-code-review/internal/model"
+	"github.com/alibaba/open-code-review/internal/refactor/crossfile"
 	"github.com/alibaba/open-code-review/internal/reviewstore"
 	"github.com/alibaba/open-code-review/internal/session"
 	"github.com/alibaba/open-code-review/internal/telemetry"
@@ -30,6 +32,7 @@ type reviewOptions struct {
 	to                  string
 	commit              string
 	resume              string
+	resumeMode          string
 	excludes            string
 	outputFormat        string
 	audience            string
@@ -49,6 +52,8 @@ type reviewOptions struct {
 	resultProject       string
 	resultSourceBranch  string
 	resultTargetBranch  string
+	apply               bool
+	applyRunTests       bool
 }
 
 var reviewOpts reviewOptions
@@ -175,7 +180,8 @@ func executeReview(opts reviewOptions) error {
 
 	var perFileWriter *reviewstore.PerFileWriter
 
-	ag := agent.New(agent.Args{
+	var ag *agent.Agent
+	ag = agent.New(agent.Args{
 		RepoDir:               cc.RepoDir,
 		From:                  opts.from,
 		To:                    opts.to,
@@ -197,12 +203,29 @@ func executeReview(opts reviewOptions) error {
 		Background:            opts.background,
 		GitRunner:             cc.GitRunner,
 		Resume:                resumeState,
+		ResumeMode:            opts.resumeMode,
 		MaxTokensBudget:       int64(opts.maxTokensBudget),
 		OnFileDone: func(filePath string, comments []model.LlmComment) {
 			if perFileWriter != nil {
 				if err := perFileWriter.WriteFile(filePath, comments); err != nil {
 					fmt.Fprintf(os.Stderr, "[ocr] warning: per-file save failed for %s: %v\n", filePath, err)
 				}
+			}
+		},
+		OnFileSuccess: func(filePath string, comments []model.LlmComment) {
+			if !opts.apply {
+				return
+			}
+			resolved := diff.ResolveLineNumbers(comments, ag.Diffs())
+			applyResult := crossfile.ApplyComments(cc.RepoDir, resolved, opts.applyRunTests)
+			for _, m := range applyResult.Messages {
+				fmt.Fprintf(os.Stderr, "[ocr] apply %s: %s\n", filePath, m)
+			}
+			if applyResult.Verify.OK && !applyResult.RolledBack {
+				fmt.Fprintf(os.Stderr, "[ocr] applied %d suggestion(s) to %s; verify ok\n",
+					len(applyResult.Written), filePath)
+			} else if len(applyResult.Written) > 0 {
+				fmt.Fprintf(os.Stderr, "[ocr] WARNING: apply+verify failed for %s (rolled back)\n", filePath)
 			}
 		},
 		RuntimeConfig:         rt.RuntimeConfig,
@@ -261,6 +284,7 @@ func executeReview(opts reviewOptions) error {
 
 	comments, runErr := ag.Run(ctx)
 	duration := time.Since(startTime)
+
 	manifest := ag.RunManifest()
 	resultErr := reviewResultError(runErr, manifest)
 	if resultErr != nil {
@@ -477,7 +501,8 @@ func validateReviewRefs(repoDir string, opts reviewOptions) error {
 }
 
 func runPreview(cc *commonContext, opts reviewOptions) error {
-	ag := agent.New(agent.Args{
+	var ag *agent.Agent
+	ag = agent.New(agent.Args{
 		RepoDir:    cc.RepoDir,
 		From:       opts.from,
 		To:         opts.to,

@@ -188,6 +188,13 @@ func printSessionDetail(w io.Writer, s *session.Summary, items []session.ItemDet
 			note = "from " + shortSessionID(it.SourceSessionID)
 		case "failed":
 			note = truncate(it.Error, 60)
+		case "IN_PROGRESS":
+			note = fmt.Sprintf("round=%d status=%s", it.Round, it.Status)
+			if it.StopReason != "" {
+				note += " " + truncate(it.StopReason, 40)
+			}
+		case "partial":
+			note = fmt.Sprintf("round=%d %s", it.Round, truncate(it.StopReason, 40))
 		}
 		fmt.Fprintf(tw, "  %s\t%s\t%d\t%s\n", it.Type, it.FilePath, it.Comments, note)
 	}

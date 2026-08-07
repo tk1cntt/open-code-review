@@ -96,6 +96,15 @@ func validateAudience(audience string) error {
 	}
 }
 
+func validateResumeMode(mode string) error {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "continue", "restart-failed", "restart", "cold":
+		return nil
+	default:
+		return fmt.Errorf("invalid --resume-mode %q: must be 'continue' or 'restart-failed'", mode)
+	}
+}
+
 func validateReviewOptions(opts *reviewOptions) error {
 	if err := validateDiffMode(opts.from, opts.to, opts.commit); err != nil {
 		return err
@@ -104,6 +113,9 @@ func validateReviewOptions(opts *reviewOptions) error {
 		return fmt.Errorf("--preview and --resume cannot be used together")
 	}
 	if err := validateAudience(opts.audience); err != nil {
+		return err
+	}
+	if err := validateResumeMode(opts.resumeMode); err != nil {
 		return err
 	}
 	const minMaxTools = 10
@@ -125,6 +137,9 @@ func validateReviewOptions(opts *reviewOptions) error {
 
 func validateScanOptions(opts *scanOptions) error {
 	if err := validateAudience(opts.audience); err != nil {
+		return err
+	}
+	if err := validateResumeMode(opts.resumeMode); err != nil {
 		return err
 	}
 	if opts.maxTools < 0 {
@@ -150,6 +165,8 @@ func registerReviewFlags(cmd *cobra.Command, opts *reviewOptions) {
 	addRepoFlag(cmd, &opts.repoDir)
 	addDiffFlags(cmd, &opts.from, &opts.to, &opts.commit)
 	cmd.Flags().StringVar(&opts.resume, "resume", "", "resume from a previous review session id")
+	cmd.Flags().StringVar(&opts.resumeMode, "resume-mode", "continue", "resume mode: continue (mid-file checkpoint) or restart-failed (cold retry)")
+	cmd.RegisterFlagCompletionFunc("resume-mode", completeEnum("continue", "restart-failed"))
 	addExcludeFlag(cmd, &opts.excludes)
 	addOutputFlags(cmd, &opts.outputFormat, &opts.audience)
 	addConcurrencyFlags(cmd, &opts.concurrency, &opts.perFileTimeout, &opts.maxTools, &opts.maxGitProcs, &opts.maxTokensBudget)
@@ -163,6 +180,8 @@ func registerReviewFlags(cmd *cobra.Command, opts *reviewOptions) {
 	cmd.Flags().StringVar(&opts.resultProject, "result-project", "", "project name/path for persisted review results")
 	cmd.Flags().StringVar(&opts.resultSourceBranch, "result-source-branch", "", "source branch metadata for persisted review results")
 	cmd.Flags().StringVar(&opts.resultTargetBranch, "result-target-branch", "", "target branch metadata for persisted review results")
+	cmd.Flags().BoolVar(&opts.apply, "apply", false, "apply suggestion_code from review comments (verify+rollback; best-effort per file)")
+	cmd.Flags().BoolVar(&opts.applyRunTests, "apply-run-tests", false, "when --apply, also run go test on touched packages during verify")
 }
 
 // registerScanFlags registers all scan command flags on cmd, binding to opts.
@@ -180,6 +199,8 @@ func registerScanFlags(cmd *cobra.Command, opts *scanOptions) {
 	cmd.Flags().IntVar(&opts.maxTokensBudget, "max-tokens-budget", 0, "cap total token usage; dispatch stops once exceeded (0 = unlimited)")
 	cmd.Flags().StringVarP(&opts.background, "background", "b", "", "optional requirement/business context for the scan")
 	cmd.Flags().StringVar(&opts.resume, "resume", "", "resume from a previous scan session id")
+	cmd.Flags().StringVar(&opts.resumeMode, "resume-mode", "continue", "resume mode: continue (mid-file checkpoint) or restart-failed (cold retry)")
+	cmd.RegisterFlagCompletionFunc("resume-mode", completeEnum("continue", "restart-failed"))
 	cmd.Flags().BoolVar(&opts.saveResult, "save-result", true, "persist final scan result for the WebUI review viewer")
 	cmd.Flags().BoolVar(&opts.savePerFile, "save-per-file", true, "split output into per-file markdown files under a directory tree mirroring the source tree")
 	cmd.Flags().StringVar(&opts.resultDir, "result-dir", "", "scan result storage root (env: OCR_REVIEWS_DIR, default: .opencodereview/reviews)")
@@ -225,6 +246,8 @@ func registerRefactorFlags(cmd *cobra.Command, opts *refactorOptions) {
 	cmd.Flags().BoolVar(&opts.applyRunTests, "apply-run-tests", false, "when --apply, also run go test on touched packages during verify")
 	addModelFlag(cmd, &opts.model)
 	cmd.Flags().StringVar(&opts.resume, "resume", "", "resume from a previous refactoring session id")
+	cmd.Flags().StringVar(&opts.resumeMode, "resume-mode", "continue", "resume mode: continue (mid-file checkpoint) or restart-failed (cold retry)")
+	cmd.RegisterFlagCompletionFunc("resume-mode", completeEnum("continue", "restart-failed"))
 	cmd.Flags().BoolVar(&opts.saveResult, "save-result", true, "persist final refactoring result for the WebUI viewer")
 	cmd.Flags().BoolVar(&opts.savePerFile, "save-per-file", true, "split output into per-file markdown files")
 	cmd.Flags().StringVar(&opts.resultDir, "result-dir", "", "refactoring result storage root (env: OCR_REVIEWS_DIR, default: .opencodereview/refactors)")
@@ -233,6 +256,9 @@ func registerRefactorFlags(cmd *cobra.Command, opts *refactorOptions) {
 
 func validateRefactorOptions(opts *refactorOptions) error {
 	if err := validateAudience(opts.audience); err != nil {
+		return err
+	}
+	if err := validateResumeMode(opts.resumeMode); err != nil {
 		return err
 	}
 	if opts.maxTools < 0 {
@@ -259,9 +285,5 @@ func validateRefactorOptions(opts *refactorOptions) error {
 		return fmt.Errorf("--cross-file must be one of: off, hints")
 	}
 	opts.crossFile = cf
-	if opts.apply && mode == crossfile.ModeLocal && cf != "hints" {
-		// allow apply only with cross/full; warn via validation error for clarity
-		return fmt.Errorf("--apply requires --mode=cross or --mode=full")
-	}
 	return nil
 }

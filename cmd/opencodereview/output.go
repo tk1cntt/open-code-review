@@ -148,13 +148,13 @@ func buildBadge(comment model.LlmComment) string {
 // Unknown or empty severities fall back to dim.
 func severityColor(severity string) string {
 	switch severity {
-	case "critical":
+	case "blocker", "critical":
 		return "\033[1;91m" // bold bright red
 	case "high":
 		return "\033[91m" // bright red
-	case "medium":
+	case "major", "medium":
 		return "\033[93m" // bright yellow
-	case "low":
+	case "minor", "low", "info":
 		return "\033[94m" // bright blue
 	default:
 		return "\033[2m" // dim
