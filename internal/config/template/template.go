@@ -261,6 +261,44 @@ func (t *RefactorTemplate) ApplyLanguage(lang string) {
 	applyLanguage(&t.MemoryCompressionTask, instruction)
 }
 
+// TemplateHashFields returns the canonical fields used for checkpoint
+// invalidation across all three template types. Adding a new field here
+// covers review, scan, and refactor in one place.
+func (t *Template) TemplateHashFields() []string {
+	parts := []string{
+		fmt.Sprintf("max_tools=%d", t.MaxToolRequestTimes),
+		fmt.Sprintf("max_tokens=%d", t.MaxTokens),
+	}
+	for _, m := range t.MainTask.Messages {
+		parts = append(parts, m.Role, m.Content)
+	}
+	return parts
+}
+
+// TemplateHashFields returns the canonical fields for scan template identity.
+func (t *ScanTemplate) TemplateHashFields() []string {
+	parts := []string{
+		fmt.Sprintf("max_tools=%d", t.MaxToolRequestTimes),
+		fmt.Sprintf("max_tokens=%d", t.MaxTokens),
+	}
+	for _, m := range t.MainTask.Messages {
+		parts = append(parts, m.Role, m.Content)
+	}
+	return parts
+}
+
+// TemplateHashFields returns the canonical fields for refactor template identity.
+func (t *RefactorTemplate) TemplateHashFields() []string {
+	parts := []string{
+		fmt.Sprintf("max_tools=%d", t.MaxToolRequestTimes),
+		fmt.Sprintf("max_tokens=%d", t.MaxTokens),
+	}
+	for _, m := range t.MainTask.Messages {
+		parts = append(parts, m.Role, m.Content)
+	}
+	return parts
+}
+
 // Validate checks that a RefactorTemplate has the minimum fields populated.
 func (t *RefactorTemplate) Validate() error {
 	if t.MaxTokens <= 0 {
