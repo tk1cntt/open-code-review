@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -167,7 +168,7 @@ func TestLlmComment_JSON(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	if got != c {
+	if !reflect.DeepEqual(got, c) {
 		t.Errorf("roundtrip mismatch:\n  got  %+v\n  want %+v", got, c)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -67,7 +68,7 @@ func TestHandleRepos_UnreadableRoot(t *testing.T) {
 }
 
 func TestHandleRepos_PermissionDenied(t *testing.T) {
-	if os.Getuid() == 0 {
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
 		t.Skip("permission checks are bypassed for root")
 	}
 	root := t.TempDir()

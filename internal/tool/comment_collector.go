@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/alibaba/open-code-review/internal/model"
+	"github.com/alibaba/open-code-review/internal/session"
 )
 
 // CommentCollector is a thread-safe, per-Agent comment store.
@@ -11,17 +12,30 @@ import (
 type CommentCollector struct {
 	mu       sync.Mutex
 	comments []model.LlmComment
+	seen     map[string]struct{} // path+content fingerprint for mid-file resume dedupe
 }
 
 // NewCommentCollector creates an empty collector.
 func NewCommentCollector() *CommentCollector {
-	return &CommentCollector{}
+	return &CommentCollector{
+		seen: make(map[string]struct{}),
+	}
 }
 
-// Add appends a comment to the collector.
+// Add appends a comment to the collector. Duplicate comments (same path +
+// content fingerprint) are silently skipped, which keeps mid-file resume and
+// same-run checkpoint continue from double-reporting findings.
 func (c *CommentCollector) Add(cm model.LlmComment) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.seen == nil {
+		c.seen = make(map[string]struct{})
+	}
+	key := session.CommentFingerprint(cm)
+	if _, ok := c.seen[key]; ok {
+		return
+	}
+	c.seen[key] = struct{}{}
 	c.comments = append(c.comments, cm)
 }
 
@@ -96,6 +110,9 @@ func (c *CommentCollector) RemoveByPath(path string) {
 	kept := c.comments[:0]
 	for _, cm := range c.comments {
 		if cm.Path == path {
+			if c.seen != nil {
+				delete(c.seen, session.CommentFingerprint(cm))
+			}
 			continue
 		}
 		kept = append(kept, cm)
@@ -117,6 +134,9 @@ func (c *CommentCollector) RemoveByPathAndIndices(path string, indices map[int]s
 	for _, cm := range c.comments {
 		if cm.Path == path {
 			if _, remove := indices[pathIdx]; remove {
+				if c.seen != nil {
+					delete(c.seen, session.CommentFingerprint(cm))
+				}
 				pathIdx++
 				continue
 			}

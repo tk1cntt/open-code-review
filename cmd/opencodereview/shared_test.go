@@ -218,3 +218,14 @@ func TestResolveWorkingDir_GitRepo(t *testing.T) {
 	}
 	_ = isGit
 }
+
+func TestValidateRefactorOptions_ApplyLocal(t *testing.T) {
+	opts := refactorOptions{
+		mode:     "local",
+		apply:    true,
+		audience: "human",
+	}
+	if err := validateRefactorOptions(&opts); err != nil {
+		t.Fatalf("--apply with --mode=local should be valid but got: %v", err)
+	}
+}

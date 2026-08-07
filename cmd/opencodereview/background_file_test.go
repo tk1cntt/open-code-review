@@ -37,7 +37,7 @@ func TestResolveBackgroundFilePath(t *testing.T) {
 	})
 
 	t.Run("absolute unchanged", func(t *testing.T) {
-		abs := filepath.FromSlash("/etc/context.md")
+		abs := filepath.Join(t.TempDir(), "context.md")
 		if got := resolveBackgroundFilePath(repo, abs); got != abs {
 			t.Errorf("resolveBackgroundFilePath = %q, want %q (absolute must be untouched)", got, abs)
 		}

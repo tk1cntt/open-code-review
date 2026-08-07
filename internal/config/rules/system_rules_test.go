@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -1517,6 +1518,9 @@ func TestResolveRuleEntries_EmptyRule(t *testing.T) {
 }
 
 func TestResolveRuleEntries_SymlinkSafety(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires administrator privileges on Windows")
+	}
 	dir := t.TempDir()
 	sensitiveFile := filepath.Join(dir, "secret.json")
 	if err := os.WriteFile(sensitiveFile, []byte("SECRET"), 0o644); err != nil {

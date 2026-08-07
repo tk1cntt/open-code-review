@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/alibaba/open-code-review/internal/session"
@@ -569,7 +570,7 @@ func TestLoadSession_ToolCallWithoutRequest(t *testing.T) {
 }
 
 func TestDiscoverRepos_SkipsUnreadableSubdir(t *testing.T) {
-	if os.Getuid() == 0 {
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
 		t.Skip("permission checks are bypassed for root")
 	}
 	root := t.TempDir()
@@ -595,7 +596,7 @@ func TestDiscoverRepos_SkipsUnreadableSubdir(t *testing.T) {
 }
 
 func TestListSessions_SkipsUnreadableFiles(t *testing.T) {
-	if os.Getuid() == 0 {
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
 		t.Skip("permission checks are bypassed for root")
 	}
 	root := t.TempDir()
@@ -689,12 +690,12 @@ func TestLoadSession_ReviewItemDone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(vs.Findings) != 4 {
-		t.Fatalf("Findings count = %d, want 4", len(vs.Findings))
+	if len(vs.Comments) != 4 {
+		t.Fatalf("Findings count = %d, want 4", len(vs.Comments))
 	}
 
 	// Finding 1: critical security
-	f := vs.Findings[0]
+	f := vs.Comments[0]
 	if f.FilePath != "src/api/users.go" {
 		t.Errorf("Findings[0].FilePath = %q", f.FilePath)
 	}
@@ -718,13 +719,13 @@ func TestLoadSession_ReviewItemDone(t *testing.T) {
 	}
 
 	// Finding 2: high bug
-	f = vs.Findings[1]
+	f = vs.Comments[1]
 	if f.Severity != "high" || f.Category != "bug" {
 		t.Errorf("Findings[1] = %s/%s, want high/bug", f.Severity, f.Category)
 	}
 
 	// Finding 3: medium performance (no code diff)
-	f = vs.Findings[2]
+	f = vs.Comments[2]
 	if f.Severity != "medium" || f.Category != "performance" {
 		t.Errorf("Findings[2] = %s/%s, want medium/performance", f.Severity, f.Category)
 	}
@@ -733,7 +734,7 @@ func TestLoadSession_ReviewItemDone(t *testing.T) {
 	}
 
 	// Finding 4: low style
-	f = vs.Findings[3]
+	f = vs.Comments[3]
 	if f.Severity != "low" || f.Category != "style" {
 		t.Errorf("Findings[3] = %s/%s, want low/style", f.Severity, f.Category)
 	}
@@ -783,11 +784,11 @@ func TestLoadSession_ReviewItemReused(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(vs.Findings) != 1 {
-		t.Fatalf("Findings count = %d, want 1", len(vs.Findings))
+	if len(vs.Comments) != 1 {
+		t.Fatalf("Findings count = %d, want 1", len(vs.Comments))
 	}
-	if vs.Findings[0].Content != "Reused finding" {
-		t.Errorf("Content = %q", vs.Findings[0].Content)
+	if vs.Comments[0].Content != "Reused finding" {
+		t.Errorf("Content = %q", vs.Comments[0].Content)
 	}
 }
 
@@ -808,8 +809,8 @@ func TestLoadSession_NoFindings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(vs.Findings) != 0 {
-		t.Errorf("Findings count = %d, want 0", len(vs.Findings))
+	if len(vs.Comments) != 0 {
+		t.Errorf("Findings count = %d, want 0", len(vs.Comments))
 	}
 	if len(vs.SeverityCount) != 0 {
 		t.Errorf("SeverityCount should be empty")
@@ -838,24 +839,24 @@ func TestLoadSession_ReviewItemFailed_WithComments(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(vs.Findings) != 3 {
-		t.Fatalf("Findings count = %d, want 3 (comments from failed files)", len(vs.Findings))
+	if len(vs.Comments) != 3 {
+		t.Fatalf("Findings count = %d, want 3 (comments from failed files)", len(vs.Comments))
 	}
 
 	// Finding 1: N+1 query from bad.go
-	f := vs.Findings[0]
+	f := vs.Comments[0]
 	if f.FilePath != "src/bad.go" || f.Severity != "high" || f.Category != "performance" {
 		t.Errorf("Findings[0] = %s/%s/%s, want bad.go/high/performance", f.FilePath, f.Severity, f.Category)
 	}
 
 	// Finding 2: missing error handling from also_bad.go
-	f = vs.Findings[1]
+	f = vs.Comments[1]
 	if f.Content != "Missing error handling" {
 		t.Errorf("Findings[1].Content = %q", f.Content)
 	}
 
 	// Finding 3: hardcoded secret from also_bad.go
-	f = vs.Findings[2]
+	f = vs.Comments[2]
 	if f.Content != "Hardcoded secret" || f.Severity != "critical" {
 		t.Errorf("Findings[2] = %s/%s, want Hardcoded secret/critical", f.Content, f.Severity)
 	}

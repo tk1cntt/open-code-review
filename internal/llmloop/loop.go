@@ -232,7 +232,7 @@ func (r *Runner) RunPerFile(ctx context.Context, messages []llm.Message, newPath
 
 		estTokens := CountMessagesTokens(messages)
 		remainingRounds := toolReqCount + 1
-		fmt.Fprintf(stdout.Writer(), "[ocr]   >> LLM round %d/%d (%d msgs, ~%d tokens)...",
+		fmt.Fprintf(stdout.Writer(), "[ocr]   >> LLM round %d/%d (%d msgs, ~%d tokens)...\n",
 			absoluteRound+1, absoluteRound+remainingRounds, len(messages), estTokens)
 
 		_, llmSpan := telemetry.StartLLMSpan(ctx, r.deps.Model)
