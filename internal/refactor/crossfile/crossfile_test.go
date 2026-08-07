@@ -339,17 +339,20 @@ func TestApplyComments_OverlappingRanges(t *testing.T) {
 	os.WriteFile(p, []byte(src), 0o644)
 
 	// Two comments with overlapping line ranges on the same file.
+	// Comment(3-4) overlaps Comment(4-5); after descending StartLine
+	// sort, only the highest-StartLine comment is kept, the overlapping
+	// lower comment is skipped individually.
 	comments := []model.LlmComment{
 		{Path: "main.go", StartLine: 3, EndLine: 4, SuggestionCode: "var a int"},
 		{Path: "main.go", StartLine: 4, EndLine: 5, SuggestionCode: "var b int"},
 	}
 	res := ApplyComments(dir, comments, false)
-	if len(res.Written) != 0 {
-		t.Fatal("expected overlapping range comments to be skipped")
+	if len(res.Written) != 1 {
+		t.Fatalf("expected 1 written (non-overlapping kept, overlapping skipped); written=%v msgs=%v skipped=%v", res.Written, res.Messages, res.Skipped)
 	}
 	found := false
 	for _, s := range res.Skipped {
-		if strings.Contains(s, "overlapping") {
+		if strings.Contains(s, "overlap") {
 			found = true
 			break
 		}

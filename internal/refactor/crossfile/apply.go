@@ -122,7 +122,9 @@ func ApplyPlanSteps(repoDir string, plans []RefactorPlan, runTests bool) ApplyRe
 // under repoDir using backup → write → verify → rollback. Comments are grouped
 // by path and applied in reverse StartLine order to preserve line numbers.
 // Comments with empty SuggestionCode, empty Path, or StartLine <= 0 are skipped.
-// Overlapping ranges on the same path cause all comments for that path to be skipped.
+// Overlapping ranges: comments whose EndLine reaches into a higher-StartLine
+// comment's StartLine are skipped individually; non-overlapping comments are
+// still applied.
 func ApplyComments(repoDir string, comments []model.LlmComment, runTests bool) ApplyResult {
 	res := ApplyResult{}
 	backup := map[string]backupEntry{}
@@ -177,6 +179,12 @@ func ApplyComments(repoDir string, comments []model.LlmComment, runTests bool) A
 		return res
 	}
 
+	// Count total actionable before overlap filtering (for reporting).
+	totalAct := 0
+	for _, g := range byPath {
+		totalAct += len(g.comments)
+	}
+
 	// Sort paths for deterministic output.
 	paths := make([]string, 0, len(byPath))
 	for p := range byPath {
@@ -191,19 +199,32 @@ func ApplyComments(repoDir string, comments []model.LlmComment, runTests bool) A
 			return g.comments[i].StartLine > g.comments[j].StartLine
 		})
 
-		// Check for overlapping ranges.
-		overlap := false
-		for i := 0; i < len(g.comments)-1; i++ {
-			a, b := g.comments[i], g.comments[i+1]
-			// After descending sort, a.StartLine >= b.StartLine.
-			// They overlap if b.EndLine >= a.StartLine.
-			if b.EndLine >= a.StartLine {
-				overlap = true
-				break
+		// Filter overlapping comments: compare each comment against
+		// the last kept (non-overlapping) comment. After descending
+		// sort, a higher StartLine comment is applied first (bottom-up).
+		// If a lower comment's EndLine reaches into a kept comment's
+		// StartLine, applying it would overwrite already-replaced lines,
+		// so skip it. Non-overlapping comments are applied normally.
+		overlapSkipped := 0
+		if len(g.comments) > 1 {
+			keep := make([]model.LlmComment, 0, len(g.comments))
+			for _, cm := range g.comments {
+				if len(keep) > 0 {
+					last := keep[len(keep)-1]
+					if cm.EndLine >= last.StartLine {
+						res.Skipped = append(res.Skipped, skipMsg(cm,
+							fmt.Sprintf("overlap with comment at L%d-L%d", last.StartLine, last.EndLine)))
+						overlapSkipped++
+						continue
+					}
+				}
+				keep = append(keep, cm)
 			}
+			g.comments = keep
 		}
-		if overlap {
-			res.Skipped = append(res.Skipped, relPath+": overlapping line ranges, skipped all")
+		if len(g.comments) == 0 {
+			res.Skipped = append(res.Skipped,
+				fmt.Sprintf("%s: all %d comment(s) overlapping, nothing to apply", relPath, overlapSkipped))
 			continue
 		}
 
@@ -256,12 +277,8 @@ func ApplyComments(repoDir string, comments []model.LlmComment, runTests bool) A
 
 	if len(res.Written) == 0 {
 		// All actionable comments were skipped (overlap or other per-path reasons).
-		totalActionable := 0
-		for _, g := range byPath {
-			totalActionable += len(g.comments)
-		}
 		res.Messages = append(res.Messages, fmt.Sprintf("nothing applied (%d comments, %d skipped, %d actionable → 0 applied)",
-			len(comments), len(res.Skipped), totalActionable))
+			len(comments), len(res.Skipped), totalAct))
 		res.Verify = VerifyResult{OK: true, Messages: res.Messages}
 		return res
 	}
