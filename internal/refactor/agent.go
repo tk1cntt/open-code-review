@@ -860,29 +860,20 @@ func (a *Agent) recordFileSuccess(it model.ScanItem, fingerprint string, comment
 // applyFileComments applies suggestion_code from per-file comments using
 // backup+verify+rollback. Runs in the per-file dispatch goroutine. Best-effort:
 // verify failures roll back the file and log a warning but never fail the run.
+// Filtering (empty suggestion_code, empty path, invalid StartLine, overlapping
+// ranges) is handled by ApplyComments which logs a skip reason for each
+// non-actionable comment via res.Skipped.
 func (a *Agent) applyFileComments(ctx context.Context, relPath string, comments []model.LlmComment) {
-	var actionable []model.LlmComment
-	for _, cm := range comments {
-		if cm.SuggestionCode != "" && cm.Path != "" && cm.StartLine > 0 {
-			actionable = append(actionable, cm)
-		}
-	}
-	if len(actionable) == 0 {
-		fmt.Fprintf(stdout.Writer(), "[ocr] apply %s: nothing applied (%d comments, 0 actionable)\n",
-			relPath, len(comments))
-		return
-	}
-
-	res := crossfile.ApplyComments(a.args.RepoDir, actionable, a.args.ApplyRunTests)
+	res := crossfile.ApplyComments(a.args.RepoDir, comments, a.args.ApplyRunTests)
 	for _, m := range res.Messages {
 		fmt.Fprintf(stdout.Writer(), "[ocr] apply %s: %s\n", relPath, m)
 	}
 	for _, s := range res.Skipped {
 		fmt.Fprintf(stdout.Writer(), "[ocr] apply %s: skip %s\n", relPath, s)
 	}
-	if res.Verify.OK && !res.RolledBack {
+	if res.AppliedCount > 0 && res.Verify.OK && !res.RolledBack {
 		fmt.Fprintf(stdout.Writer(), "[ocr] apply %d/%d suggestion(s) to %s\n", res.AppliedCount, len(comments), relPath)
-	} else {
+	} else if len(res.Written) > 0 {
 		fmt.Fprintf(stdout.Writer(), "[ocr] WARNING: apply+verify failed for %s (rolled back)\n", relPath)
 	}
 }
