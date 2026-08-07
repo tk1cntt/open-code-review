@@ -450,7 +450,7 @@ func TestExecuteSubtask_Success(t *testing.T) {
 	a.currentDate = "2026-06-26 10:00"
 
 	it := model.ScanItem{Path: "main.go", Content: "package main\n", LineCount: 1}
-	err := a.executeSubtask(context.Background(), it)
+	err := a.executeSubtask(context.Background(), it, session.FileStart{})
 	if err != nil {
 		t.Fatalf("executeSubtask: %v", err)
 	}
@@ -504,7 +504,7 @@ func TestExecuteSubtask_WithPlan(t *testing.T) {
 	a.currentDate = "2026-06-26 10:00"
 
 	it := model.ScanItem{Path: "handler.go", Content: "package h\nfunc Handle() error { return nil }\n", LineCount: 2}
-	err := a.executeSubtask(context.Background(), it)
+	err := a.executeSubtask(context.Background(), it, session.FileStart{})
 	if err != nil {
 		t.Fatalf("executeSubtask: %v", err)
 	}
@@ -517,7 +517,7 @@ func TestExecuteSubtask_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := a.executeSubtask(ctx, model.ScanItem{Path: "a.go", Content: "x", LineCount: 1})
+	err := a.executeSubtask(ctx, model.ScanItem{Path: "a.go", Content: "x", LineCount: 1}, session.FileStart{})
 	if err == nil {
 		t.Fatal("expected error for cancelled context")
 	}

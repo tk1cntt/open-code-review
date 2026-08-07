@@ -71,6 +71,8 @@ type Args struct {
 	MaxTokensBudget int64
 	// Resume is an optional read-only checkpoint index from a previous scan session.
 	Resume *session.ResumeState
+	// ResumeMode is session.ResumeModeContinue (default) or ResumeModeRestartFailed.
+	ResumeMode string
 	// OnFileDone is called when each file completes (success or failure).
 	// filePath is the repo-relative source path; comments are the collected
 	// review findings (may be nil/empty). The callback is invoked from the
@@ -394,21 +396,25 @@ func (a *Agent) injectScanContentMap() {
 // reviewability rules (binary, extension allowlist, user include/exclude,
 // default excluded paths).
 func (a *Agent) filterScanItems(items []model.ScanItem) []model.ScanItem {
+	// On resume, suppress per-file Skipping noise from whole-repo enumerate.
+	quiet := a.args.Resume != nil
 	var kept []model.ScanItem
 	skipped := 0
 	for _, it := range items {
 		if reason := a.whyExcluded(it); reason != model.ExcludeNone {
-			if it.IsBinary {
-				fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s — binary file\n", it.Path)
-			} else {
-				fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s — filtered by path/extension rules\n", it.Path)
+			if !quiet {
+				if it.IsBinary {
+					fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s — binary file\n", it.Path)
+				} else {
+					fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s — filtered by path/extension rules\n", it.Path)
+				}
 			}
 			skipped++
 			continue
 		}
 		kept = append(kept, it)
 	}
-	if skipped > 0 {
+	if skipped > 0 && !quiet {
 		fmt.Fprintf(stdout.Writer(), "[ocr] Filtered %d file(s) by include/exclude rules\n", skipped)
 	}
 	return kept
@@ -420,19 +426,22 @@ func (a *Agent) filterLargeScans(items []model.ScanItem) []model.ScanItem {
 	if limit <= 0 {
 		return items
 	}
+	quiet := a.args.Resume != nil
 	var kept []model.ScanItem
 	skipped := 0
 	for _, it := range items {
 		tokens := llm.CountTokens(it.Content)
 		if tokens > limit {
-			fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s (~%d tokens exceeds 80%% of max_tokens(%d))\n",
-				it.Path, tokens, a.args.Template.MaxTokens)
+			if !quiet {
+				fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s (~%d tokens exceeds 80%% of max_tokens(%d))\n",
+					it.Path, tokens, a.args.Template.MaxTokens)
+			}
 			skipped++
 			continue
 		}
 		kept = append(kept, it)
 	}
-	if skipped > 0 {
+	if skipped > 0 && !quiet {
 		fmt.Fprintf(stdout.Writer(), "[ocr] Pre-filtered %d file(s) exceeding 80%% of max_tokens\n", skipped)
 	}
 	return kept
@@ -441,31 +450,48 @@ func (a *Agent) filterLargeScans(items []model.ScanItem) []model.ScanItem {
 // applyResume separates already-completed items from the dispatch list using
 // the resume checkpoint index. Completed comments are added to the collector
 // and recorded as reused. The returned slice contains only files that need
-// fresh review (including previously-failed files).
+// work from the prior session (failed / mid-file continue) — not the rest of
+// the repository.
 func (a *Agent) applyResume(items []model.ScanItem) []model.ScanItem {
 	resume := a.args.Resume
 	if resume == nil {
 		return items
 	}
 
+	// Full-scan resume must not treat every unscoped repo file as "new work".
+	scoped := resume.HasSessionScope()
+
 	toDispatch := make([]model.ScanItem, 0, len(items))
-	var reused, retried int64
+	var reused, continuing, coldRetry, newFiles int64
+	opts := session.PrepareOpts{
+		ResumeMode:   session.NormalizeResumeMode(a.args.ResumeMode),
+		CurrentModel: a.args.Model,
+		TemplateHash: a.templateHash(),
+	}
 	for _, it := range items {
 		fingerprint := ScanItemFingerprint(it.Path)
-		item, ok := resume.Item(fingerprint)
-		if !ok {
-			if prevPath, wasFailed := resume.FailedFiles[fingerprint]; wasFailed {
-				fmt.Fprintf(stdout.Writer(), "[ocr] Resume retrying previously failed file: %s\n", prevPath)
-				retried++
-			}
-			toDispatch = append(toDispatch, it)
+		if scoped && !resume.InSession(fingerprint) {
 			continue
 		}
-		for _, cm := range item.Comments {
-			a.args.CommentCollector.Add(cm)
+		start := session.PrepareFileStart(resume, fingerprint, it.Path, opts)
+		if start.Mode == session.ModeReuse {
+			for _, cm := range start.SeedComments {
+				a.args.CommentCollector.Add(cm)
+			}
+			a.session.RecordReviewItemReused(it.Path, it.Path, it.Path, fingerprint, resume.SessionID, start.SeedComments)
+			reused++
+			continue
 		}
-		a.session.RecordReviewItemReused(it.Path, it.Path, it.Path, fingerprint, resume.SessionID, item.Comments)
-		reused++
+		if start.Mode == session.ModeContinue {
+			fmt.Fprintf(stdout.Writer(), "[ocr] Resume continuing mid-file: %s (round %d)\n", it.Path, start.Round)
+			continuing++
+		} else if _, wasFailed := resume.FailedFiles[fingerprint]; wasFailed {
+			fmt.Fprintf(stdout.Writer(), "[ocr] Resume retrying previously failed file (cold): %s\n", it.Path)
+			coldRetry++
+		} else {
+			newFiles++
+		}
+		toDispatch = append(toDispatch, it)
 	}
 
 	rerun := int64(len(toDispatch))
@@ -481,9 +507,34 @@ func (a *Agent) applyResume(items []model.ScanItem) []model.ScanItem {
 		fmt.Fprintf(stdout.Writer(), "[ocr] Warning: resume session %q used model %q, current model is %q\n",
 			resume.SessionID, resume.Model, a.args.Model)
 	}
-	fmt.Fprintf(stdout.Writer(), "[ocr] Resume %s: reusing %d file(s), retrying %d failed file(s), reviewing %d new file(s)\n",
-		resume.SessionID, reused, retried, rerun-retried)
+	fmt.Fprintln(stdout.Writer(), session.FormatResumeSummary(resume.SessionID, reused, continuing, coldRetry, newFiles))
 	return toDispatch
+}
+
+func (a *Agent) templateHash() string {
+	return session.ComputeTemplateHashFrom(&a.args.Template)
+}
+
+func (a *Agent) prepareFileStart(it model.ScanItem) session.FileStart {
+	fingerprint := ScanItemFingerprint(it.Path)
+	if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok && len(cp.Messages) > 0 {
+		return session.FileStart{
+			Mode:         session.ModeContinue,
+			Messages:     cp.Messages,
+			PlanGuidance: cp.PlanGuidance,
+			SeedComments: cp.Comments,
+			Round:        cp.Round,
+			Checkpoint:   cp,
+		}
+	}
+	if a.args.Resume == nil {
+		return session.FileStart{Mode: session.ModeCold}
+	}
+	return session.PrepareFileStart(a.args.Resume, fingerprint, it.Path, session.PrepareOpts{
+		ResumeMode:   session.NormalizeResumeMode(a.args.ResumeMode),
+		CurrentModel: a.args.Model,
+		TemplateHash: a.templateHash(),
+	})
 }
 
 // whyExcluded mirrors agent.whyExcluded but for ScanItem inputs.
@@ -577,11 +628,14 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 		}
 	}
 
+	comments := a.args.CommentCollector.Comments()
 	failed := atomic.LoadInt64(&a.subtaskFailed)
 	if failed > 0 && failed == dispatched {
-		return nil, fmt.Errorf("all %d file scan(s) failed — check your LLM configuration and API key", dispatched)
+		// Still return any partial findings collected before timeout/failure so
+		// the CLI can persist and display them.
+		return comments, fmt.Errorf("all %d file scan(s) failed — check your LLM configuration and API key", dispatched)
 	}
-	return a.args.CommentCollector.Comments(), nil
+	return comments, nil
 }
 
 // resolveBatchStrategy reads the strategy from the scan template, defaulting
@@ -645,10 +699,35 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 			defer func() { <-sem }()
 
 			fingerprint := ScanItemFingerprint(it.Path)
+			start := a.prepareFileStart(it)
 
 			const maxRetries = 3
 			var lastErr error
 			for attempt := 0; attempt < maxRetries; attempt++ {
+				if attempt > 0 {
+					if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok && len(cp.Messages) > 0 {
+						start = session.FileStart{
+							Mode:         session.ModeContinue,
+							Messages:     cp.Messages,
+							PlanGuidance: cp.PlanGuidance,
+							SeedComments: cp.Comments,
+							Round:        cp.Round,
+							Checkpoint:   cp,
+						}
+						if reason := llm.RetryReason(lastErr); reason == llm.RetryReasonRateLimit {
+							select {
+							case <-time.After(2 * time.Second):
+							case <-ctx.Done():
+							}
+						}
+						fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask continuing from checkpoint for %s (batch #%d, attempt %d/%d, round %d)\n",
+							it.Path, batchIdx, attempt+1, maxRetries, cp.Round)
+					} else {
+						a.args.CommentCollector.RemoveByPath(it.Path)
+						start = session.FileStart{Mode: session.ModeCold}
+					}
+				}
+
 				var fileCtx context.Context
 				var cancel context.CancelFunc
 				if timeout > 0 {
@@ -658,7 +737,7 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 					fileCtx = ctx
 				}
 
-				lastErr = a.executeSubtask(fileCtx, it)
+				lastErr = a.executeSubtask(fileCtx, it, start)
 				if cancel != nil {
 					cancel()
 				}
@@ -667,34 +746,56 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 					break
 				}
 
-				shouldRetry := errors.Is(lastErr, context.DeadlineExceeded) ||
-					llm.IsRetryableHTTPStatus(lastErr)
+				reason := llm.RetryReason(lastErr)
+				shouldRetry := llm.IsRetryableLLMError(lastErr)
 				if !shouldRetry || attempt == maxRetries-1 {
+					if shouldRetry {
+						fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask exhausted retries for %s (batch #%d, %d attempt(s), reason=%s): %v\n",
+							it.Path, batchIdx, maxRetries, reason, lastErr)
+					}
+					// Permanent errors fall through to the failure path below (single log).
 					break
 				}
 
-				a.args.CommentCollector.RemoveByPath(it.Path)
-
-				if errors.Is(lastErr, context.DeadlineExceeded) {
+				switch reason {
+				case llm.RetryReasonTimeout:
 					fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask timeout for %s (batch #%d, attempt %d/%d), retrying with extended timeout...\n",
 						it.Path, batchIdx, attempt+1, maxRetries)
-				} else {
-					fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask rate-limited (429/502) for %s (batch #%d, attempt %d/%d), retrying...\n",
+				case llm.RetryReasonRateLimit:
+					fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask rate-limited (429/502/503) for %s (batch #%d, attempt %d/%d), retrying...\n",
 						it.Path, batchIdx, attempt+1, maxRetries)
+				default:
+					fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask retryable error for %s (batch #%d, attempt %d/%d, reason=%s): %v\n",
+						it.Path, batchIdx, attempt+1, maxRetries, reason, lastErr)
 				}
 			}
 
 			if lastErr != nil {
 				atomic.AddInt64(&a.subtaskFailed, 1)
 				comments := a.args.CommentCollector.CommentsForPath(it.Path)
+				reason := llm.RetryReason(lastErr)
+				status := session.CheckpointFailed
+				if reason == llm.RetryReasonTimeout {
+					status = session.CheckpointTimedOut
+				}
+				planGuidance := ""
+				round := 0
+				if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok {
+					planGuidance = cp.PlanGuidance
+					round = cp.Round
+					a.session.MarkCheckpointStopped(fingerprint, status, lastErr.Error())
+				}
+				a.session.RecordReviewItemPartial(it.Path, fingerprint, session.PhaseMain, planGuidance, lastErr.Error(), round, comments)
 				a.session.RecordReviewItemFailed(it.Path, it.Path, it.Path, fingerprint, lastErr.Error(), comments)
 				if a.args.OnFileDone != nil {
 					a.args.OnFileDone(it.Path, comments)
 				}
-				fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask error for %s (batch #%d): %v\n", it.Path, batchIdx, lastErr)
+				fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask error for %s (batch #%d, reason=%s): %v\n",
+					it.Path, batchIdx, reason, lastErr)
 				telemetry.ErrorEvent(context.WithoutCancel(ctx), "scan.subtask.error", lastErr,
 					telemetry.AnyToAttr("file.path", it.Path),
-					telemetry.AnyToAttr("batch.index", batchIdx))
+					telemetry.AnyToAttr("batch.index", batchIdx),
+					telemetry.AnyToAttr("error.reason", reason))
 				a.recordWarning("scan_subtask_error", it.Path, lastErr.Error())
 				return
 			}
@@ -720,7 +821,7 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 // is small enough that planning overhead outweighs gain, or the plan call
 // itself fails. Plan failure never blocks the main review — it falls back
 // to v1 (plan-less) behavior.
-func (a *Agent) executeSubtask(ctx context.Context, it model.ScanItem) error {
+func (a *Agent) executeSubtask(ctx context.Context, it model.ScanItem, start session.FileStart) error {
 	ctx, span := telemetry.StartSpan(ctx, "scan.subtask."+it.Path)
 	defer span.End()
 	telemetry.SetAttr(span, "file.path", it.Path)
@@ -729,14 +830,38 @@ func (a *Agent) executeSubtask(ctx context.Context, it model.ScanItem) error {
 		return ctx.Err()
 	}
 
+	fingerprint := ScanItemFingerprint(it.Path)
+	a.session.RecordFileStarted(it.Path, fingerprint, session.PhaseMain)
+	defer llmloop.ClearCheckpointHook(a.runner)
+
+	for _, cm := range start.SeedComments {
+		a.args.CommentCollector.Add(cm)
+	}
+
 	rule := ""
 	if a.args.SystemRule != nil {
 		rule = a.args.SystemRule.Resolve(strings.ToLower(it.Path))
 	}
 
-	planGuidance := a.maybeRunPlan(ctx, it, rule)
-
-	messages := a.renderMessages(it, rule, planGuidance)
+	var (
+		messages        []llm.Message
+		planGuidance    string
+		completedRounds int
+	)
+	if start.Mode == session.ModeContinue && len(start.Messages) > 0 {
+		messages = start.Messages
+		planGuidance = start.PlanGuidance
+		completedRounds = start.Round
+		fmt.Fprintf(stdout.Writer(), "[ocr] Mid-file continue %s from round %d (%d messages)\n",
+			it.Path, completedRounds, len(messages))
+	} else {
+		if start.PlanGuidance != "" {
+			planGuidance = start.PlanGuidance
+		} else {
+			planGuidance = a.maybeRunPlan(ctx, it, rule)
+		}
+		messages = a.renderMessages(it, rule, planGuidance)
+	}
 
 	tokenCount := llmloop.CountMessagesTokens(messages)
 	maxAllowed := a.args.Template.MaxTokens
@@ -752,6 +877,8 @@ func (a *Agent) executeSubtask(ctx context.Context, it model.ScanItem) error {
 		return nil
 	}
 
+	llmloop.BindSessionCheckpoint(a.runner, a.session, fingerprint, planGuidance, a.args.Model, a.templateHash())
+	a.runner.SetCompletedRounds(completedRounds)
 	completed, _, err := a.runner.RunPerFile(ctx, messages, it.Path)
 	if err != nil {
 		return err
@@ -787,11 +914,20 @@ func (a *Agent) maybeRunPlan(ctx context.Context, it model.ScanItem, rule string
 		messages = append(messages, llm.NewTextMessage(m.Role, content))
 	}
 
+	// Nested timeout on the parent ctx: plan deadline only cancels planCtx,
+	// leaving remaining fileCtx budget for main review. Parent cancel still
+	// propagates — do not use WithoutCancel here.
+	if ctx.Err() != nil {
+		return noPlan
+	}
+	planCtx, planCancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer planCancel()
+
 	fs := a.session.GetOrCreateFileSession(it.Path)
 	rec := fs.AppendTaskRecord(session.PlanTask, messages)
 	startTime := time.Now()
 
-	resp, err := a.args.LLMClient.CompletionsWithCtx(ctx, llm.ChatRequest{
+	resp, err := a.args.LLMClient.CompletionsWithCtx(planCtx, llm.ChatRequest{
 		Model:     a.args.Model,
 		Messages:  messages,
 		MaxTokens: a.args.Template.MaxTokens,
