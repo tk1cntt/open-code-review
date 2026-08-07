@@ -230,6 +230,9 @@ func executeReview(opts reviewOptions) error {
 			for _, m := range applyResult.Messages {
 				fmt.Fprintf(os.Stderr, "[ocr] apply %s: %s\n", filePath, m)
 			}
+			for _, s := range applyResult.Skipped {
+				fmt.Fprintf(os.Stderr, "[ocr] apply %s: skip %s\n", filePath, s)
+			}
 			if applyResult.Verify.OK && !applyResult.RolledBack {
 				fmt.Fprintf(os.Stderr, "[ocr] apply %d/%d suggestion(s) to %s; verify ok\n",
 					applyResult.AppliedCount, len(comments), filePath)

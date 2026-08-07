@@ -868,12 +868,17 @@ func (a *Agent) applyFileComments(ctx context.Context, relPath string, comments 
 		}
 	}
 	if len(actionable) == 0 {
+		fmt.Fprintf(stdout.Writer(), "[ocr] apply %s: nothing applied (%d comments, 0 actionable)\n",
+			relPath, len(comments))
 		return
 	}
 
 	res := crossfile.ApplyComments(a.args.RepoDir, actionable, a.args.ApplyRunTests)
 	for _, m := range res.Messages {
 		fmt.Fprintf(stdout.Writer(), "[ocr] apply %s: %s\n", relPath, m)
+	}
+	for _, s := range res.Skipped {
+		fmt.Fprintf(stdout.Writer(), "[ocr] apply %s: skip %s\n", relPath, s)
 	}
 	if res.Verify.OK && !res.RolledBack {
 		fmt.Fprintf(stdout.Writer(), "[ocr] apply %d/%d suggestion(s) to %s\n", res.AppliedCount, len(comments), relPath)

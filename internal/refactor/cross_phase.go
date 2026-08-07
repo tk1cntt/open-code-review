@@ -207,6 +207,9 @@ func (a *Agent) runCrossApply(ctx context.Context, plans []crossfile.RefactorPla
 		for _, m := range res.Messages {
 			fmt.Fprintf(stdout.Writer(), "[ocr] apply: %s\n", m)
 		}
+		for _, s := range res.Skipped {
+			fmt.Fprintf(stdout.Writer(), "[ocr] apply: skip %s\n", s)
+		}
 		if res.Verify.OK && !res.RolledBack {
 			fmt.Fprintf(stdout.Writer(), "[ocr] cross-file apply succeeded on attempt %d\n", attempt)
 			telemetry.Event(ctx, "refactor.cross_file.apply.ok",

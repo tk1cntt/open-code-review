@@ -145,8 +145,16 @@ func ApplyComments(repoDir string, comments []model.LlmComment, runTests bool) A
 	byPath := map[string]*grouped{}
 
 	for _, cm := range comments {
-		if cm.SuggestionCode == "" || cm.Path == "" || cm.StartLine <= 0 {
-			res.Skipped = append(res.Skipped, cm.Path+": no suggestion_code or invalid line numbers")
+		if cm.SuggestionCode == "" {
+			res.Skipped = append(res.Skipped, skipMsg(cm, "suggestion_code empty"))
+			continue
+		}
+		if cm.Path == "" {
+			res.Skipped = append(res.Skipped, skipMsg(cm, "path empty"))
+			continue
+		}
+		if cm.StartLine <= 0 {
+			res.Skipped = append(res.Skipped, skipMsg(cm, fmt.Sprintf("StartLine=%d (no line match)", cm.StartLine)))
 			continue
 		}
 		// Normalize unset or inverted EndLine to prevent capturing the entire file
@@ -163,7 +171,8 @@ func ApplyComments(repoDir string, comments []model.LlmComment, runTests bool) A
 	}
 
 	if len(byPath) == 0 {
-		res.Messages = append(res.Messages, "nothing applied (no actionable comments)")
+		res.Messages = append(res.Messages, fmt.Sprintf("nothing applied (%d comments, %d skipped, 0 actionable)",
+			len(comments), len(res.Skipped)))
 		res.Verify = VerifyResult{OK: true, Messages: res.Messages}
 		return res
 	}
@@ -246,7 +255,13 @@ func ApplyComments(repoDir string, comments []model.LlmComment, runTests bool) A
 	}
 
 	if len(res.Written) == 0 {
-		res.Messages = append(res.Messages, "nothing applied (all comments skipped)")
+		// All actionable comments were skipped (overlap or other per-path reasons).
+		totalActionable := 0
+		for _, g := range byPath {
+			totalActionable += len(g.comments)
+		}
+		res.Messages = append(res.Messages, fmt.Sprintf("nothing applied (%d comments, %d skipped, %d actionable → 0 applied)",
+			len(comments), len(res.Skipped), totalActionable))
 		res.Verify = VerifyResult{OK: true, Messages: res.Messages}
 		return res
 	}
@@ -262,6 +277,15 @@ func ApplyComments(repoDir string, comments []model.LlmComment, runTests bool) A
 	res.Messages = append(res.Messages, fmt.Sprintf("applied %d file(s); verify ok", len(res.Written)))
 	res.Messages = append(res.Messages, v.Messages...)
 	return res
+}
+
+// skipMsg formats a skip reason with path context for diagnostic logging.
+func skipMsg(cm model.LlmComment, reason string) string {
+	path := cm.Path
+	if path == "" {
+		path = "(unknown)"
+	}
+	return fmt.Sprintf("%s: %s", path, reason)
 }
 
 // replaceLineRange replaces lines [startLine, endLine] (1-indexed, inclusive)
