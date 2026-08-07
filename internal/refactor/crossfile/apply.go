@@ -17,11 +17,12 @@ type backupEntry struct {
 
 // ApplyResult summarizes a multi-file apply attempt.
 type ApplyResult struct {
-	Written    []string
-	Skipped    []string
-	Verify     VerifyResult
-	RolledBack bool
-	Messages   []string
+	Written      []string
+	Skipped      []string
+	Verify       VerifyResult
+	RolledBack   bool
+	Messages     []string
+	AppliedCount int // number of suggestion_code items actually applied (not file count)
 }
 
 // ApplyPlanSteps writes suggestion_code from plan steps under repoDir.
@@ -241,6 +242,7 @@ func ApplyComments(repoDir string, comments []model.LlmComment, runTests bool) A
 			return res
 		}
 		res.Written = append(res.Written, relPath)
+		res.AppliedCount += len(g.comments)
 	}
 
 	if len(res.Written) == 0 {

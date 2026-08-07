@@ -231,8 +231,8 @@ func executeReview(opts reviewOptions) error {
 				fmt.Fprintf(os.Stderr, "[ocr] apply %s: %s\n", filePath, m)
 			}
 			if applyResult.Verify.OK && !applyResult.RolledBack {
-				fmt.Fprintf(os.Stderr, "[ocr] applied %d suggestion(s) to %s; verify ok\n",
-					len(applyResult.Written), filePath)
+				fmt.Fprintf(os.Stderr, "[ocr] apply %d/%d suggestion(s) to %s; verify ok\n",
+					applyResult.AppliedCount, len(comments), filePath)
 			} else if len(applyResult.Written) > 0 {
 				fmt.Fprintf(os.Stderr, "[ocr] WARNING: apply+verify failed for %s (rolled back)\n", filePath)
 			}

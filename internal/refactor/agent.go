@@ -876,7 +876,7 @@ func (a *Agent) applyFileComments(ctx context.Context, relPath string, comments 
 		fmt.Fprintf(stdout.Writer(), "[ocr] apply %s: %s\n", relPath, m)
 	}
 	if res.Verify.OK && !res.RolledBack {
-		fmt.Fprintf(stdout.Writer(), "[ocr] applied %d suggestion(s) to %s\n", len(res.Written), relPath)
+		fmt.Fprintf(stdout.Writer(), "[ocr] apply %d/%d suggestion(s) to %s\n", res.AppliedCount, len(comments), relPath)
 	} else {
 		fmt.Fprintf(stdout.Writer(), "[ocr] WARNING: apply+verify failed for %s (rolled back)\n", relPath)
 	}
