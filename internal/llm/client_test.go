@@ -1359,6 +1359,9 @@ func TestNewLLMClient_OpenAIAliasDispatchesToOpenAIClient(t *testing.T) {
 }
 
 func typeName(v any) string {
+	if rc, ok := v.(*retryClient); ok {
+		return fmt.Sprintf("%T", rc.inner)
+	}
 	return fmt.Sprintf("%T", v)
 }
 
@@ -1383,5 +1386,91 @@ func TestStripThinkTags(t *testing.T) {
 				t.Errorf("stripThinkTags(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIsDeadlineExceeded(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"plain deadline", context.DeadlineExceeded, true},
+		{"wrapped deadline", fmt.Errorf("LLM completion error: %w", context.DeadlineExceeded), true},
+		{"string deadline", errors.New("post \"https://api\": context deadline exceeded"), true},
+		{"i/o timeout", errors.New("read tcp 1.2.3.4:443: i/o timeout"), true},
+		{"client timeout", errors.New("net/http: request canceled (Client.Timeout exceeded while awaiting headers)"), true},
+		{"canceled not deadline", context.Canceled, false},
+		{"auth error", errors.New("401 Unauthorized: invalid api key"), false},
+		{"task failed", errors.New("task failed: model gave up"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsDeadlineExceeded(tt.err); got != tt.want {
+				t.Errorf("IsDeadlineExceeded(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsRetryableLLMError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"deadline", context.DeadlineExceeded, true},
+		{"wrapped deadline", fmt.Errorf("LLM completion error: %w", context.DeadlineExceeded), true},
+		{"429", errors.New("error status 429: rate_limit_error"), true},
+		{"502", errors.New("POST /v1/messages: 502 Bad Gateway"), true},
+		{"503", errors.New("status 503: service unavailable"), true},
+		{"unexpected eof", io.ErrUnexpectedEOF, true},
+		{"connection reset", errors.New("read: connection reset by peer"), true},
+		{"canceled", context.Canceled, false},
+		{"wrapped cancel", fmt.Errorf("LLM completion error: %w", context.Canceled), false},
+		{"401", errors.New("401 Unauthorized"), false},
+		{"400", errors.New("400 invalid_request_error: max_tokens too large"), false},
+		{"task failed", errors.New("task failed: analysis incomplete"), false},
+		{"generic", errors.New("something went wrong"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsRetryableLLMError(tt.err); got != tt.want {
+				t.Errorf("IsRetryableLLMError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRetryReason(t *testing.T) {
+	tests := []struct {
+		err  error
+		want string
+	}{
+		{nil, "none"},
+		{context.Canceled, "canceled"},
+		{context.DeadlineExceeded, "timeout"},
+		{errors.New("429 too many requests"), "rate_limit"},
+		{errors.New("connection reset by peer"), "network"},
+		{errors.New("401 unauthorized"), "non_retryable"},
+		{errors.New("task failed: boom"), "non_retryable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want+"_"+fmt.Sprintf("%v", tt.err), func(t *testing.T) {
+			if got := RetryReason(tt.err); got != tt.want {
+				t.Errorf("RetryReason(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsRetryableHTTPStatus_Includes503(t *testing.T) {
+	if !IsRetryableHTTPStatus(errors.New("503 Service Unavailable")) {
+		t.Fatal("expected 503 to be retryable")
+	}
+	if IsRetryableHTTPStatus(errors.New("401 Unauthorized")) {
+		t.Fatal("401 must not be retryable via HTTP status helper")
 	}
 }

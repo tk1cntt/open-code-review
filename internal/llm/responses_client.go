@@ -91,6 +91,11 @@ func (c *OpenAIResponsesClient) CompletionsWithCtx(ctx context.Context, req Chat
 		}
 		opts = append(opts, openaiopt.WithJSONSet(k, v))
 	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > c.cfg.Timeout {
+			opts = append(opts, openaiopt.WithRequestTimeout(remaining))
+		}
+	}
 
 	sdkResp, err := c.sdk.Responses.New(ctx, params, opts...)
 	if err != nil {

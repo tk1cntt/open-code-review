@@ -270,16 +270,127 @@ func (rc *retryClient) CompletionsWithCtx(ctx context.Context, req ChatRequest) 
 }
 
 // IsRetryableHTTPStatus reports whether err was caused by an HTTP 429 (Too Many
-// Requests) or 502 (Bad Gateway) response. It detects the status code by
-// inspecting the error string, which works across all three SDKs (OpenAI Chat
-// Completions, OpenAI Responses, and Anthropic) without importing SDK-internal
-// error types.
+// Requests), 502 (Bad Gateway), or 503 (Service Unavailable) response. It
+// detects the status code by inspecting the error string, which works across
+// all three SDKs (OpenAI Chat Completions, OpenAI Responses, and Anthropic)
+// without importing SDK-internal error types.
 func IsRetryableHTTPStatus(err error) bool {
 	if err == nil {
 		return false
 	}
 	s := err.Error()
-	return strings.Contains(s, "429") || strings.Contains(s, "502")
+	return strings.Contains(s, "429") || strings.Contains(s, "502") || strings.Contains(s, "503")
+}
+
+// IsDeadlineExceeded reports whether err was caused by a context deadline
+// exceeded or an HTTP/transport timeout. This checks errors.Is (for unwrapped
+// cases), net.Error.Timeout(), and the error string (for SDK-wrapped cases
+// where the original context error is buried inside an *apierror.Error or
+// similar type that does not implement Unwrap).
+func IsDeadlineExceeded(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// Prefer structured timeout detection when the error chain implements it.
+	var netTimeout interface{ Timeout() bool }
+	if errors.As(err, &netTimeout) && netTimeout.Timeout() {
+		return true
+	}
+	// errors.Is/As fail when the SDK wraps the HTTP transport error inside a
+	// custom error type that does not implement Unwrap() (e.g. Anthropic SDK
+	// v1.x generated code). Fall back to inspecting the error string.
+	s := err.Error()
+	if strings.Contains(s, "deadline exceeded") {
+		return true
+	}
+	if strings.Contains(s, "i/o timeout") {
+		return true
+	}
+	if strings.Contains(s, "Client.Timeout exceeded") {
+		return true
+	}
+	return false
+}
+
+// IsContextCanceled reports whether err is (or wraps) context.Canceled.
+func IsContextCanceled(err error) bool {
+	return err != nil && errors.Is(err, context.Canceled)
+}
+
+// IsRetryableLLMError reports whether a subtask/LLM error is safe to retry at
+// the per-file dispatcher layer. Only transient failures are allowlisted:
+// deadlines/timeouts, rate-limit/bad-gateway, and a few common network blips.
+//
+// Permanent failures must NOT be retried: auth (401/403), bad request (400),
+// context cancellation, and application-level "task failed" outcomes. Retrying
+// those multiplies latency, amplifies rate limits, and obscures the real error.
+func IsRetryableLLMError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if IsContextCanceled(err) {
+		return false
+	}
+	if IsDeadlineExceeded(err) {
+		return true
+	}
+	if IsRetryableHTTPStatus(err) {
+		return true
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	// Narrow network blips frequently seen from SDKs / proxies.
+	switch {
+	case strings.Contains(s, "connection reset"):
+		return true
+	case strings.Contains(s, "connection refused"):
+		return true
+	case strings.Contains(s, "broken pipe"):
+		return true
+	case strings.Contains(s, "tls handshake timeout"):
+		return true
+	case strings.Contains(s, "temporary failure in name resolution"):
+		return true
+	case strings.Contains(s, "no such host"):
+		return true
+	default:
+		return false
+	}
+}
+
+// Retry reason constants — use these instead of string matching on RetryReason().
+const (
+	RetryReasonTimeout       = "timeout"
+	RetryReasonRateLimit     = "rate_limit"
+	RetryReasonNetwork       = "network"
+	RetryReasonCanceled      = "canceled"
+	RetryReasonNonRetryable  = "non_retryable"
+	RetryReasonNone          = "none"
+)
+
+// RetryReason returns a short stable label for logging retry decisions.
+func RetryReason(err error) string {
+	if err == nil {
+		return RetryReasonNone
+	}
+	if IsContextCanceled(err) {
+		return RetryReasonCanceled
+	}
+	if IsDeadlineExceeded(err) {
+		return RetryReasonTimeout
+	}
+	if IsRetryableHTTPStatus(err) {
+		return RetryReasonRateLimit
+	}
+	if IsRetryableLLMError(err) {
+		return RetryReasonNetwork
+	}
+	return RetryReasonNonRetryable
 }
 
 // --- Token counting with tiktoken ---
@@ -416,6 +527,11 @@ func (c *OpenAIClient) CompletionsWithCtx(ctx context.Context, req ChatRequest) 
 			continue
 		}
 		opts = append(opts, openaiopt.WithJSONSet(k, v))
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > c.cfg.Timeout {
+			opts = append(opts, openaiopt.WithRequestTimeout(remaining))
+		}
 	}
 	if stream, ok := c.cfg.ExtraBody["stream"].(bool); ok && stream {
 		return c.completionsStreaming(ctx, params, opts...)
@@ -726,6 +842,11 @@ func (c *AnthropicClient) CompletionsWithCtx(ctx context.Context, req ChatReques
 			continue
 		}
 		opts = append(opts, option.WithJSONSet(k, v))
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > c.cfg.Timeout {
+			opts = append(opts, option.WithRequestTimeout(remaining))
+		}
 	}
 
 	sdkResp, err := c.sdk.Messages.New(ctx, params, opts...)

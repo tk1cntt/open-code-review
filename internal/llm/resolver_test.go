@@ -1363,12 +1363,16 @@ func TestNewLLMClient_TimeoutForwarded(t *testing.T) {
 
 	// Verify the client was created (we can't easily inspect the internal timeout,
 	// but we can verify the client is functional and was constructed without error).
-	if oc, ok := client.(*OpenAIClient); ok {
-		if oc.cfg.Timeout != 2*time.Minute {
-			t.Errorf("OpenAIClient cfg.Timeout = %v, want %v", oc.cfg.Timeout, 2*time.Minute)
-		}
-	} else {
-		t.Errorf("expected *OpenAIClient, got %T", client)
+	rc, ok := client.(*retryClient)
+	if !ok {
+		t.Fatalf("expected *retryClient, got %T", client)
+	}
+	oc, ok := rc.inner.(*OpenAIClient)
+	if !ok {
+		t.Fatalf("expected *OpenAIClient inner, got %T", rc.inner)
+	}
+	if oc.cfg.Timeout != 2*time.Minute {
+		t.Errorf("OpenAIClient cfg.Timeout = %v, want %v", oc.cfg.Timeout, 2*time.Minute)
 	}
 }
 
@@ -1381,10 +1385,16 @@ func TestNewLLMClient_DefaultTimeout(t *testing.T) {
 	}
 
 	client := NewLLMClient(ep)
-	if oc, ok := client.(*OpenAIClient); ok {
-		if oc.cfg.Timeout != 5*time.Minute {
-			t.Errorf("OpenAIClient cfg.Timeout = %v, want default %v", oc.cfg.Timeout, 5*time.Minute)
-		}
+	rc, ok := client.(*retryClient)
+	if !ok {
+		t.Fatalf("expected *retryClient, got %T", client)
+	}
+	oc, ok := rc.inner.(*OpenAIClient)
+	if !ok {
+		t.Fatalf("expected *OpenAIClient inner, got %T", rc.inner)
+	}
+	if oc.cfg.Timeout != 5*time.Minute {
+		t.Errorf("OpenAIClient cfg.Timeout = %v, want default %v", oc.cfg.Timeout, 5*time.Minute)
 	}
 }
 
