@@ -12,6 +12,7 @@ import (
 
 	"github.com/alibaba/open-code-review/internal/agent"
 	"github.com/alibaba/open-code-review/internal/diff"
+	"github.com/alibaba/open-code-review/internal/llm"
 	"github.com/alibaba/open-code-review/internal/mcp"
 	"github.com/alibaba/open-code-review/internal/model"
 	"github.com/alibaba/open-code-review/internal/refactor/crossfile"
@@ -38,6 +39,7 @@ type reviewOptions struct {
 	audience            string
 	background          string
 	backgroundFile      string
+	provider            string
 	model               string
 	concurrency         int
 	perFileTimeout      int
@@ -150,9 +152,16 @@ func executeReview(opts reviewOptions) error {
 		return runPreview(cc, opts)
 	}
 
-	rt, err := loadLLMRuntime(cc.Template, opts.toolConfigPath, opts.model)
+	rt, err := loadLLMRuntime(cc.Template, opts.toolConfigPath, llm.ResolveOptions{
+		Provider: opts.provider,
+		Model:    opts.model,
+	})
 	if err != nil {
 		return err
+	}
+	llmIdentity := &jsonLLMIdentity{
+		Provider: rt.Provider,
+		Model:    rt.Model,
 	}
 
 	mode := tool.ParseReviewMode(opts.from, opts.to, opts.commit)
@@ -297,14 +306,14 @@ func executeReview(opts reviewOptions) error {
 	// error so JSON consumers retain the complete coverage diagnosis.
 	var emitErr error
 	if manifest != nil || runErr == nil {
-		emitErr = emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q)
+		emitErr = emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity)
 		if emitErr != nil {
 			emitErr = fmt.Errorf("emit review result: %w", emitErr)
 		}
 	}
 	if resultErr != nil {
 		q.Restore()
-		emitFailureUsage(ag, duration, opts.outputFormat)
+		emitFailureUsage(ag, duration, opts.outputFormat, llmIdentity)
 		if id := ag.SessionID(); id != "" {
 			fmt.Fprintf(os.Stderr, "[ocr] Session: %s (retry with: --resume %s)\n", id, id)
 		}

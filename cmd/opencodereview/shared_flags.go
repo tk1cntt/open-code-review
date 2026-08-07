@@ -51,6 +51,10 @@ func addModelFlag(cmd *cobra.Command, target *string) {
 	cmd.Flags().StringVar(target, "model", "", "override LLM model for this run (e.g., claude-opus-4-6)")
 }
 
+func addProviderFlag(cmd *cobra.Command, target *string) {
+	cmd.Flags().StringVar(target, "provider", "", "override configured LLM provider for this run")
+}
+
 func addToolsFlag(cmd *cobra.Command, target *string) {
 	cmd.Flags().StringVar(target, "tools", "", "path to JSON tools config file (default: embedded)")
 }
@@ -171,6 +175,7 @@ func registerReviewFlags(cmd *cobra.Command, opts *reviewOptions) {
 	addOutputFlags(cmd, &opts.outputFormat, &opts.audience)
 	addConcurrencyFlags(cmd, &opts.concurrency, &opts.perFileTimeout, &opts.maxTools, &opts.maxGitProcs, &opts.maxTokensBudget)
 	addBackgroundFlags(cmd, &opts.background, &opts.backgroundFile)
+	addProviderFlag(cmd, &opts.provider)
 	addModelFlag(cmd, &opts.model)
 	addPreviewFlag(cmd, &opts.preview)
 	cmd.Flags().StringVar(&opts.rulesDir, "rules-dir", "", "directory with enterprise/project review rules (env: OCR_RULES_DIR)")
@@ -211,6 +216,7 @@ func registerScanFlags(cmd *cobra.Command, opts *scanOptions) {
 	cmd.Flags().BoolVar(&opts.noSummary, "no-summary", false, "skip the post-run PROJECT_SUMMARY_TASK")
 	cmd.Flags().StringVar(&opts.batch, "batch", "", "override BATCH_STRATEGY: none | by-language | by-directory")
 	addModelFlag(cmd, &opts.model)
+	addProviderFlag(cmd, &opts.provider)
 	cmd.RegisterFlagCompletionFunc("batch", completeEnum("none", "by-language", "by-directory"))
 }
 
@@ -245,6 +251,7 @@ func registerRefactorFlags(cmd *cobra.Command, opts *refactorOptions) {
 	cmd.Flags().BoolVar(&opts.apply, "apply", false, "apply cross-file architect plans that include suggestion_code (verify+rollback; default false)")
 	cmd.Flags().BoolVar(&opts.applyRunTests, "apply-run-tests", false, "when --apply, also run go test on touched packages during verify")
 	addModelFlag(cmd, &opts.model)
+	addProviderFlag(cmd, &opts.provider)
 	cmd.Flags().StringVar(&opts.resume, "resume", "", "resume from a previous refactoring session id")
 	cmd.Flags().StringVar(&opts.resumeMode, "resume-mode", "continue", "resume mode: continue (mid-file checkpoint) or restart-failed (cold retry)")
 	cmd.RegisterFlagCompletionFunc("resume-mode", completeEnum("continue", "restart-failed"))

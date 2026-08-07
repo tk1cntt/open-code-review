@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alibaba/open-code-review/internal/config/template"
+	"github.com/alibaba/open-code-review/internal/llm"
 	"github.com/alibaba/open-code-review/internal/llmloop"
 	"github.com/alibaba/open-code-review/internal/model"
 	"github.com/alibaba/open-code-review/internal/refactor"
@@ -27,6 +28,7 @@ type refactorOptions struct {
 	resultDir, resultProject                           string
 	concurrency, perFileTimeout, maxTools, maxGitProcs, maxTokensBudget int
 	noPlan                                                               bool
+	provider                                            string
 	model                                              string
 	showHelp                                           bool
 	preview                                            bool
@@ -119,9 +121,16 @@ func executeRefactor(opts refactorOptions) error {
 		return err
 	}
 
-	rt, err := loadLLMRuntime(cc.Template, opts.toolConfigPath, opts.model)
+	rt, err := loadLLMRuntime(cc.Template, opts.toolConfigPath, llm.ResolveOptions{
+		Provider: opts.provider,
+		Model:    opts.model,
+	})
 	if err != nil {
 		return err
+	}
+	llmIdentity := &jsonLLMIdentity{
+		Provider: rt.Provider,
+		Model:    rt.Model,
 	}
 	if rt.AppCfg != nil {
 		refactorTpl.ApplyLanguage(rt.AppCfg.Language)
@@ -239,7 +248,7 @@ func executeRefactor(opts refactorOptions) error {
 			fmt.Fprintf(os.Stderr, "[ocr] Wrote %d partial finding(s) before failure\n", len(comments))
 		}
 		// Emit partial stdout/json (comments + token summary) even on hard failure.
-		if emitErr := emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q); emitErr != nil {
+		if emitErr := emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity); emitErr != nil {
 			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to emit partial refactor result: %v\n", emitErr)
 		}
 		return fmt.Errorf("refactor failed: %w", err)
@@ -251,7 +260,7 @@ func executeRefactor(opts refactorOptions) error {
 		}
 	}
 
-	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q)
+	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity)
 }
 
 // persistRefactorOutputs writes JSON/markdown/per-file artifacts for both

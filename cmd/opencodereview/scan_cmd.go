@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alibaba/open-code-review/internal/config/template"
+	"github.com/alibaba/open-code-review/internal/llm"
 	"github.com/alibaba/open-code-review/internal/llmloop"
 	"github.com/alibaba/open-code-review/internal/model"
 	"github.com/alibaba/open-code-review/internal/reviewstore"
@@ -46,6 +47,7 @@ type scanOptions struct {
 	noSummary       bool
 	batch           string
 	maxTokensBudget int
+	provider        string
 	model           string
 }
 
@@ -222,9 +224,16 @@ func executeScan(opts scanOptions) error {
 		return err
 	}
 
-	rt, err := loadLLMRuntime(cc.Template, opts.toolConfigPath, opts.model)
+	rt, err := loadLLMRuntime(cc.Template, opts.toolConfigPath, llm.ResolveOptions{
+		Provider: opts.provider,
+		Model:    opts.model,
+	})
 	if err != nil {
 		return err
+	}
+	llmIdentity := &jsonLLMIdentity{
+		Provider: rt.Provider,
+		Model:    rt.Model,
 	}
 	// Apply language to the scan template too (loadLLMRuntime only mutates
 	// the diff-review template it was handed).
@@ -343,7 +352,7 @@ func executeScan(opts scanOptions) error {
 		if len(comments) > 0 {
 			fmt.Fprintf(os.Stderr, "[ocr] Wrote %d partial finding(s) before failure\n", len(comments))
 		}
-		if emitErr := emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q); emitErr != nil {
+		if emitErr := emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity); emitErr != nil {
 			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to emit partial scan result: %v\n", emitErr)
 		}
 		return fmt.Errorf("scan failed: %w", err)
@@ -355,7 +364,7 @@ func executeScan(opts scanOptions) error {
 		}
 	}
 
-	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q)
+	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity)
 }
 
 func persistScanOutputs(
