@@ -26,6 +26,21 @@ import (
 	"github.com/alibaba/open-code-review/internal/tool"
 )
 
+// ctxKeyResumeSessionID is a context key used to pass the session ID from
+// executeXxx() back to main() for the Ctrl+C resume hint. The value is a
+// *string pointer main() creates and executeXxx() writes into.
+type ctxKeyResumeSessionID struct{}
+
+// setResumeSessionID writes sessionID into the context value. No-op if the
+// context was not set up with a *string (e.g., during tests or previews).
+func setResumeSessionID(ctx context.Context, sessionID string) {
+	if v := ctx.Value(ctxKeyResumeSessionID{}); v != nil {
+		if ptr, ok := v.(*string); ok && ptr != nil {
+			*ptr = sessionID
+		}
+	}
+}
+
 // commonContext bundles the state that both `ocr review` and `ocr scan`
 // need to load *before* deciding whether to dispatch a preview or a real
 // LLM session: a validated template, the resolved repo path, review rules,

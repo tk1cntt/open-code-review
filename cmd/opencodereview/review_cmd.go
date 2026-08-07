@@ -246,6 +246,7 @@ func executeReview(ctx context.Context, opts reviewOptions) error {
 	// Use the session ID as the review result ID so --resume and review
 	// result persistence share one consistent identifier.
 	reviewID := ag.SessionID()
+	setResumeSessionID(ctx, reviewID)
 	if opts.savePerFile {
 		if opts.resultDir == "" {
 			opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")

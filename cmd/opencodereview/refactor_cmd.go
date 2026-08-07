@@ -185,6 +185,7 @@ func executeRefactor(ctx context.Context, opts refactorOptions) error {
 	// Use the session ID as the review result ID so --resume and review
 	// result persistence share one consistent identifier.
 	reviewID := ag.SessionID()
+	setResumeSessionID(ctx, reviewID)
 	if opts.savePerFile {
 		if opts.resultDir == "" {
 			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {

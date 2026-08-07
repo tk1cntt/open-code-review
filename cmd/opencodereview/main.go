@@ -27,6 +27,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
+	// Store session ID for Ctrl+C resume hint. executeXxx() writes the
+	// session ID into this pointer after creating the agent, so main() can
+	// display it directly when the user interrupts.
+	var resumeSessionID string
+	ctx = context.WithValue(ctx, ctxKeyResumeSessionID{}, &resumeSessionID)
+
 	if telemetry.Init(ctx) {
 		// Use context.Background() for the shutdown timeout: the signal-aware
 		// ctx may already be cancelled by the time this defer runs, which would
@@ -40,8 +46,12 @@ func main() {
 	if err := rootCmd.Execute(); err != nil {
 		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 			fmt.Fprintf(os.Stderr, "\n[ocr] Interrupted by user (Ctrl+C). Checkpoint saved — you can resume with:\n")
-			fmt.Fprintf(os.Stderr, "[ocr]   ocr session list    (to see all sessions)\n")
-			fmt.Fprintf(os.Stderr, "[ocr]   ocr <review|scan|refactor> --resume <session-id>\n")
+			if resumeSessionID != "" {
+				fmt.Fprintf(os.Stderr, "[ocr]   ocr --resume %s\n", resumeSessionID)
+			} else {
+				fmt.Fprintf(os.Stderr, "[ocr]   ocr session list    (to see all sessions)\n")
+				fmt.Fprintf(os.Stderr, "[ocr]   ocr <review|scan|refactor> --resume <session-id>\n")
+			}
 		}
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
