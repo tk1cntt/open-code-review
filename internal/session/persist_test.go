@@ -241,6 +241,7 @@ func TestSessionFilePermissions(t *testing.T) {
 func TestFinalizeSurfacesWriterCreationErrorWithoutStdout(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome) // Windows uses USERPROFILE for UserHomeDir
 
 	// A regular file at this path makes creation of the sessions directory fail
 	// deterministically on every platform.

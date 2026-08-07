@@ -71,6 +71,10 @@ type SessionHistory struct {
 	// rather than a later call falsely reporting success. Read only after
 	// finalizeOnce.Do returns, which establishes the happens-before.
 	finalizeErr error
+
+	// liveCheckpoints holds the latest mid-file conversation checkpoint per
+	// fingerprint for same-run continue-from-checkpoint retries.
+	liveCheckpoints map[string]ConversationCheckpoint
 }
 
 // FileSession represents the conversation records for a single file subtask.
@@ -253,6 +257,7 @@ func (sh *SessionHistory) RecordReviewItemDone(filePath, oldPath, newPath, finge
 	if p := sh.persist; p != nil {
 		p.WriteReviewItemDone(filePath, oldPath, newPath, fingerprint, comments)
 	}
+	sh.ClearConversationCheckpoint(fingerprint)
 }
 
 // RecordReviewItemReused records that this run reused a checkpoint from another session.
@@ -286,6 +291,113 @@ func (sh *SessionHistory) RecordReviewItemFailed(filePath, oldPath, newPath, fin
 	}
 	if p := sh.persist; p != nil {
 		p.WriteReviewItemFailed(filePath, oldPath, newPath, fingerprint, errorMsg, comments)
+	}
+}
+
+// RecordFileStarted writes a file_started record for crash diagnostics / UI.
+func (sh *SessionHistory) RecordFileStarted(filePath, fingerprint, phase string) {
+	if sh == nil {
+		return
+	}
+	if filePath != "" {
+		sh.GetOrCreateFileSession(filePath)
+	}
+	if p := sh.persist; p != nil {
+		p.WriteFileStarted(filePath, fingerprint, phase)
+	}
+}
+
+// SaveConversationCheckpoint persists a mid-file checkpoint and updates the
+// in-memory map used by same-run retries.
+func (sh *SessionHistory) SaveConversationCheckpoint(cp ConversationCheckpoint) {
+	if sh == nil || cp.Fingerprint == "" {
+		return
+	}
+	if cp.Status == "" {
+		cp.Status = CheckpointInProgress
+	}
+	if cp.Phase == "" {
+		cp.Phase = PhaseMain
+	}
+	cp.Messages = copyMessages(cp.Messages)
+	cp.Comments = copyLlmComments(cp.Comments)
+	if cp.CommentFingerprints == nil {
+		cp.CommentFingerprints = CommentFingerprints(cp.Comments)
+	}
+
+	sh.mu.Lock()
+	if sh.liveCheckpoints == nil {
+		sh.liveCheckpoints = make(map[string]ConversationCheckpoint)
+	}
+	sh.liveCheckpoints[cp.Fingerprint] = cp
+	p := sh.persist
+	sh.mu.Unlock()
+
+	if p != nil {
+		p.WriteConversationCheckpoint(cp)
+	}
+}
+
+// LastConversationCheckpoint returns the latest in-memory checkpoint for fingerprint.
+func (sh *SessionHistory) LastConversationCheckpoint(fingerprint string) (ConversationCheckpoint, bool) {
+	if sh == nil || fingerprint == "" {
+		return ConversationCheckpoint{}, false
+	}
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	cp, ok := sh.liveCheckpoints[fingerprint]
+	if !ok {
+		return ConversationCheckpoint{}, false
+	}
+	cp.Messages = copyMessages(cp.Messages)
+	cp.Comments = copyLlmComments(cp.Comments)
+	return cp, true
+}
+
+// ClearConversationCheckpoint drops the in-memory checkpoint after success.
+func (sh *SessionHistory) ClearConversationCheckpoint(fingerprint string) {
+	if sh == nil || fingerprint == "" {
+		return
+	}
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	delete(sh.liveCheckpoints, fingerprint)
+}
+
+// RecordReviewItemPartial writes a lightweight partial findings record.
+func (sh *SessionHistory) RecordReviewItemPartial(filePath, fingerprint, phase, planGuidance, stopReason string, round int, comments []model.LlmComment) {
+	if sh == nil {
+		return
+	}
+	if filePath != "" {
+		sh.GetOrCreateFileSession(filePath)
+	}
+	if p := sh.persist; p != nil {
+		p.WriteReviewItemPartial(filePath, fingerprint, phase, planGuidance, stopReason, round, comments)
+	}
+}
+
+// MarkCheckpointStopped updates the latest checkpoint status (timeout/failed)
+// without claiming a half-finished LLM round: messages stay at last success.
+func (sh *SessionHistory) MarkCheckpointStopped(fingerprint, status, stopReason string) {
+	if sh == nil || fingerprint == "" {
+		return
+	}
+	sh.mu.Lock()
+	cp, ok := sh.liveCheckpoints[fingerprint]
+	if !ok {
+		sh.mu.Unlock()
+		return
+	}
+	cp.Status = status
+	cp.StopReason = stopReason
+	cp.Messages = copyMessages(cp.Messages)
+	cp.Comments = copyLlmComments(cp.Comments)
+	sh.liveCheckpoints[fingerprint] = cp
+	p := sh.persist
+	sh.mu.Unlock()
+	if p != nil {
+		p.WriteConversationCheckpoint(cp)
 	}
 }
 

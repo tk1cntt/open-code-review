@@ -136,6 +136,13 @@ func (jw *jsonlWriter) writeRecordLocked(rec map[string]any) {
 	jw.writer.WriteByte('\n')
 }
 
+// flushLocked flushes the buffered writer. Caller must hold jw.mu.
+func (jw *jsonlWriter) flushLocked() {
+	if jw.writer != nil {
+		_ = jw.writer.Flush()
+	}
+}
+
 // WriteSessionStart writes the initial session_start record.
 func (jw *jsonlWriter) WriteSessionStart(startTime time.Time) string {
 	uuid := generateUUID()
@@ -216,14 +223,13 @@ func (jw *jsonlWriter) writeReviewItemRecord(recordType, filePath, oldPath, newP
 		rec["error"] = errorMsg
 	}
 	jw.writeRecordLocked(rec)
-	if jw.writer != nil {
-		jw.writer.Flush()
-	}
+	jw.flushLocked()
 	jw.lastUUID = uuid
 	return uuid
 }
 
 // WriteLLMRequest writes a request entry with the resolved messages.
+// Flushed immediately so mid-file resume can recover after a crash/timeout.
 func (jw *jsonlWriter) WriteLLMRequest(filePath string, taskType TaskType, requestNo int, messages any) string {
 	uuid := generateUUID()
 
@@ -241,11 +247,13 @@ func (jw *jsonlWriter) WriteLLMRequest(filePath string, taskType TaskType, reque
 		"messages":   messages,
 	}
 	jw.writeRecordLocked(rec)
+	jw.flushLocked()
 	jw.lastUUID = uuid
 	return uuid
 }
 
 // WriteLLMResponse writes a response entry with model, content, tool calls, usage.
+// Flushed immediately for crash durability.
 func (jw *jsonlWriter) WriteLLMResponse(filePath string, taskType TaskType, content string, toolCalls []map[string]any, model string, usage TokenUsage, duration time.Duration) string {
 	uuid := generateUUID()
 
@@ -271,11 +279,13 @@ func (jw *jsonlWriter) WriteLLMResponse(filePath string, taskType TaskType, cont
 		},
 	}
 	jw.writeRecordLocked(rec)
+	jw.flushLocked()
 	jw.lastUUID = uuid
 	return uuid
 }
 
 // WriteLLMError writes an llm_error entry recording a failed LLM request.
+// Flushed immediately for crash durability.
 func (jw *jsonlWriter) WriteLLMError(filePath string, taskType TaskType, requestNo int, errorMsg string, duration time.Duration) string {
 	uuid := generateUUID()
 
@@ -294,11 +304,13 @@ func (jw *jsonlWriter) WriteLLMError(filePath string, taskType TaskType, request
 		"duration_ms": duration.Milliseconds(),
 	}
 	jw.writeRecordLocked(rec)
+	jw.flushLocked()
 	jw.lastUUID = uuid
 	return uuid
 }
 
 // WriteToolCall writes a tool call result entry.
+// Flushed immediately for crash durability.
 func (jw *jsonlWriter) WriteToolCall(filePath string, taskType TaskType, toolName, arguments, result string, ok bool, duration time.Duration) string {
 	uuid := generateUUID()
 
@@ -319,6 +331,94 @@ func (jw *jsonlWriter) WriteToolCall(filePath string, taskType TaskType, toolNam
 		"duration_ms": duration.Milliseconds(),
 	}
 	jw.writeRecordLocked(rec)
+	jw.flushLocked()
+	jw.lastUUID = uuid
+	return uuid
+}
+
+// WriteFileStarted records that work began for a file fingerprint.
+func (jw *jsonlWriter) WriteFileStarted(filePath, fingerprint, phase string) string {
+	uuid := generateUUID()
+
+	jw.mu.Lock()
+	defer jw.mu.Unlock()
+	rec := map[string]any{
+		"uuid":        uuid,
+		"parentUuid":  jw.lastUUID,
+		"type":        "file_started",
+		"sessionId":   jw.sessionID,
+		"timestamp":   time.Now().UTC().Format(time.RFC3339),
+		"filePath":    filePath,
+		"fingerprint": fingerprint,
+		"phase":       phase,
+		"model":       jw.model,
+	}
+	jw.writeRecordLocked(rec)
+	jw.flushLocked()
+	jw.lastUUID = uuid
+	return uuid
+}
+
+// WriteConversationCheckpoint persists a mid-file conversation snapshot.
+func (jw *jsonlWriter) WriteConversationCheckpoint(cp ConversationCheckpoint) string {
+	uuid := generateUUID()
+
+	jw.mu.Lock()
+	defer jw.mu.Unlock()
+	rec := map[string]any{
+		"uuid":                uuid,
+		"parentUuid":          jw.lastUUID,
+		"type":                "conversation_checkpoint",
+		"sessionId":           jw.sessionID,
+		"timestamp":           time.Now().UTC().Format(time.RFC3339),
+		"filePath":            cp.FilePath,
+		"fingerprint":         cp.Fingerprint,
+		"phase":               cp.Phase,
+		"planGuidance":        cp.PlanGuidance,
+		"round":               cp.Round,
+		"model":               cp.Model,
+		"templateHash":        cp.TemplateHash,
+		"messages":            cp.Messages,
+		"commentFingerprints": cp.CommentFingerprints,
+		"status":              cp.Status,
+		"stopReason":          cp.StopReason,
+		"updatedAt":           time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(cp.Comments) > 0 {
+		rec["comments"] = cp.Comments
+	}
+	jw.writeRecordLocked(rec)
+	jw.flushLocked()
+	jw.lastUUID = uuid
+	return uuid
+}
+
+// WriteReviewItemPartial persists partial findings when a file fails mid-loop.
+func (jw *jsonlWriter) WriteReviewItemPartial(filePath, fingerprint, phase, planGuidance, stopReason string, round int, comments []model.LlmComment) string {
+	uuid := generateUUID()
+
+	jw.mu.Lock()
+	defer jw.mu.Unlock()
+	rec := map[string]any{
+		"uuid":         uuid,
+		"parentUuid":   jw.lastUUID,
+		"type":         "review_item_partial",
+		"sessionId":    jw.sessionID,
+		"timestamp":    time.Now().UTC().Format(time.RFC3339),
+		"filePath":     filePath,
+		"fingerprint":  fingerprint,
+		"phase":        phase,
+		"round":        round,
+		"planGuidance": planGuidance,
+		"stopReason":   stopReason,
+		"updatedAt":    time.Now().UTC().Format(time.RFC3339),
+		"model":        jw.model,
+	}
+	if len(comments) > 0 {
+		rec["comments"] = comments
+	}
+	jw.writeRecordLocked(rec)
+	jw.flushLocked()
 	jw.lastUUID = uuid
 	return uuid
 }

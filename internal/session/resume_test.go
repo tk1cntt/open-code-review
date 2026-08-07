@@ -279,6 +279,8 @@ func TestApplyResumeLine_ReviewItemDone_FallbackToNewPath(t *testing.T) {
 		Type:        "review_item_done",
 		NewPath:     "renamed.go",
 		Fingerprint: "fp-renamed",
+		// Non-empty comments required: zero-comment done is treated as incomplete.
+		Comments: []model.LlmComment{{Path: "renamed.go", Content: "ok", StartLine: 1, EndLine: 1}},
 	})
 	if err := s.applyResumeLine(line); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -580,13 +582,24 @@ func TestLoadResumeState_InvalidJSON(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("{bad json}\n"), 0600); err != nil {
+	// Corrupt lines are skipped (P0 hard-crash resilience) so resume can still
+	// load valid records that surround a truncated write.
+	content := []byte("{bad json}\n" +
+		`{"type":"session_start","sessionId":"bad-json","reviewMode":"full_scan"}` + "\n" +
+		`{"type":"review_item_done","filePath":"a.go","fingerprint":"fp-a","comments":[{"path":"a.go","content":"ok","start_line":1,"end_line":1}]}` + "\n")
+	if err := os.WriteFile(path, content, 0600); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = LoadResumeState(repoDir, sessionID)
-	if err == nil {
-		t.Fatal("expected error for invalid JSON content")
+	state, err := LoadResumeState(repoDir, sessionID)
+	if err != nil {
+		t.Fatalf("corrupt lines must not fail LoadResumeState: %v", err)
+	}
+	if state.CorruptLines != 1 {
+		t.Fatalf("CorruptLines = %d, want 1", state.CorruptLines)
+	}
+	if state.CompletedCount() != 1 {
+		t.Fatalf("CompletedCount = %d, want 1 after skipping corrupt line", state.CompletedCount())
 	}
 }
 

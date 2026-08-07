@@ -51,6 +51,11 @@ type ItemDetail struct {
 	Comments        int       `json:"comments"`
 	SourceSessionID string    `json:"source_session_id,omitempty"`
 	Error           string    `json:"error,omitempty"`
+	// Mid-file checkpoint fields (conversation_checkpoint / partial).
+	Round      int    `json:"round,omitempty"`
+	Phase      string `json:"phase,omitempty"`
+	Status     string `json:"status,omitempty"`
+	StopReason string `json:"stop_reason,omitempty"`
 }
 
 // summaryRecord is a superset of resumeRecord that also carries session_end fields.
@@ -77,6 +82,10 @@ type summaryRecord struct {
 	DurationSeconds float64         `json:"duration_seconds"`
 	LLMFailures     int64           `json:"llm_failures"`
 	RunManifest     *RunManifest    `json:"run_manifest"`
+	Phase           string          `json:"phase"`
+	Round           int             `json:"round"`
+	Status          string          `json:"status"`
+	StopReason      string          `json:"stopReason"`
 }
 
 // SessionsDir returns the on-disk directory that holds JSONL session files
@@ -265,27 +274,56 @@ func applyRecordToSummary(s *Summary, rec summaryRecord) {
 }
 
 func recordToItem(rec summaryRecord) (ItemDetail, bool) {
-	switch rec.Type {
-	case "review_item_done", "review_item_reused", "review_item_failed":
-	default:
-		return ItemDetail{}, false
-	}
-	kind := strings.TrimPrefix(rec.Type, "review_item_")
 	filePath := rec.FilePath
 	if filePath == "" {
 		filePath = rec.NewPath
 	}
-	return ItemDetail{
-		Type:            kind,
-		Timestamp:       parseRecordTime(rec.Timestamp),
-		FilePath:        filePath,
-		OldPath:         rec.OldPath,
-		NewPath:         rec.NewPath,
-		Fingerprint:     rec.Fingerprint,
-		Comments:        countCommentsRaw(rec.Comments),
-		SourceSessionID: rec.SourceSessionID,
-		Error:           rec.Error,
-	}, true
+	switch rec.Type {
+	case "review_item_done", "review_item_reused", "review_item_failed":
+		kind := strings.TrimPrefix(rec.Type, "review_item_")
+		return ItemDetail{
+			Type:            kind,
+			Timestamp:       parseRecordTime(rec.Timestamp),
+			FilePath:        filePath,
+			OldPath:         rec.OldPath,
+			NewPath:         rec.NewPath,
+			Fingerprint:     rec.Fingerprint,
+			Comments:        countCommentsRaw(rec.Comments),
+			SourceSessionID: rec.SourceSessionID,
+			Error:           rec.Error,
+		}, true
+	case "conversation_checkpoint":
+		status := rec.Status
+		if status == "" {
+			status = CheckpointInProgress
+		}
+		return ItemDetail{
+			Type:        "IN_PROGRESS",
+			Timestamp:   parseRecordTime(rec.Timestamp),
+			FilePath:    filePath,
+			Fingerprint: rec.Fingerprint,
+			Comments:    countCommentsRaw(rec.Comments),
+			Round:       rec.Round,
+			Phase:       rec.Phase,
+			Status:      status,
+			StopReason:  rec.StopReason,
+			Error:       rec.StopReason,
+		}, true
+	case "review_item_partial":
+		return ItemDetail{
+			Type:        "partial",
+			Timestamp:   parseRecordTime(rec.Timestamp),
+			FilePath:    filePath,
+			Fingerprint: rec.Fingerprint,
+			Comments:    countCommentsRaw(rec.Comments),
+			Round:       rec.Round,
+			Phase:       rec.Phase,
+			StopReason:  rec.StopReason,
+			Error:       rec.StopReason,
+		}, true
+	default:
+		return ItemDetail{}, false
+	}
 }
 
 func countCommentsRaw(raw json.RawMessage) int {
