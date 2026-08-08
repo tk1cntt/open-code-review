@@ -185,9 +185,7 @@ func registerReviewFlags(cmd *cobra.Command, opts *reviewOptions) {
 	cmd.Flags().StringVar(&opts.resultProject, "result-project", "", "project name/path for persisted review results")
 	cmd.Flags().StringVar(&opts.resultSourceBranch, "result-source-branch", "", "source branch metadata for persisted review results")
 	cmd.Flags().StringVar(&opts.resultTargetBranch, "result-target-branch", "", "target branch metadata for persisted review results")
-	cmd.Flags().BoolVar(&opts.apply, "apply", false, "apply suggestion_code from review comments (verify+rollback; best-effort per file)")
-	cmd.Flags().BoolVar(&opts.applyRunTests, "apply-run-tests", false, "when --apply, also run go test on touched packages during verify")
-	cmd.Flags().BoolVar(&opts.applyAgentic, "apply-agentic", false, "let LLM edit files directly using file_edit + shell_run (multi-language, self-verifying)")
+	cmd.Flags().BoolVar(&opts.apply, "apply", false, "let LLM edit files directly using file_edit + shell_run (multi-language, self-verifying)")
 }
 
 // registerScanFlags registers all scan command flags on cmd, binding to opts.
@@ -251,7 +249,6 @@ func registerRefactorFlags(cmd *cobra.Command, opts *refactorOptions) {
 	cmd.Flags().StringVar(&opts.crossFile, "cross-file", "off", "per-file cross-file hints: off | hints (cite related paths via tools)")
 	cmd.Flags().BoolVar(&opts.apply, "apply", false, "apply cross-file architect plans that include suggestion_code (verify+rollback; default false)")
 	cmd.Flags().BoolVar(&opts.applyRunTests, "apply-run-tests", false, "when --apply, also run go test on touched packages during verify")
-	cmd.Flags().BoolVar(&opts.applyAgentic, "apply-agentic", false, "let LLM edit files directly using file_edit + shell_run (multi-language, self-verifying)")
 	addModelFlag(cmd, &opts.model)
 	addProviderFlag(cmd, &opts.provider)
 	cmd.Flags().StringVar(&opts.resume, "resume", "", "resume from a previous refactoring session id")

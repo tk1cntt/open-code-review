@@ -154,9 +154,9 @@ type Args struct {
 	// would exceed it. 0 = unlimited. Mirrors scan.Args.MaxTokensBudget.
 	MaxTokensBudget int64
 
-	// ApplyAgentic enables the agentic apply phase after review, where the LLM
+	// Apply enables the agentic apply phase after review, where the LLM
 	// uses file_edit + file_write + shell_run tools to directly fix code.
-	ApplyAgentic bool
+	Apply bool
 
 	// ApplyToolDefs holds llm.ToolDef entries for the apply phase (file_edit,
 	// file_write, shell_run, file_read, task_done). When nil or empty, the
@@ -1420,7 +1420,7 @@ func (a *Agent) executeSubtask(ctx context.Context, d model.Diff, start session.
 		// APPLY_TASK runs after the review filter when agentic apply is enabled.
 		// The LLM gets file_edit, file_write, shell_run tools and applies
 		// suggestion_code directly to source files.
-		if a.args.ApplyAgentic && a.args.Template.ApplyTask != nil && len(a.args.Template.ApplyTask.Messages) > 0 {
+		if a.args.Apply && a.args.Template.ApplyTask != nil && len(a.args.Template.ApplyTask.Messages) > 0 {
 			a.executeApplyPhase(ctx, d, newPath)
 		}
 	}

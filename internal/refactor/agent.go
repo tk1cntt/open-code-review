@@ -1,4 +1,4 @@
-﻿// Package refactor implements `ocr refactor` — full-file refactoring analysis.
+// Package refactor implements `ocr refactor` — full-file refactoring analysis.
 // It follows the same architecture as internal/scan but uses refactoring-specific
 // templates, rules (ResolveRefactor), and output categories/severities.
 package refactor
@@ -615,9 +615,6 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 				return
 			}
 			a.recordFileSuccess(it, fingerprint, comments)
-			if a.args.Apply && a.args.Mode == "local" {
-				a.applyFileComments(ctx, it.Path, comments)
-			}
 		}(batch[i])
 	}
 
@@ -854,27 +851,6 @@ func (a *Agent) recordFileSuccess(it model.ScanItem, fingerprint string, comment
 	a.session.RecordReviewItemDone(it.Path, it.Path, it.Path, fingerprint, comments)
 	if a.args.OnFileDone != nil {
 		a.args.OnFileDone(it.Path, comments)
-	}
-}
-
-// applyFileComments applies suggestion_code from per-file comments using
-// backup+verify+rollback. Runs in the per-file dispatch goroutine. Best-effort:
-// verify failures roll back the file and log a warning but never fail the run.
-// Filtering (empty suggestion_code, empty path, invalid StartLine, overlapping
-// ranges) is handled by ApplyComments which logs a skip reason for each
-// non-actionable comment via res.Skipped.
-func (a *Agent) applyFileComments(ctx context.Context, relPath string, comments []model.LlmComment) {
-	res := crossfile.ApplyComments(a.args.RepoDir, comments, a.args.ApplyRunTests)
-	for _, m := range res.Messages {
-		fmt.Fprintf(stdout.Writer(), "[ocr] apply %s: %s\n", relPath, m)
-	}
-	for _, s := range res.Skipped {
-		fmt.Fprintf(stdout.Writer(), "[ocr] apply %s: skip %s\n", relPath, s)
-	}
-	if res.AppliedCount > 0 && res.Verify.OK && !res.RolledBack {
-		fmt.Fprintf(stdout.Writer(), "[ocr] apply %d/%d suggestion(s) to %s\n", res.AppliedCount, len(comments), relPath)
-	} else if len(res.Written) > 0 {
-		fmt.Fprintf(stdout.Writer(), "[ocr] WARNING: apply+verify failed for %s (rolled back)\n", relPath)
 	}
 }
 

@@ -11,11 +11,9 @@ import (
 	"time"
 
 	"github.com/alibaba/open-code-review/internal/agent"
-	"github.com/alibaba/open-code-review/internal/diff"
 	"github.com/alibaba/open-code-review/internal/llm"
 	"github.com/alibaba/open-code-review/internal/mcp"
 	"github.com/alibaba/open-code-review/internal/model"
-	"github.com/alibaba/open-code-review/internal/refactor/crossfile"
 	"github.com/alibaba/open-code-review/internal/reviewstore"
 	"github.com/alibaba/open-code-review/internal/session"
 	"github.com/alibaba/open-code-review/internal/telemetry"
@@ -55,8 +53,6 @@ type reviewOptions struct {
 	resultSourceBranch  string
 	resultTargetBranch  string
 	apply               bool
-	applyRunTests       bool
-	applyAgentic        bool
 }
 
 var reviewOpts reviewOptions
@@ -174,7 +170,7 @@ func executeReview(ctx context.Context, opts reviewOptions) error {
 		Runner:  cc.GitRunner,
 	}
 	var tools *tool.Registry
-	if opts.applyAgentic {
+	if opts.apply {
 		tools = buildToolRegistryWithEditors(rt.Collector, fileReader, cc.RepoDir)
 	} else {
 		tools = buildToolRegistry(rt.Collector, fileReader)
@@ -195,7 +191,7 @@ func executeReview(ctx context.Context, opts reviewOptions) error {
 
 	// Build apply-specific tool definitions for the agentic apply phase.
 	var applyToolDefs []llm.ToolDef
-	if opts.applyAgentic {
+	if opts.apply {
 		applyToolDefs = agent.FilterApplyTools(rt.MainToolDefs)
 	}
 
@@ -226,32 +222,13 @@ func executeReview(ctx context.Context, opts reviewOptions) error {
 		Resume:                resumeState,
 		ResumeMode:            opts.resumeMode,
 			MaxTokensBudget:       int64(opts.maxTokensBudget),
-			ApplyAgentic:          opts.applyAgentic,
+			Apply:                 opts.apply,
 			ApplyToolDefs:         applyToolDefs,
 			OnFileDone: func(filePath string, comments []model.LlmComment) {
 			if perFileWriter != nil {
 				if err := perFileWriter.WriteFile(filePath, comments); err != nil {
 					fmt.Fprintf(os.Stderr, "[ocr] warning: per-file save failed for %s: %v\n", filePath, err)
 				}
-			}
-		},
-		OnFileSuccess: func(filePath string, comments []model.LlmComment) {
-			if !opts.apply || opts.applyAgentic {
-				return
-			}
-			resolved := diff.ResolveLineNumbers(comments, ag.Diffs())
-			applyResult := crossfile.ApplyComments(cc.RepoDir, resolved, opts.applyRunTests)
-			for _, m := range applyResult.Messages {
-				fmt.Fprintf(os.Stderr, "[ocr] apply %s: %s\n", filePath, m)
-			}
-			for _, s := range applyResult.Skipped {
-				fmt.Fprintf(os.Stderr, "[ocr] apply %s: skip %s\n", filePath, s)
-			}
-			if applyResult.Verify.OK && !applyResult.RolledBack {
-				fmt.Fprintf(os.Stderr, "[ocr] apply %d/%d suggestion(s) to %s; verify ok\n",
-					applyResult.AppliedCount, len(comments), filePath)
-			} else if len(applyResult.Written) > 0 {
-				fmt.Fprintf(os.Stderr, "[ocr] WARNING: apply+verify failed for %s (rolled back)\n", filePath)
 			}
 		},
 		RuntimeConfig:         rt.RuntimeConfig,
