@@ -1511,10 +1511,16 @@ func (a *Agent) executeApplyPhase(ctx context.Context, d model.Diff, newPath str
 		return
 	}
 
+	// Max 15 rounds for apply phase.
+	// Use a local copy to avoid mutating the shared a.args.Template
+	// that is used by concurrent file subtask goroutines.
+	applyTemplate := a.args.Template
+	applyTemplate.MaxToolRequestTimes = 15
+
 	deps := llmloop.Deps{
 		LLMClient:         a.args.LLMClient,
 		Model:             a.args.Model,
-		Template:          a.args.Template,
+		Template:          applyTemplate,
 		Tools:             a.args.Tools,
 		MainToolDefs:      applyToolDefs,
 		CommentCollector:  tool.NewCommentCollector(),
@@ -1523,12 +1529,6 @@ func (a *Agent) executeApplyPhase(ctx context.Context, d model.Diff, newPath str
 		DiffLookup:        a.findDiff,
 	}
 	applyRunner := llmloop.NewRunner(deps)
-
-	// Max 15 rounds for apply phase.
-	// Temporarily reduce MaxToolRequestTimes for the apply loop.
-	origMax := a.args.Template.MaxToolRequestTimes
-	a.args.Template.MaxToolRequestTimes = 15
-	defer func() { a.args.Template.MaxToolRequestTimes = origMax }()
 
 	fs := a.session.GetOrCreateFileSession(newPath)
 	rec := fs.AppendTaskRecord(session.ApplyTask, append([]llm.Message(nil), messages...))
