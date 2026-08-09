@@ -31,6 +31,26 @@ func NewSandbox(repoDir string) (*SandboxEnv, error) {
 // Dir returns the sandbox directory path.
 func (s *SandboxEnv) Dir() string { return s.tmpDir }
 
+// sandboxPath validates and sanitizes a relative path received from LLM output.
+// Rejects absolute paths, path traversal attempts (..), and empty paths.
+func sandboxPath(rel string) (string, error) {
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("absolute path not allowed: %s", rel)
+	}
+	cleaned := filepath.Clean(filepath.FromSlash(rel))
+	if cleaned == "." || cleaned == "" {
+		return "", fmt.Errorf("empty or root path not allowed: %s", rel)
+	}
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path traversal not allowed: %s", rel)
+	}
+	if strings.Contains(cleaned, string(filepath.Separator)+".."+string(filepath.Separator)) ||
+		strings.HasSuffix(cleaned, string(filepath.Separator)+"..") {
+		return "", fmt.Errorf("path traversal not allowed: %s", rel)
+	}
+	return cleaned, nil
+}
+
 // backupEntry holds pre-merge content and mode for rollback.
 type mergeBackupEntry struct {
 	data []byte
@@ -49,8 +69,13 @@ func (s *SandboxEnv) Merge(written []string, deleted []string) error {
 	// Process writes: copy sandbox → repo with pre-overwrite backup
 	var merged []string
 	for _, rel := range written {
-		src := filepath.Join(s.tmpDir, filepath.FromSlash(rel))
-		dst := filepath.Join(s.repoDir, filepath.FromSlash(rel))
+		path, err := sandboxPath(rel)
+		if err != nil {
+			s.rollbackMerged(backup, merged)
+			return fmt.Errorf("invalid merge path %q: %w", rel, err)
+		}
+		src := filepath.Join(s.tmpDir, path)
+		dst := filepath.Join(s.repoDir, path)
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			s.rollbackMerged(backup, merged)
 			return fmt.Errorf("merge mkdir %s: %w", rel, err)
@@ -78,6 +103,12 @@ func (s *SandboxEnv) Merge(written []string, deleted []string) error {
 			} else {
 				backup[dst] = mergeBackupEntry{existed: false}
 			}
+		}
+		// Issue #5: Reject writing to symlink destinations to prevent
+		// escape outside the repository via tracked symlinks.
+		if fi, err := os.Lstat(dst); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			s.rollbackMerged(backup, merged)
+			return fmt.Errorf("merge write %s: refusing symlink destination", rel)
 		}
 		if err := os.WriteFile(dst, data, mode); err != nil {
 			s.rollbackMerged(backup, merged)

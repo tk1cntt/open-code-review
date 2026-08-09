@@ -16,10 +16,10 @@ import (
 )
 
 const crossFileHintsBlock = `### CROSS-FILE HINTS (enabled)
-You may use code_search / file_read to find similar logic in related files.
-If you find clear cross-file duplication, mention related paths in the comment body
-(e.g. "Also duplicated in path/b.go"). Keep the primary finding anchored on the current file.
-Do not invent paths you have not seen in tool results or the current file.`
+	You may use code_search / file_read to find similar logic in related files.
+	If you find clear cross-file duplication, mention related paths in the comment body
+	(e.g. "Also duplicated in path/b.go"). Keep the primary finding anchored on the current file.
+	Do not invent paths you have not seen in tool results or the current file.`
 
 // runCrossFilePhase executes Layer1 cluster → X1 detect → X2 architect → comments,
 // and optionally F3 apply+verify when Args.Apply is set.
@@ -328,13 +328,11 @@ func (a *Agent) runCrossTransform(ctx context.Context, c crossfile.Cluster, plan
 
 	transformed, err := crossfile.ParseRefactorPlans(resp.Content())
 	if err != nil {
-		fmt.Fprintf(stdout.Writer(), "[ocr] cross-file transform: parse error: %v, falling back to architect plans\n", err)
-		return plans, nil
+		return plans, fmt.Errorf("parse transform response: %w", err)
 	}
 
 	if len(transformed) == 0 {
-		fmt.Fprintln(stdout.Writer(), "[ocr] cross-file transform: no transformed plans, using architect plans as-is")
-		return plans, nil
+		return plans, fmt.Errorf("transform response contained no plans")
 	}
 
 	// Merge transformed suggestion_code into original plans.
