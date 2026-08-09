@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/alibaba/open-code-review/internal/config/rules"
 	"github.com/alibaba/open-code-review/internal/llm"
@@ -306,6 +307,13 @@ func (a *Agent) runCrossTransform(ctx context.Context, c crossfile.Cluster, plan
 		content = strings.ReplaceAll(content, "{{plan_json}}", planJSON)
 		content = strings.ReplaceAll(content, "{{transform_files}}", filesBlock)
 		messages = append(messages, llm.NewTextMessage(m.Role, content))
+	}
+
+	timeout := pt.Timeout
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+		defer cancel()
 	}
 
 	resp, err := a.args.LLMClient.CompletionsWithCtx(ctx, llm.ChatRequest{
