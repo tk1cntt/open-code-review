@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	allowedext "github.com/alibaba/open-code-review/internal/config/allowlist"
 	"github.com/alibaba/open-code-review/internal/config/rules"
 	"github.com/alibaba/open-code-review/internal/config/template"
+	"github.com/alibaba/open-code-review/internal/fileutil"
 	"github.com/alibaba/open-code-review/internal/gitcmd"
 	"github.com/alibaba/open-code-review/internal/llm"
 	"github.com/alibaba/open-code-review/internal/llmloop"
@@ -915,8 +917,14 @@ func (a *Agent) applyLocalComments() error {
 			continue
 		}
 
-		if !strings.Contains(string(content), old) {
-			fmt.Fprintf(stdout.Writer(), "[ocr] local apply: existing_code not found in %s, skipping\n", c.Path)
+		count := strings.Count(string(content), old)
+		if count == 0 {
+			fmt.Fprintf(stdout.Writer(), "[ocr] local apply: existing_code not found in %s:%d, skipping\n", c.Path, c.StartLine)
+			skipped++
+			continue
+		}
+		if count > 1 {
+			fmt.Fprintf(stdout.Writer(), "[ocr] local apply: existing_code is ambiguous (%d matches) in %s:%d, skipping\n", count, c.Path, c.StartLine)
 			skipped++
 			continue
 		}
@@ -925,7 +933,24 @@ func (a *Agent) applyLocalComments() error {
 		if err := os.WriteFile(abs, []byte(newContent), 0o644); err != nil {
 			return fmt.Errorf("apply %s: %w", c.Path, err)
 		}
-		fmt.Fprintf(stdout.Writer(), "[ocr] local apply: applied %s (line %d)\n", c.Path, c.StartLine)
+
+		// Post-apply syntax check: validate the file is still syntactically valid.
+		// If validation fails, rollback to the pre-apply content.
+		if err := fileutil.ValidateFileSyntax(abs); err != nil {
+			if err2 := os.WriteFile(abs, content, 0o644); err2 != nil {
+				fmt.Fprintf(stdout.Writer(), "[ocr] local apply: syntax error in %s: %v (rollback also failed: %v)\n", c.Path, err, err2)
+			} else {
+				fmt.Fprintf(stdout.Writer(), "[ocr] local apply: syntax error in %s: %v (rolled back)\n", c.Path, err)
+			}
+			skipped++
+			continue
+		}
+
+		if new_ == "" {
+			fmt.Fprintf(stdout.Writer(), "[ocr] local apply: deleted existing_code in %s (line %d)\n", c.Path, c.StartLine)
+		} else {
+			fmt.Fprintf(stdout.Writer(), "[ocr] local apply: applied %s (line %d)\n", c.Path, c.StartLine)
+		}
 		applied++
 	}
 
@@ -1040,7 +1065,20 @@ func (a *Agent) fillPlaceholders(content string, it model.ScanItem, rule string,
 // inserts the APPLY MODE ACTIVE directive; otherwise it strips the placeholder.
 func (a *Agent) applyHint(messages []llm.Message) []llm.Message {
 	if a.args.Apply {
-		applyHintText := "\n\n## APPLY MODE ACTIVE\nYou MUST provide suggestion_code with the EXACT corrected code for EVERY issue you report.\n- suggestion_code must contain the complete corrected code block\n- If you cannot determine the exact fix, provide your best suggestion\n- Do NOT skip suggestion_code — it is REQUIRED in apply mode\n"
+		applyHintText := `
+## APPLY MODE ACTIVE
+You MUST provide suggestion_code with the EXACT corrected code for EVERY issue you report.
+
+CRITICAL RULES FOR suggestion_code:
+1. COMPLETE REPLACEMENT: suggestion_code must be the COMPLETE replacement for existing_code — include BOTH the removal of old code AND the addition of new code in ONE suggestion.
+2. For multi-location changes (e.g., remove function at line 50 + add new function at line 200), create SEPARATE code_comment entries — one for each location.
+3. If REMOVING code without replacement, set suggestion_code to empty string "".
+4. For JSX/TSX: ensure suggestion_code produces VALID JSX — check tag matching, no stray comments in JSX expressions.
+5. For CSS: ensure all properties stay inside their selector blocks — no bare properties outside { }.
+6. Verify ALL imports used in suggestion_code exist in the original file. If adding new imports, INCLUDE them in suggestion_code.
+7. existing_code MUST be an EXACT, copyable substring of the current file. Do NOT paraphrase or abbreviate.
+8. For constants/variables referenced in suggestion_code: verify they are either already defined in the file OR include their definition in suggestion_code.
+`
 		for i := range messages {
 			if s, ok := messages[i].Content.(string); ok {
 				messages[i].Content = strings.ReplaceAll(s, "{{apply_hint}}", applyHintText)
@@ -1056,6 +1094,168 @@ func (a *Agent) applyHint(messages []llm.Message) []llm.Message {
 	return messages
 }
 
+// ----- Fix 2: local import context injection -----
+
+var (
+	reLocalImport  = regexp.MustCompile(`(?:import\s+.*?\s+from\s+['"]((?:\.{1,2}/)[^'"]+)['"]|require\s*\(\s*['"]((?:\.{1,2}/)[^'"]+)['"]\s*\)|from\s+['"]((?:\.{1,2}/)[^'"]+)['"]\s+import)`)
+	reExportConst  = regexp.MustCompile(`export\s+const\s+(\w+)`)
+	reExportFunc   = regexp.MustCompile(`export\s+(?:async\s+)?function\s+(\w+)`)
+	reExportDefault = regexp.MustCompile(`export\s+default\s+(?:function|class|async\s+function)?\s*(\w*)`)
+	reExportType    = regexp.MustCompile(`export\s+(?:interface|type)\s+(\w+)`)
+	reGoExportFunc  = regexp.MustCompile(`func\s+([A-Z]\w*)`)
+	reGoExportType  = regexp.MustCompile(`type\s+([A-Z]\w*)\s+(?:struct|interface)`)
+	reGoExportConst = regexp.MustCompile(`(?:const|var)\s+([A-Z]\w*)`)
+)
+
+// buildProjectContext extracts local imports from the current file, resolves them
+// to files in the workspace, parses their exports, and returns a context block
+// to inject into the prompt.
+func (a *Agent) buildProjectContext(it model.ScanItem) string {
+	ext := strings.ToLower(filepath.Ext(it.Path))
+	imports := extractLocalImportPaths(it.Content, ext)
+	if len(imports) == 0 {
+		return ""
+	}
+
+	importsContext := ""
+	dir := filepath.Dir(it.Path)
+
+	for _, imp := range imports {
+		resolved := filepath.Join(dir, imp)
+		resolved = filepath.ToSlash(filepath.Clean(resolved))
+		resolvedLower := strings.ToLower(resolved)
+
+		// Find matching file in workspace items.
+		var content string
+		for _, item := range a.items {
+			if strings.ToLower(filepath.ToSlash(item.Path)) == resolvedLower ||
+				strings.TrimSuffix(strings.ToLower(filepath.ToSlash(item.Path)), filepath.Ext(item.Path)) == resolvedLower {
+				content = item.Content
+				break
+			}
+		}
+		if content == "" {
+			continue
+		}
+
+		exports := extractExports(content, filepath.Ext(resolved))
+		if len(exports) > 0 {
+			importsContext += fmt.Sprintf("- `%s`: exports { %s }\n", imp, strings.Join(exports, ", "))
+		}
+	}
+
+	if importsContext != "" {
+		return fmt.Sprintf(
+			"\n\n### Available Imports Context\n"+
+				"The current file imports from these local modules:\n%s"+
+				"When suggesting code, ONLY reference components/constants that exist in these exports.\n"+
+				"Do NOT suggest importing components that don't exist.\n",
+			importsContext)
+	}
+
+	// Fallback: if no local imports resolved, list files in the same directory.
+	return a.buildSameDirContext(it.Path)
+}
+
+// extractLocalImportPaths returns relative local import paths (./ or ../) from source.
+func extractLocalImportPaths(content, ext string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+
+	switch ext {
+	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
+		matches := reLocalImport.FindAllStringSubmatch(content, -1)
+		for _, m := range matches {
+			for g := 1; g < len(m); g++ {
+				if m[g] != "" && strings.HasPrefix(m[g], ".") {
+					if _, ok := seen[m[g]]; !ok {
+						seen[m[g]] = struct{}{}
+						out = append(out, m[g])
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// extractExports parses source content and returns a list of exported symbol names.
+func extractExports(content, ext string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+
+	add := func(name string) {
+		if name != "" {
+			if _, ok := seen[name]; !ok {
+				seen[name] = struct{}{}
+				out = append(out, name)
+			}
+		}
+	}
+
+	switch ext {
+	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
+		for _, m := range reExportConst.FindAllStringSubmatch(content, -1) {
+			add(m[1])
+		}
+		for _, m := range reExportFunc.FindAllStringSubmatch(content, -1) {
+			add(m[1])
+		}
+		for _, m := range reExportDefault.FindAllStringSubmatch(content, -1) {
+			if m[1] != "" {
+				add(m[1])
+			} else {
+				add("default")
+			}
+		}
+		for _, m := range reExportType.FindAllStringSubmatch(content, -1) {
+			add(m[1])
+		}
+	case ".go":
+		for _, m := range reGoExportFunc.FindAllStringSubmatch(content, -1) {
+			add(m[1])
+		}
+		for _, m := range reGoExportType.FindAllStringSubmatch(content, -1) {
+			add(m[1])
+		}
+		// Go exported vars/consts at package level.
+		for _, m := range reGoExportConst.FindAllStringSubmatch(content, -1) {
+			add(m[1])
+		}
+	}
+
+	if len(out) > 30 {
+		out = out[:30]
+	}
+	return out
+}
+
+// buildSameDirContext lists files in the same directory as fallback context.
+func (a *Agent) buildSameDirContext(filePath string) string {
+	dir := filepath.Dir(filePath)
+	var names []string
+	for _, item := range a.items {
+		if item.Path == filePath {
+			continue
+		}
+		if filepath.Dir(item.Path) == dir {
+			names = append(names, filepath.Base(item.Path))
+		}
+	}
+	if len(names) == 0 {
+		return fmt.Sprintf(
+			"\n\n### Project Context\nThis is a Next.js + React + TypeScript project using next-intl for i18n.\n",
+		)
+	}
+	if len(names) > 20 {
+		names = names[:20]
+	}
+	return fmt.Sprintf(
+		"\n\n### Project Context\nFiles in the same directory: %s\nThis is a Next.js + React + TypeScript project using next-intl for i18n.\n",
+		strings.Join(names, ", "),
+	)
+}
+
 func (a *Agent) renderMessages(it model.ScanItem, rule, planGuidance string) []llm.Message {
 	rawMsgs := a.args.Template.MainTask.Messages
 	messages := make([]llm.Message, 0, len(rawMsgs))
@@ -1063,11 +1263,13 @@ func (a *Agent) renderMessages(it model.ScanItem, rule, planGuidance string) []l
 	if a.args.CrossFileHints {
 		hints = crossFileHintsBlock
 	}
+	projectCtx := a.buildProjectContext(it)
 	for _, m := range rawMsgs {
 		extra := map[string]string{
 			"{{plan_guidance}}":          planGuidance,
 			"{{requirement_background}}": a.args.Background,
 			"{{cross_file_hints}}":       hints,
+			"{{project_context}}":        projectCtx,
 		}
 		content := a.fillPlaceholders(m.Content, it, rule, extra)
 		messages = append(messages, llm.NewTextMessage(m.Role, content))

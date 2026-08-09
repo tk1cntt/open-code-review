@@ -28,6 +28,7 @@ import (
 	"github.com/alibaba/open-code-review/internal/config/template"
 	"github.com/alibaba/open-code-review/internal/config/toolsconfig"
 	"github.com/alibaba/open-code-review/internal/diff"
+	"github.com/alibaba/open-code-review/internal/fileutil"
 	"github.com/alibaba/open-code-review/internal/gitcmd"
 	"github.com/alibaba/open-code-review/internal/llm"
 	"github.com/alibaba/open-code-review/internal/llmloop"
@@ -1596,6 +1597,28 @@ func (a *Agent) executeApplyPhase(ctx context.Context, d model.Diff, newPath str
 	}
 	if mismatchCount > 0 {
 		fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: %d/%d comment(s) mismatch — applied code differs from suggestion_code\n", mismatchCount, len(actionable))
+	}
+
+	// Post-apply syntax validation: verify each affected file is still syntactically valid.
+	// If any file fails, restore all backups instead of clearing them.
+	syntaxErrors := 0
+	for abs, data := range backup {
+		if err := fileutil.ValidateFileSyntax(abs); err != nil {
+			fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: syntax error in %s: %v, rolling back\n", abs, err)
+			syntaxErrors++
+			// Restore this file from backup.
+			if err2 := os.WriteFile(abs, data, 0o644); err2 != nil {
+				fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: rollback of %s also failed: %v\n", abs, err2)
+			}
+		}
+	}
+	if syntaxErrors > 0 {
+		fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: %d file(s) had syntax errors — all edits rolled back for %s\n", syntaxErrors, newPath)
+		// Restore remaining files from backup that weren't already restored above.
+		for abs, data := range backup {
+			_ = os.WriteFile(abs, data, 0o644)
+		}
+		return
 	}
 
 	// Clear backups — apply was successful!
