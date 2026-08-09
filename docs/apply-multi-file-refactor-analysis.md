@@ -744,3 +744,152 @@ Sau khi cân nhắc cả 4 bước — đặc biệt là các kịch bản thấ
 | **G3 (1 ngày)** | Kết nối: plans → apply_comments JSON → `executeApplyPhase` trong sandbox | 1 ngày |
 | **G4 (1 ngày)** | E2E tests: extract → create file → modify callers → verify → merge | 1 ngày |
 | **Tổng** | | **5 ngày** |
+
+---
+
+## 11. Bug Phân Tích: Review --apply Sửa Sai Dù Cùng 1 File
+
+**Ngày:** 2026-08-09  
+**Mức độ:** 🔴 Cao — --apply sửa code không khớp suggestion_code  
+**Phạm vi:** Review mode --apply (LLM-as-editor qua xecuteApplyPhase)
+
+### 11.1 Mô Tả Vấn Đề
+
+Khi chạy ocr review --apply:
+- Một số file được sửa **đúng** — code sau apply khớp với suggestion_code
+- Một số file khác bị sửa **sai** — code không khớp suggestion_code, output markdown không hiển thị sai lệch
+- **Không có cơ chế phát hiện** sự sai lệch giữa kết quả apply và suggestion_code gốc
+
+### 11.2 Flow Hiện Tại (xecuteApplyPhase, agent.go)
+
+| Bước | Hành động | Bug? |
+|---|---|---|
+| B1 | uildApplyCommentsJSON() — serialize 5 field: path, content, start_line, end_line, suggestion_code | ⚠️ Thiếu existing_code |
+| B2 | Render APPLY_TASK prompt với {{apply_comments}} | ✅ |
+| B3 | Backup file gốc (map[absPath][]byte) | ✅ |
+| B4 | pplyRunner.RunPerFile() — LLM dùng file_read/file_edit/file_write/shell_run, max 15 rounds | ⚠️ Prompt không ràng buộc exact match |
+| B5 | completed=true → xóa backup, giữ thay đổi | ⚠️ Không verify suggestion_code có trong file |
+| B6 | fail/stop → restore backup | ✅ |
+
+### 11.3 Root Cause — 5 Nguyên Nhân
+
+**#1: Thiếu xisting_code trong apply prompt JSON** 🔴
+
+uildApplyCommentsJSON không serialize cm.ExistingCode → LLM chỉ nhận suggestion_code (code mới) mà không có xisting_code (code cũ cần thay thế). LLM phải tự ile_read rồi **đoán** old_str dựa trên start_line/nd_line và content message. Đoán sai → edit sai vị trí.
+
+Ví dụ:
+`json
+{
+  "path": "handler/user.go",
+  "start_line": 42,
+  "end_line": 48,
+  "content": "Consider adding context parameter",
+  "suggestion_code": "func (h *Handler) GetUser(ctx context.Context, id int) (*User, error) { ... }"
+  // ⚠️ existing_code BỊ THIẾU: "func (h *Handler) GetUser(id int) (*User, error) { ... }"
+}
+`
+
+**#2: Prompt không ràng buộc exact match với suggestion_code** 🔴
+
+Prompt hiện tại: "apply the fix" — không yêu cầu 
+ew_str phải khớp CHÍNH XÁC suggestion_code. LLM có thể "sáng tạo" → tự cải thiện code → output khác suggestion_code. Code compile pass, nhưng markdown output vẫn hiển thị suggestion_code gốc (không được update).
+
+**#3: Thiếu post-apply diff verification** 🟡
+
+Sau khi applyRunner hoàn thành (completed=true), code chỉ kiểm tra: LLM có gọi 	ask_done không. Không kiểm tra: file sau apply có chứa suggestion_code không.
+
+**#4: Multiple comments trên cùng file — conflict ngầm** 🟡
+
+Khi file có 2+ comments: Comment A edit trước → file thay đổi → line numbers của Comment B lệch → old_str không còn khớp. LLM phải ile_read lại nhưng prompt không nhấn mạnh việc này.
+
+**#5: Line numbers từ diff có thể không chính xác** 🟢
+
+start_line/nd_line từ review (dựa trên git diff) có thể lệch so với file thực tế khi apply (file đã bị thay đổi giữa lúc review và apply).
+
+### 11.4 Đề Xuất Sửa — 4 Hướng
+
+| # | Hướng | Impact | Effort | Priority |
+|---|---|---|---|---|
+| 1 | Thêm xisting_code vào apply JSON | Trung bình | 30 phút | 🔴 P0 |
+| 2 | Cứng hóa prompt: exact match + dùng existing_code | Cao | 1 giờ | 🔴 P0 |
+| 3 | Post-apply verify: check suggestion_code trong file | Cao | 2 giờ | 🟡 P1 |
+| 4 | Sequential per-comment apply, sort bottom-up | Rất cao | 1-2 ngày | 🟢 P2 |
+
+### 11.5 Code Changes Cụ Thể
+
+**Sửa 1: uildApplyCommentsJSON — thêm xisting_code** (agent.go ~dòng 1588)
+
+`go
+type applyComment struct {
+    Path           string json:"path"
+    StartLine      int    json:"start_line"
+    EndLine        int    json:"end_line"
+    Content        string json:"content"
+    ExistingCode   string json:"existing_code"    // ← THÊM
+    SuggestionCode string json:"suggestion_code"
+}
+// Trong vòng lặp:
+items[i] = applyComment{
+    Path:           cm.Path,
+    StartLine:      cm.StartLine,
+    EndLine:        cm.EndLine,
+    Content:        cm.Content,
+    ExistingCode:   cm.ExistingCode,    // ← THÊM
+    SuggestionCode: cm.SuggestionCode,
+}
+`
+
+**Sửa 2: pply_task_system.md — ràng buộc exact match**
+
+`markdown
+## CRITICAL RULE: EXACT MATCH
+- new_str in file_edit MUST match suggestion_code EXACTLY (character-by-character)
+- DO NOT improve, modify, or refactor the suggestion_code
+- Use existing_code to locate the EXACT old_str in the file
+- After file_edit, use file_read to verify the change matches suggestion_code
+
+## Instructions
+For each review comment:
+1. file_read the target file
+2. Verify existing_code exists in file (if not found, skip with warning)
+3. file_edit with old_str = existing_code, new_str = suggestion_code
+4. file_read to confirm edit matches suggestion_code exactly
+5. shell_run to verify compilation
+6. If any step fails, retry once then skip
+`
+
+**Sửa 3: Post-apply verification** (agent.go, xecuteApplyPhase, sau dòng completed check)
+
+`go
+if completed {
+    // Post-apply verify: check suggestion_code is in the file
+    for _, cm := range actionable {
+        if cm.SuggestionCode == "" { continue }
+        abs := filepath.Join(a.args.RepoDir, filepath.FromSlash(cm.Path))
+        current, err := os.ReadFile(abs)
+        if err != nil {
+            fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: cannot verify %s: %v\n", cm.Path, err)
+            continue
+        }
+        if !strings.Contains(string(current), cm.SuggestionCode) {
+            fmt.Fprintf(stdout.Writer(), 
+                "[ocr] Agentic apply: WARNING — suggestion_code not found in %s after apply\n", cm.Path)
+        }
+    }
+    // Clear backups
+    for abs := range backup { delete(backup, abs) }
+}
+`
+
+### 11.6 Kế Hoạch Triển Khai
+
+| # | Task | File | Effort | Priority |
+|---|---|---|---|---|
+| 11.1 | Thêm xisting_code vào uildApplyCommentsJSON | gent.go | 30 phút | P0 |
+| 11.2 | Cập nhật pply_task_system.md — exact match + existing_code | pply_task_system.md | 30 phút | P0 |
+| 11.3 | Post-apply verify: check suggestion_code trong file | gent.go | 1 giờ | P1 |
+| 11.4 | Sort comments bottom-up trước khi apply | gent.go | 30 phút | P1 |
+| 11.5 | E2E test: verify exact match sau apply | pply_e2e_test.go | 1 ngày | P1 |
+| 11.6 | Sequential per-comment apply (nếu P1 chưa đủ) | gent.go | 1-2 ngày | P2 |
+
+**Tổng P0+P1:** ~1-2 ngày | **Tổng P0+P1+P2:** ~3-4 ngày
