@@ -1555,6 +1555,28 @@ func (a *Agent) executeApplyPhase(ctx context.Context, d model.Diff, newPath str
 	// (the apply loop records its own tool results internally).
 	rec.Duration = duration
 
+	// Post-apply verification: check suggestion_code is actually in the file.
+	mismatchCount := 0
+	for _, cm := range actionable {
+		if cm.SuggestionCode == "" {
+			continue
+		}
+		abs := filepath.Join(a.args.RepoDir, filepath.FromSlash(cm.Path))
+		current, err := os.ReadFile(abs)
+		if err != nil {
+			fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: cannot verify %s: %v\n", cm.Path, err)
+			mismatchCount++
+			continue
+		}
+		if !strings.Contains(string(current), cm.SuggestionCode) {
+			fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: WARNING — suggestion_code not found in %s after apply (applied code differs from suggestion)\n", cm.Path)
+			mismatchCount++
+		}
+	}
+	if mismatchCount > 0 {
+		fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: %d/%d comment(s) mismatch — applied code differs from suggestion_code\n", mismatchCount, len(actionable))
+	}
+
 	// Clear backups — apply was successful!
 	for abs := range backup {
 		delete(backup, abs)
@@ -1589,6 +1611,7 @@ func buildApplyCommentsJSON(comments []model.LlmComment) string {
 		Content        string `json:"content"`
 		StartLine      int    `json:"start_line"`
 		EndLine        int    `json:"end_line"`
+		ExistingCode   string `json:"existing_code"`
 		SuggestionCode string `json:"suggestion_code"`
 	}
 	items := make([]applyComment, len(comments))
@@ -1598,6 +1621,7 @@ func buildApplyCommentsJSON(comments []model.LlmComment) string {
 			Content:        cm.Content,
 			StartLine:      cm.StartLine,
 			EndLine:        cm.EndLine,
+			ExistingCode:   cm.ExistingCode,
 			SuggestionCode: cm.SuggestionCode,
 		}
 	}
