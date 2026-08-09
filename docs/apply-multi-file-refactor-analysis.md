@@ -383,3 +383,364 @@ Vấn đề `--apply` không hoạt động cho refactor đa file bắt nguồn 
 
 - **Trước sửa:** `ocr refactor --mode=cross --apply` không hoạt động với refactor tạo file mới → mất code
 - **Sau sửa:** Pipeline hoạt động end-to-end: detect → architect → **transform** → apply → verify
+## 10. Kiến Trúc Độc Lập — Big Review (4 Bước)
+
+### 10.1 Bước 1: Liệt Kê và Phân Rã (Neutral Listing)
+
+Dưới đây là **7 phương án** để giải quyết vấn đề `--apply` cho refactor đa file (extract code → tạo file mới → sửa file cũ). Mỗi phương án được mô tả thuần túy về kỹ thuật, không đánh giá tốt/xấu.
+
+#### P1: X3 Transform — LLM sinh code riêng cho từng PlanStep (đề xuất ban đầu)
+
+| Đặc điểm | Mô tả |
+|---|---|
+| Cơ chế | Gọi LLM riêng cho mỗi `RefactorPlan`, prompt chứa toàn bộ plan + file contents, yêu cầu LLM sinh `suggestion_code` cho từng `PlanStep` |
+| Số LLM call | 1 call/plan (có thể tách thành 1 call/step nếu plan lớn) |
+| Output | `RefactorPlan` với `suggestion_code` được điền đầy đủ cho mỗi step |
+| Apply sau đó | `ApplyPlanSteps()` ghi trực tiếp (không cần LLM nữa) |
+| Code cần viết | Prompt mới (`transform_task_system.md`), `runCrossTransform()`, parsing |
+
+#### P2: LLM-as-Editor — tool-use loop giống Review --apply
+
+| Đặc điểm | Mô tả |
+|---|---|
+| Cơ chế | Chuyển `RefactorPlan` → comment format → đưa vào APPLY_TASK prompt → LLM dùng `file_edit` + `file_write` + `shell_run` tự sửa từng file |
+| Số LLM call | 1 tool-use loop (nhiều round) cho toàn bộ plan |
+| Output | File được sửa trực tiếp bởi LLM qua tool calls |
+| Apply sau đó | Không cần — LLM đã tự apply |
+| Code cần viết | Convert plans → apply_comments JSON, tái sử dụng `executeApplyPhase()` |
+
+#### P3: Differential Patching — sinh diff/patch thay vì full file
+
+| Đặc điểm | Mô tả |
+|---|---|
+| Cơ chế | X3 sinh unified diff (diff -u) cho từng file thay vì toàn bộ nội dung. Apply dùng `git apply` hoặc manual patch |
+| Số LLM call | 1 call/plan |
+| Output | Diff string cho mỗi file |
+| Apply sau đó | `git apply` hoặc manual patching từng file |
+| Code cần viết | Prompt yêu cầu diff format, `applyPatch()` function |
+
+#### P4: Symbolic Transformation — AST-based thay vì text-based
+
+| Đặc điểm | Mô tả |
+|---|---|
+| Cơ chế | Dùng Go AST parser để phân tích code, sinh transformation rules (move function X từ A.go sang B.go), apply bằng code (không LLM) |
+| Số LLM call | 0 cho apply phase (LLM chỉ dùng cho detect + architect) |
+| Output | AST transformation rules (MoveFunction, CreateFile, AddImport...) |
+| Apply sau đó | Go code thực hiện AST manipulation + code generation |
+| Code cần viết | AST engine cho Go, transformation rules, code formatter |
+
+#### P5: Two-Phase Hybrid — Architect sinh code thô → Editor refine
+
+| Đặc điểm | Mô tả |
+|---|---|
+| Cơ chế | Phase 1: Architect (X2) được yêu cầu sinh `suggestion_code` thô kèm plan. Phase 2: Editor agent (P2-style) đọc code thô, refine, và apply |
+| Số LLM call | 2 calls: 1 architect (có code thô) + 1 editor loop |
+| Output | Plan có code thô → Editor refine → file đã sửa |
+| Apply sau đó | Editor đã apply, hoặc cần thêm bước verify |
+| Code cần viết | Thay đổi architect prompt, editor prompt, kết nối 2 phase |
+
+#### P6: Git Worktree Sandbox — apply trong sandbox, commit nếu pass
+
+| Đặc điểm | Mô tả |
+|---|---|
+| Cơ chế | Tạo git worktree tạm, apply toàn bộ changes ở đó, chạy full test suite. Nếu pass → merge vào branch chính. Nếu fail → discard worktree |
+| Số LLM call | Tùy chọn: có thể kết hợp với P1, P2, hoặc P5 |
+| Output | Worktree với changes đã apply |
+| Apply sau đó | `git merge` hoặc `git cherry-pick` |
+| Code cần viết | Worktree manager, test runner, merge logic |
+
+#### P7: Incremental Apply với Checkpoint — từng step một, checkpoint sau mỗi step
+
+| Đặc điểm | Mô tả |
+|---|---|
+| Cơ chế | Thay vì apply tất cả step rồi verify, apply từng step → verify ngay → nếu pass thì checkpoint (commit tạm), nếu fail thì rollback step đó và skip |
+| Số LLM call | Tùy chọn: có thể kết hợp với P1, P2 |
+| Output | Các step thành công được áp dụng, step fail bị skip |
+| Apply sau đó | Từng step đã được áp dụng incremental |
+| Code cần viết | Checkpoint manager (git commit --allow-empty), step-by-step loop |
+
+---
+
+### 10.2 Bước 2: Phân Tích Theo Tiêu Chí (Attribute Mapping)
+
+#### Tiêu chí 1: Chất lượng code sinh ra (Generated Code Quality)
+
+Code sinh ra có biên dịch được không? Có giữ nguyên style không? Có đầy đủ import không?
+
+**Mạnh nhất: P4 (Symbolic Transformation)** — AST manipulation đảm bảo code luôn valid về mặt cú pháp, import được quản lý tự động, không phụ thuộc vào "đoán" của LLM.
+
+**Yếu nhất: P1 (X3 Transform)** — LLM sinh toàn bộ nội dung file, rủi ro thiếu import, sai syntax, sai style.
+
+**Xếp hạng (từ mạnh đến yếu):** P4 > P5 > P2 > P6/P7 (tùy base) > P1 > P3
+
+#### Tiêu chí 2: Chi phí vận hành (Operational Cost — LLM tokens)
+
+**Mạnh nhất: P4 (Symbolic)** — 0 LLM call cho apply phase. Chỉ tốn CPU cho AST manipulation.
+
+**Yếu nhất: P2 (LLM-as-Editor)** — Mỗi tool-use loop có thể 10-15 rounds, mỗi round gửi toàn bộ context. Token cost cao nhất.
+
+**Xếp hạng (từ rẻ đến đắt):** P4 > P7 > P1 > P3 > P6 > P5 > P2
+
+#### Tiêu chí 3: Độ an toàn / rủi ro mất code (Safety / Rollback Integrity)
+
+**Mạnh nhất: P6 (Git Worktree Sandbox)** — Changes nằm trong sandbox, chỉ merge khi pass toàn bộ test. Không thể mất code trên branch chính.
+
+**Yếu nhất: P2 (LLM-as-Editor)** — LLM tự quyết định sửa file, có thể sửa sai file, sai scope, hoặc bỏ sót step.
+
+**Xếp hạng (từ an toàn đến rủi ro):** P6 > P7 > P1 > P5 > P3 > P4 > P2
+
+#### Tiêu chí 4: Khả năng tổng quát hóa — hỗ trợ đa ngôn ngữ (Multi-language Support)
+
+**Mạnh nhất: P2 / P1 / P3** — Hoàn toàn text-based, hoạt động với mọi ngôn ngữ. LLM tự hiểu syntax của ngôn ngữ đó.
+
+**Yếu nhất: P4 (Symbolic Transformation)** — Yêu cầu viết AST engine riêng cho từng ngôn ngữ. Go có sẵn, nhưng Python, TypeScript, Rust... cần engine khác.
+
+**Xếp hạng (từ đa năng đến giới hạn):** P2 = P1 = P3 = P5 > P6 = P7 > P4
+
+#### Tiêu chí 5: Khả năng bảo trì và mở rộng (Maintainability / Extensibility)
+
+**Mạnh nhất: P1 (X3 Transform)** — Prompt-based, dễ điều chỉnh bằng cách sửa prompt. Thêm rule mới = thêm text vào system prompt. Không cần code mới.
+
+**Yếu nhất: P4 (Symbolic)** — Mỗi rule transformation mới cần code Go mới. AST manipulation phức tạp, dễ gây regression.
+
+**Xếp hạng (từ dễ bảo trì đến khó):** P1 > P5 > P3 > P2 > P7 > P6 > P4
+
+#### Tiêu chí 6: Thời gian phát triển (Development Time)
+
+**Mạnh nhất (nhanh nhất): P5 (Two-Phase Hybrid)** — Tận dụng architect có sẵn + editor có sẵn (`executeApplyPhase`). Chỉ cần thay đổi prompt + kết nối.
+
+**Yếu nhất (chậm nhất): P4 (Symbolic Transformation)** — Cần viết AST engine, transformation rules, code formatter. Hàng tháng, không phải hàng ngày.
+
+**Xếp hạng (từ nhanh đến chậm):** P5 > P2 > P1 > P7 > P3 > P6 > P4
+
+#### Bảng tổng hợp xếp hạng
+
+| Tiêu chí | P1: X3 | P2: Editor | P3: Diff | P4: AST | P5: Hybrid | P6: Sandbox | P7: Checkpoint |
+|---|---|---|---|---|---|---|---|
+| Code Quality | ⭐⭐ | ⭐⭐⭐ | ⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | (tùy base) | (tùy base) |
+| Token Cost | ⭐⭐⭐ | ⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐ | (tùy base) | ⭐⭐⭐ |
+| Safety | ⭐⭐⭐ | ⭐ | ⭐⭐ | ⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+| Multi-language | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
+| Maintainability | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐ | ⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐ |
+| Dev Speed | ⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐ | ⭐⭐⭐ |
+| **TỔNG** | **21** | **17** | **18** | **17** | **22** | **16** | **19** |
+
+#### Phân tích Trade-off
+
+**Nếu chọn P5 (Hybrid) thay vì P1 (X3 Transform):**
+- **Được:** Dev speed nhanh hơn (5/5 vs 3/5), tận dụng code có sẵn (`executeApplyPhase`, `apply_task_system.md`)
+- **Mất:** Không đúng kiến trúc ADR F3 (3-layer: detect → architect → transform), architect prompt phải thay đổi để sinh code thô (tăng token architect)
+
+**Nếu chọn P1 (X3 Transform) thay vì P5 (Hybrid):**
+- **Được:** Đúng kiến trúc ADR, separation of concerns rõ ràng (architect chỉ plan, transformer chỉ code), maintainability cao nhất
+- **Mất:** Phát triển chậm hơn, phải viết prompt + parsing mới, architect không cần thay đổi nhưng transformer phải đủ mạnh
+
+**Nếu chọn P6 (Sandbox) thay vì P1/P5:**
+- **Được:** Safety tuyệt đối (5/5), không lo mất code
+- **Mất:** Không tự giải quyết vấn đề thiếu code — sandbox chỉ là cơ chế an toàn bọc ngoài, vẫn cần P1/P2/P5 để sinh code
+
+**Nếu chọn P4 (AST) thay vì text-based (P1/P2/P3/P5):**
+- **Được:** Code quality tuyệt đối, token cost = 0 cho apply
+- **Mất:** Multi-language support (1/5), maintainability thấp nhất (1/5), dev speed chậm nhất (1/5)
+
+---
+
+### 10.3 Bước 3: Đề Xuất Dựa Trên Context (Contextual Recommendation)
+
+#### Context của dự án open-code-review
+
+| Yếu tố | Thực tế |
+|---|---|
+| **Ngôn ngữ chính** | Go 1.25.5 |
+| **Hỗ trợ đa ngôn ngữ** | Có — hệ thống rules hỗ trợ ~80 ngôn ngữ qua `rule_docs/` |
+| **Codebase hiện tại** | Đã có X1 (detect), X2 (architect), `ApplyPlanSteps`, `executeApplyPhase`, `file_edit`, `file_write` |
+| **Pattern đã dùng** | Backup-then-mutate, defer rollback, verify-then-commit, MainLoopStop enum, tool-use loop qua `llmloop.Runner` |
+| **Thời gian yêu cầu** | Chưa có deadline cứng, nhưng hệ thống đang thiếu chức năng |
+| **ADR hiện tại** | ADR F3 định nghĩa 3-layer: Detect(X1) → Architect(X2) → Transform(X3) → Verify |
+| **Team** | Go developers, đã quen với prompt engineering và LLM tool-use |
+| **Mức độ rủi ro chấp nhận được** | Thấp — `--apply` là destructive operation, cần safety cao |
+
+#### Phân tích context
+
+1. **Hỗ trợ ~80 ngôn ngữ** → P4 (AST) bị loại ngay vì không scale được. Mỗi ngôn ngữ cần AST engine riêng. P1/P2/P3/P5 đều text-based → hỗ trợ mọi ngôn ngữ.
+
+2. **Đã có `executeApplyPhase` + `file_edit` + `file_write`** → P2 và P5 có lợi thế tái sử dụng code. P1 yêu cầu viết mới toàn bộ X3 transform.
+
+3. **Pattern backup-then-mutate đã dùng** → P6 (sandbox) và P7 (checkpoint) phù hợp với philosophy hiện tại.
+
+4. **ADR F3 đã định nghĩa 3-layer** → P1 (X3 Transform) là phương án duy nhất tuân thủ đúng kiến trúc đã được phê duyệt trong ADR.
+
+5. **Safety là yêu cầu cao** → cần kết hợp P1/P5 với P6 hoặc P7.
+
+#### Đề xuất: Phương án Lai (P1 + P6 + P7) — "X3 Transform + Sandbox + Incremental Checkpoint"
+
+**Đây là phương án tối ưu nhất dựa trên context.**
+
+**Kiến trúc:**
+```
+runCrossArchitect() → RefactorPlan[]
+    ↓
+runCrossTransform() (X3) — P1: LLM sinh suggestion_code cho từng step
+    ↓
+ValidatePlanSteps() — kiểm tra tất cả code đã sẵn sàng
+    ↓
+ApplyPlanStepsIncremental() — P7: từng step một
+    ├── Step 1: áp dụng → verify ngay → OK thì checkpoint (git commit tạm)
+    ├── Step 2: áp dụng → verify ngay → FAIL thì rollback step này, skip
+    ├── Step 3: ...
+    └── Nếu tất cả OK: merge checkpoint → branch chính
+    └── Nếu có step fail: các step OK vẫn được giữ, step fail bị skip
+```
+
+**Lý do chọn:**
+
+1. **P1 (X3)** vì tuân thủ ADR F3, separation of concerns (architect plan, transformer code), maintainability cao nhất (21/30 điểm).
+
+2. **P6 (Sandbox)** vì safety — tất cả thay đổi được thực hiện trong git worktree hoặc branch tạm, chỉ merge khi pass toàn bộ verify.
+
+3. **P7 (Incremental Checkpoint)** vì resilience — nếu 1 step fail, các step khác vẫn thành công. Không bị "all or nothing". Phù hợp với pattern backup-then-mutate đã có.
+
+4. **Tổng điểm tổ hợp: 21 + safety của P6 + resilience của P7 = tối ưu toàn diện**
+
+---
+
+### 10.4 Bước 4: Chế Độ Phản Biện Nghịch Đảo (Adversarial Mode)
+
+**Giả định:** Tôi quyết định chọn **Phương án Lai (P1 + P6 + P7)** như đề xuất ở Bước 3.
+
+**Với tư cách Devil's Advocate, tôi sẽ tấn công lựa chọn này.**
+
+---
+
+#### 🔴 Kịch bản thất bại #1: "X3 Transformer sinh code không đủ tốt, verify fail liên tục"
+
+**Mô tả:** LLM trong X3 Transform được yêu cầu sinh TOÀN BỘ nội dung file mới. Với file phức tạp (nhiều import, dependency nội bộ), LLM có thể:
+- Thiếu import package nội bộ → `go vet` fail
+- Sai type signature → compile error
+- Thiếu dependency injection → runtime error (không phát hiện khi verify)
+
+**Hậu quả:** Với P7 (incremental), step create_file fail → skip → các step modify sau đó cũng fail vì file mới không tồn tại → **toàn bộ plan thất bại, không step nào được áp dụng.**
+
+**Xác suất:** Trung bình-Cao với codebase phức tạp. LLM không có context về toàn bộ dependency graph.
+
+**Giảm thiểu:** Thêm "dependency-aware prompting" — inject import graph của toàn bộ project vào X3 prompt. Nhưng điều này làm tăng token cost đáng kể.
+
+---
+
+#### 🔴 Kịch bản thất bại #2: "Checkpoint contamination — step sau phụ thuộc step trước đã fail"
+
+**Mô tả:** P7 áp dụng từng step, skip step fail. Vấn đề: step 2 (modify `user.go` để import `validator.go`) phụ thuộc vào step 1 (create `validator.go`). Nếu step 1 fail và bị skip, step 2 vẫn chạy và thêm import đến một package không tồn tại → **codebase bị hỏng.**
+
+**Kịch bản cụ thể:**
+```
+Plan: [create validator.go, modify user.go (import validator), modify admin.go (import validator)]
+Step 1: create validator.go → LLM sinh code sai syntax → verify fail → SKIP
+Step 2: modify user.go → thêm import "pkg/validator" → verify OK → CHECKPOINT
+Step 3: modify admin.go → thêm import "pkg/validator" → verify OK → CHECKPOINT
+
+Kết quả: user.go và admin.go import package không tồn tại → compile error toàn project!
+```
+
+**Hậu quả:** Tệ hơn cả "all or nothing" — codebase bị corrupt một phần.
+
+**Xác suất:** Cao. Đây là vấn đề cố hữu của incremental apply với dependency giữa các step.
+
+**Giảm thiểu:** Trước khi apply, xây dựng dependency graph giữa các step. Nếu step N phụ thuộc step M và M fail, tự động skip N. Nhưng điều này làm tăng độ phức tạp đáng kể.
+
+---
+
+#### 🔴 Kịch bản thất bại #3: "Sandbox merge conflict — changes không merge được vào branch chính"
+
+**Mô tả:** P6 dùng git worktree hoặc branch tạm. Trong thời gian apply (có thể vài phút do LLM calls), developer khác có thể push changes vào branch chính. Khi merge sandbox → main, conflict xảy ra.
+
+**Kịch bản cụ thể:**
+1. T0: Tạo sandbox từ `main` (commit A)
+2. T1-T5: X3 Transform + Apply trong sandbox
+3. T3: Developer khác push commit B vào `main`
+4. T5: Merge sandbox → main → **CONFLICT: `user.go` đã bị sửa bởi cả sandbox và commit B**
+
+**Hậu quả:** Merge conflict, cần người giải quyết thủ công. Mất tính tự động của `--apply`.
+
+**Xác suất:** Thấp với team nhỏ, trung bình với team lớn hoặc CI/CD pipeline.
+
+**Giảm thiểu:** Rebase sandbox trước khi merge. Nhưng rebase có thể fail nếu conflict.
+
+---
+
+#### 🔴 Kịch bản thất bại #4: "Token explosion — X3 prompt quá lớn với cluster nhiều file"
+
+**Mô tả:** P1 yêu cầu gửi toàn bộ file contents cho X3 Transform. Với cluster 8 files (default), mỗi file trung bình 500 dòng → 4000 dòng code. Prompt có thể 50K-100K tokens. Với plan phức tạp (5-7 steps), output có thể 20K-40K tokens.
+
+**Hậu quả:**
+- Vượt context window → LLM từ chối hoặc cắt output
+- Token cost cao (100K input + 40K output = ~$0.40-$1.00/plan với GPT-4o)
+- Thời gian phản hồi chậm (30-60 giây)
+
+**Xác suất:** Cao với cluster lớn hoặc file dài.
+
+**Giảm thiểu:** Giới hạn cluster size, dùng skeleton thay vì full content, hoặc chỉ gửi file bị ảnh hưởng.
+
+---
+
+#### 🔴 Kịch bản thất bại #5: "False positive verify — code pass go vet nhưng sai logic"
+
+**Mô tả:** Verify hiện tại chỉ kiểm tra:
+- AST parse (Go files) → đảm bảo syntax đúng
+- Balanced braces (non-Go) → heuristic thô
+- `go test` (optional, nếu `--apply-run-tests`)
+
+**Không kiểm tra:**
+- Logic correctness: function có hoạt động đúng không?
+- Type compatibility: kiểu trả về có khớp với caller không?
+- Interface satisfaction: type mới có implement interface không?
+- Race conditions, deadlocks, memory leaks
+
+**Kịch bản:** X3 sinh `validator.go` với function `ValidateEmail`, syntax đúng, `go vet` pass. Nhưng function signature sai (nhận `*User` thay vì `string`) → `user.go` gọi `ValidateEmail(user)` → **compile fail ở step sau, hoặc tệ hơn: compile pass nhưng runtime panic.**
+
+**Hậu quả:** Verify pass, code được merge, nhưng broken ở runtime.
+
+**Xác suất:** Thấp-Trung bình. LLM thường sinh đúng signature nếu context đủ. Nhưng rủi ro có thật với codebase phức tạp.
+
+**Giảm thiểu:** Thêm `go build ./...` vào verify (không chỉ `go vet`). Nhưng vẫn không phát hiện được lỗi logic.
+
+---
+
+#### 🔴 Rủi ro kiến trúc bị bỏ qua
+
+1. **Coupling giữa Transformer và Architect prompt**: Nếu architect thay đổi format output (thêm field mới, đổi tên field), transformer phải thay đổi theo. Hai prompt tightly coupled → dễ break khi thay đổi một bên.
+
+2. **Silent data loss trong incremental rollback**: P7 rollback từng step bằng cách restore backup. Nhưng nếu step 2 sửa file mà step 1 đã backup → backup của step 2 không phải là trạng thái gốc mà là trạng thái sau step 1. Rollback step 2 sẽ restore về trạng thái sau step 1 (đã bị thay đổi), không phải trạng thái ban đầu.
+
+3. **State explosion**: P1 + P6 + P7 tạo ra 3 loại state cần quản lý: (a) LLM conversation state, (b) git worktree state, (c) checkpoint chain. Debug khi có lỗi sẽ rất phức tạp — cần trace qua cả 3 hệ thống.
+
+4. **Prompt injection / hallucination**: X3 nhận plan từ X2 architect. Nếu architect hallucinate (tạo plan không khả thi, sai file path), X3 sẽ cố gắng implement plan không khả thi → code rác. Không có validation logic nào kiểm tra tính khả thi của plan trước khi đưa vào X3.
+
+---
+
+### 10.5 Phán Quyết Cuối Cùng
+
+Sau khi cân nhắc cả 4 bước — đặc biệt là các kịch bản thất bại ở Bước 4 — tôi điều chỉnh đề xuất:
+
+#### Phương án tối ưu thực tế: P5 (Two-Phase Hybrid) + P6 (Sandbox wrapper)
+
+**Lý do điều chỉnh:**
+
+1. **P5 thực tế hơn P1:** Tận dụng `executeApplyPhase()` đã được test kỹ qua E2E tests (`apply_e2e_test.go`). Editor agent (LLM-as-editor) đã chứng minh khả năng tự sửa lỗi qua retry loop (TestE2E_EditWrongOldStr, TestE2E_ShellRunFailThenFix).
+
+2. **Tránh "token explosion" của P1:** Không cần gửi toàn bộ file contents trong 1 prompt. Editor agent tự `file_read` khi cần, tiết kiệm token.
+
+3. **Tránh "dependency failure cascade" của P7:** Editor agent xử lý toàn bộ plan trong 1 session, có thể tự điều chỉnh thứ tự. Nếu file A phụ thuộc file B, editor có thể tạo B trước, verify, rồi mới sửa A.
+
+4. **P6 là safety net:** Mọi thay đổi được thực hiện trong sandbox. Nếu editor fail hoặc kết quả không như mong đợi → discard sandbox, không ảnh hưởng branch chính.
+
+**Tổng điểm tổ hợp P5+P6: Quality 4 + Cost 2 + Safety 5 + Multi-lang 5 + Maintain 4 + Speed 5 = 25/30** (vượt P1 đơn thuần 21 điểm)
+
+#### Implementation plan điều chỉnh:
+
+| Giai đoạn | Nhiệm vụ | Effort |
+|---|---|---|
+| **G1 (2 ngày)** | Sửa architect prompt để sinh `suggestion_code` thô + Sửa `apply_task_system.md` để nhận multi-file plan | 2 ngày |
+| **G2 (1 ngày)** | Implement sandbox (git worktree) wrapper trong `runCrossApply` | 1 ngày |
+| **G3 (1 ngày)** | Kết nối: plans → apply_comments JSON → `executeApplyPhase` trong sandbox | 1 ngày |
+| **G4 (1 ngày)** | E2E tests: extract → create file → modify callers → verify → merge | 1 ngày |
+| **Tổng** | | **5 ngày** |
