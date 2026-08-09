@@ -7,7 +7,7 @@
       },
       {
         "role": "user",
-        "content": "<current_file_path>{{current_file_path}}</current_file_path>\n\n<current_file_content>\n{{file_content}}\n</current_file_content>\n\nCurrent time in the real world: {{current_system_date_time}}\n\n<user_task>\n{{apply_hint}}\n### Requirement Background (Optional)\n{{requirement_background}}\n\n### Refactoring Rules\n{{system_rule}}\n\n### Refactoring Guidance\n{{plan_guidance}}\n\nAnalyze the entire source file in <current_file_content>. Identify refactoring opportunities following the rules above. For each finding, indicate severity, confidence, and provide a before/after code preview via code_comment. Call task_done when complete.\n\n{{cross_file_hints}}\n</user_task>"
+        "content": "<current_file_path>{{current_file_path}}</current_file_path>\n\n<current_file_content>\n{{file_content}}\n</current_file_content>\n\nCurrent time in the real world: {{current_system_date_time}}\n\n<user_task>\n{{apply_hint}}\n### Requirement Background (Optional)\n{{requirement_background}}\n\n### Refactoring Rules\n{{system_rule}}\n\n### Refactoring Guidance\n{{plan_guidance}}\n\nAnalyze the entire source file in <current_file_content>. Identify refactoring opportunities following the rules above. For each finding, indicate severity, confidence, and provide a before/after code preview via code_comment. Call task_done when complete.\n\n{{cross_file_hints}}\n{{project_context}}\n</user_task>"
       }
     ],
     "timeout": 600
