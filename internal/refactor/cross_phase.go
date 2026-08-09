@@ -92,6 +92,14 @@ func (a *Agent) runCrossFilePhase(ctx context.Context) ([]model.LlmComment, erro
 			a.recordWarning("cross_architect_error", c.ID, err.Error())
 			continue
 		}
+		// X3: Transform — generate full suggestion_code before applying
+		plans, err = a.runCrossTransform(ctx, c, plans, crossRules)
+		if err != nil {
+			fmt.Fprintf(stdout.Writer(), "[ocr] cross-file transform failed for %s: %v\n", c.ID, err)
+			a.recordWarning("cross_transform_error", c.ID, err.Error())
+			// Continue with original plans (architect may have populated code)
+		}
+
 		allPlans = append(allPlans, plans...)
 		for _, co := range crossfile.PlansToComments(plans, c.ID) {
 			cm := commentOutToModel(co)
@@ -203,7 +211,25 @@ func (a *Agent) runCrossApply(ctx context.Context, plans []crossfile.RefactorPla
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		res := crossfile.ApplyPlanSteps(a.args.RepoDir, attemptPlans, a.args.ApplyRunTests)
+		// Apply in sandbox for safety
+		sandbox, sbErr := crossfile.NewSandbox(a.args.RepoDir)
+		if sbErr != nil {
+			fmt.Fprintf(stdout.Writer(), "[ocr] apply: sandbox create failed: %v\n", sbErr)
+			return
+		}
+		defer sandbox.Cleanup()
+		res := crossfile.ApplyPlanSteps(sandbox.Dir(), attemptPlans, a.args.ApplyRunTests)
+		if res.Verify.OK && !res.RolledBack {
+			if mergeErr := sandbox.Merge(res.Written, res.Deleted); mergeErr != nil {
+				// Append merge error to existing messages instead of overwriting
+				res.Verify.OK = false
+				res.Verify.Messages = append(res.Verify.Messages,
+					fmt.Sprintf("sandbox merge failed: %v", mergeErr))
+				fmt.Fprintf(stdout.Writer(), "[ocr] apply: sandbox merge failed: %v\n", mergeErr)
+				// Note: RolledBack is false here because the sandbox still has valid state;
+				// the merge failure means repo was not updated but sandbox is intact.
+			}
+		}
 		for _, m := range res.Messages {
 			fmt.Fprintf(stdout.Writer(), "[ocr] apply: %s\n", m)
 		}
@@ -250,4 +276,82 @@ func commentOutToModel(co crossfile.CommentOut) model.LlmComment {
 		})
 	}
 	return cm
+}
+
+// runCrossTransform (X3) calls the LLM to generate complete suggestion_code
+// for each plan step. Input: RefactorPlan from X2 architect. Output: RefactorPlan
+// with suggestion_code fully populated.
+func (a *Agent) runCrossTransform(ctx context.Context, c crossfile.Cluster, plans []crossfile.RefactorPlan, crossRules string) ([]crossfile.RefactorPlan, error) {
+	ctx, span := telemetry.StartSpan(ctx, "refactor.cross_transform")
+	defer span.End()
+
+	pt := a.args.Template.CrossTransformTask
+	if pt == nil || len(pt.Messages) == 0 {
+		// Fallback: return plans as-is (architect may have already populated code)
+		fmt.Fprintln(stdout.Writer(), "[ocr] cross-file transform: CROSS_TRANSFORM_TASK not configured, using architect code as-is")
+		return plans, nil
+	}
+
+	if a.args.LLMClient == nil {
+		return plans, fmt.Errorf("cross-file transform requires LLM client")
+	}
+
+	planJSON, filesBlock := crossfile.RenderTransformPrompt(c, plans)
+
+	messages := make([]llm.Message, 0, len(pt.Messages))
+	for _, m := range pt.Messages {
+		content := m.Content
+		content = strings.ReplaceAll(content, "{{current_system_date_time}}", a.currentDate)
+		content = strings.ReplaceAll(content, "{{cross_file_rules}}", crossRules)
+		content = strings.ReplaceAll(content, "{{plan_json}}", planJSON)
+		content = strings.ReplaceAll(content, "{{transform_files}}", filesBlock)
+		messages = append(messages, llm.NewTextMessage(m.Role, content))
+	}
+
+	resp, err := a.args.LLMClient.CompletionsWithCtx(ctx, llm.ChatRequest{
+		Model:     a.args.Model,
+		Messages:  messages,
+		MaxTokens: a.args.Template.MaxTokens,
+	})
+	if err != nil {
+		return plans, fmt.Errorf("transform LLM call: %w", err)
+	}
+	a.runner.RecordUsage(resp.Usage)
+
+	transformed, err := crossfile.ParseRefactorPlans(resp.Content())
+	if err != nil {
+		fmt.Fprintf(stdout.Writer(), "[ocr] cross-file transform: parse error: %v, falling back to architect plans\n", err)
+		return plans, nil
+	}
+
+	if len(transformed) == 0 {
+		fmt.Fprintln(stdout.Writer(), "[ocr] cross-file transform: no transformed plans, using architect plans as-is")
+		return plans, nil
+	}
+
+	// Merge transformed suggestion_code into original plans.
+	// NOTE: This mutates orig.Steps in place via the planMap pointers.
+	// Callers should not rely on the original plans after this call.
+	planMap := make(map[string]*crossfile.RefactorPlan)
+	for i := range plans {
+		planMap[plans[i].PlanID] = &plans[i]
+	}
+	for _, tp := range transformed {
+		if orig, ok := planMap[tp.PlanID]; ok {
+			stepMap := make(map[int]int) // order -> index
+			for j, s := range tp.Steps {
+				stepMap[s.Order] = j
+			}
+			for k := range orig.Steps {
+				if j, ok := stepMap[orig.Steps[k].Order]; ok && tp.Steps[j].SuggestionCode != "" {
+					orig.Steps[k].SuggestionCode = tp.Steps[j].SuggestionCode
+				}
+			}
+		}
+	}
+
+	fmt.Fprintf(stdout.Writer(), "[ocr] cross-file transform: %d plan(s) transformed\n", len(transformed))
+	telemetry.Event(ctx, "refactor.cross_transform.done",
+		telemetry.AnyToAttr("plans", len(transformed)))
+	return plans, nil
 }

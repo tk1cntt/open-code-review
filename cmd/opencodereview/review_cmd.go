@@ -172,6 +172,8 @@ func executeReview(ctx context.Context, opts reviewOptions) error {
 	var tools *tool.Registry
 	if opts.apply {
 		tools = buildToolRegistryWithEditors(rt.Collector, fileReader, cc.RepoDir)
+		// Signal the rule resolver to inject the suggestion_code requirement.
+		cc.Resolver.InjectApplyHint()
 	} else {
 		tools = buildToolRegistry(rt.Collector, fileReader)
 	}

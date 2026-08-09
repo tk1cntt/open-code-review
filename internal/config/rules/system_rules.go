@@ -19,6 +19,8 @@ import (
 type Resolver interface {
 	Resolve(path string) string
 	ResolveRefactor(path string) string
+	// InjectApplyHint signals that suggestion_code must be generated for every issue.
+	InjectApplyHint()
 }
 
 // PathRule is a single pattern→rule entry preserving declaration order.
@@ -48,6 +50,9 @@ type SystemRule struct {
 
 	// raw family file paths (name → relative path under rule_docs/), used only during load.
 	refactorFamilyFiles map[string]string
+
+	// applyHint forces inclusion of the suggestion_code instruction in resolved rules.
+	applyHint bool
 }
 
 // UnmarshalJSON preserves the key order from JSON's path_rule_map and
@@ -280,6 +285,21 @@ type DetailResolver interface {
 	ResolveDetail(path string) RuleDetail
 }
 
+// InjectApplyHint enables suggestion_code requirement injection.
+func (r *SystemRule) InjectApplyHint() {
+	r.applyHint = true
+}
+
+// applyHintInstruction is the prompt snippet appended when --apply is active.
+const applyHintInstruction = `
+
+## APPLY MODE ACTIVE
+You MUST provide a suggestion_code with exact corrected code for EVERY issue you report.
+- suggestion_code must contain the complete corrected code block
+- Do NOT skip suggestion_code — it is REQUIRED in apply mode
+- If you cannot determine the exact fix, set confidence to LOW and provide your best suggestion
+`
+
 // Resolve returns the rule text for a given file path.
 // Patterns with brace expansion like "*.{go,py}" are expanded into "*.go", "*.py".
 // The first match wins; if none match, it falls back to DefaultRule.
@@ -290,9 +310,15 @@ func (r *SystemRule) Resolve(path string) string {
 		expanded := expandBraces(pr.Pattern)
 		for _, p := range expanded {
 			if matched, _ := doublestar.Match(strings.ToLower(p), lowerPath); matched {
+				if r.applyHint {
+					return pr.Rule + applyHintInstruction
+				}
 				return pr.Rule
 			}
 		}
+	}
+	if r.applyHint {
+		return r.DefaultRule + applyHintInstruction
 	}
 	return r.DefaultRule
 }
@@ -487,6 +513,13 @@ type composedResolver struct {
 	enterpriseGlobal  *ProjectRule // medium-low: <rules-dir>/global.json
 	global            *ProjectRule // low: ~/.opencodereview/rule.json
 	system            *SystemRule  // lowest: embedded default
+
+	applyHint bool
+}
+
+// InjectApplyHint signals that the resolved rules must include the suggestion_code requirement.
+func (c *composedResolver) InjectApplyHint() {
+	c.applyHint = true
 }
 
 // NewResolver builds a Resolver with the following priority:
@@ -743,13 +776,21 @@ func loadProjectRule(repoDir string) (*ProjectRule, error) {
 func (c *composedResolver) Resolve(path string) string {
 	for _, layer := range []*ProjectRule{c.custom, c.project, c.enterpriseProject, c.enterpriseGlobal, c.global} {
 		if entry := matchProjectRuleEntry(layer, path); entry != nil {
+			result := entry.Rule
 			if entry.MergeSystemRule {
-				return c.mergeWithSystemRule(path, entry.Rule)
+				result = c.mergeWithSystemRule(path, entry.Rule)
 			}
-			return entry.Rule
+			if c.applyHint {
+				result += applyHintInstruction
+			}
+			return result
 		}
 	}
-	return c.system.Resolve(path)
+	result := c.system.Resolve(path)
+	if c.applyHint {
+		result += applyHintInstruction
+	}
+	return result
 }
 
 func (c *composedResolver) ResolveRefactor(path string) string {

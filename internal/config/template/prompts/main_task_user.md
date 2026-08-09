@@ -12,6 +12,7 @@
 Current time in the real world: {{current_system_date_time}}
 
 <user_task>
+{{apply_hint}}
 ### Requirement Background (Optional)
 {{requirement_background}}
 

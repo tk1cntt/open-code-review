@@ -80,6 +80,7 @@
               "required": [
                 "content",
                 "existing_code",
+                "suggestion_code",
                 "category",
                 "severity"
               ]

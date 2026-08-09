@@ -313,3 +313,190 @@ func TestE2E_FileWriteCreateNew(t *testing.T) {
 		t.Fatalf("expected comment after edit, got: %s", string(got))
 	}
 }
+
+// TestE2E_ExactMatchSuggestionCode verifies that file_edit applies
+// suggestion_code exactly without modification. This is the core
+// fix for P0.2 — LLM must not "improve" the suggestion_code.
+func TestE2E_ExactMatchSuggestionCode(t *testing.T) {
+	dir := t.TempDir()
+
+	src := filepath.Join(dir, "main.go")
+	content := "package main\n\nfunc Greet() string {\n\treturn \"hello\"\n}\n"
+	if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	suggestionCode := "\"hey there\""
+
+	ctx := context.Background()
+
+	relPath := src[len(dir)+1:]
+	edit := NewFileEdit(dir)
+	result, err := edit.Execute(ctx, map[string]any{
+		"file_path": relPath,
+		"old_str":   "\"hello\"",
+		"new_str":   suggestionCode,
+	})
+	if err != nil {
+		t.Fatalf("file_edit failed: %v", err)
+	}
+	if !strings.Contains(result, "Successfully edited") {
+		t.Fatalf("expected success, got: %s", result)
+	}
+
+	got, _ := os.ReadFile(src)
+	if !strings.Contains(string(got), suggestionCode) {
+		t.Fatalf("expected suggestion_code %q in file, got: %s", suggestionCode, string(got))
+	}
+	if strings.Contains(string(got), "\"hello\"") {
+		t.Fatalf("old code still present in file: %s", string(got))
+	}
+}
+
+// TestE2E_PostApplyVerifyMismatchDetection verifies that we can detect
+// when applied code does NOT contain the suggestion_code.
+func TestE2E_PostApplyVerifyMismatchDetection(t *testing.T) {
+	dir := t.TempDir()
+
+	src := filepath.Join(dir, "main.go")
+	content := "package main\n\nfunc Greet() string {\n\treturn \"hello\"\n}\n"
+	if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	suggestionCode := "\"should be here\""
+
+	relPath := src[len(dir)+1:]
+	edit := NewFileEdit(dir)
+	result, err := edit.Execute(ctx, map[string]any{
+		"file_path": relPath,
+		"old_str":   "\"hello\"",
+		"new_str":   "\"wrong replacement\"",
+	})
+	if err != nil {
+		t.Fatalf("file_edit failed: %v", err)
+	}
+	if !strings.Contains(result, "Successfully edited") {
+		t.Fatalf("expected success, got: %s", result)
+	}
+
+	got, _ := os.ReadFile(src)
+	if strings.Contains(string(got), suggestionCode) {
+		t.Fatalf("suggestion_code found but we applied different code — mismatch detection failed")
+	}
+
+	t.Log("Mismatch correctly detected: suggestion_code not in file after wrong apply")
+}
+
+// TestE2E_MultipleCommentsSameFile applies 2 comments to the same file
+// and verifies both are applied correctly.
+func TestE2E_MultipleCommentsSameFile(t *testing.T) {
+	dir := t.TempDir()
+
+	src := filepath.Join(dir, "main.go")
+	content := "package main\n\n// comment A area\nvar x = 10\nvar y = 20\n\n// comment B area\nvar z = 30\nvar w = 40\n"
+	if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	relPath := src[len(dir)+1:]
+
+	edit := NewFileEdit(dir)
+	result, err := edit.Execute(ctx, map[string]any{
+		"file_path": relPath,
+		"old_str":   "var z = 30",
+		"new_str":   "var z = 999",
+	})
+	if err != nil {
+		t.Fatalf("file_edit B failed: %v", err)
+	}
+	if !strings.Contains(result, "Successfully edited") {
+		t.Fatalf("edit B not successful: %s", result)
+	}
+
+	result, err = edit.Execute(ctx, map[string]any{
+		"file_path": relPath,
+		"old_str":   "var x = 10",
+		"new_str":   "var x = 100",
+	})
+	if err != nil {
+		t.Fatalf("file_edit A failed: %v", err)
+	}
+	if !strings.Contains(result, "Successfully edited") {
+		t.Fatalf("edit A not successful: %s", result)
+	}
+
+	got, _ := os.ReadFile(src)
+	if !strings.Contains(string(got), "var x = 100") {
+		t.Fatalf("comment A not applied: %s", string(got))
+	}
+	if !strings.Contains(string(got), "var z = 999") {
+		t.Fatalf("comment B not applied: %s", string(got))
+	}
+	// Use exact line matching to avoid substring false positives
+	// (e.g. "var x = 10" matches "var x = 100" with Contains)
+	lines := strings.Split(string(got), "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "var x = 10" {
+			t.Fatalf("old value x=10 still present in: %s", trimmed)
+		}
+		if trimmed == "var z = 30" {
+			t.Fatalf("old value z=30 still present in: %s", trimmed)
+		}
+	}
+}
+
+// TestE2E_ExistingCodeField verifies that using the existing_code field
+// (when available) allows precise location of old_str.
+func TestE2E_ExistingCodeField(t *testing.T) {
+	dir := t.TempDir()
+
+	src := filepath.Join(dir, "main.go")
+	content := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello world\")\n}\n"
+	if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	relPath := src[len(dir)+1:]
+
+	existingCode := "fmt.Println(\"hello world\")"
+	suggestionCode := "fmt.Println(\"hello, existing_code field works!\")"
+
+	fr := &FileReader{RepoDir: dir, Mode: ModeWorkspace}
+	frp := NewFileRead(fr)
+	readResult, err := frp.Execute(ctx, map[string]any{
+		"file_path": relPath,
+	})
+	if err != nil {
+		t.Fatalf("file_read failed: %v", err)
+	}
+	if !strings.Contains(readResult, existingCode) {
+		t.Fatalf("existing_code not found in file: %s", readResult)
+	}
+
+	edit := NewFileEdit(dir)
+	result, err := edit.Execute(ctx, map[string]any{
+		"file_path": relPath,
+		"old_str":   existingCode,
+		"new_str":   suggestionCode,
+	})
+	if err != nil {
+		t.Fatalf("file_edit failed: %v", err)
+	}
+	if !strings.Contains(result, "Successfully edited") {
+		t.Fatalf("expected success, got: %s", result)
+	}
+
+	got, _ := os.ReadFile(src)
+	if !strings.Contains(string(got), suggestionCode) {
+		t.Fatalf("suggestion_code not found in file after apply: %s", string(got))
+	}
+	if strings.Contains(string(got), existingCode) {
+		t.Fatalf("existing_code still present after replace: %s", string(got))
+	}
+}

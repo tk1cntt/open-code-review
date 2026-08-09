@@ -103,3 +103,50 @@ func RenderFilesForArchitect(c Cluster, affected []string) string {
 	b.WriteString("</files>\n")
 	return b.String()
 }
+
+// RenderTransformPrompt builds the prompt context for X3 transformer.
+func RenderTransformPrompt(c Cluster, plans []RefactorPlan) (planJSON string, filesBlock string) {
+	// Serialize plans
+	data, err := json.Marshal(plans)
+	if err != nil {
+		planJSON = "[]"
+	} else {
+		planJSON = string(data)
+	}
+
+	// Collect affected files
+	affected := map[string]struct{}{}
+	for _, p := range plans {
+		for _, s := range p.Steps {
+			if s.Path != "" {
+				affected[s.Path] = struct{}{}
+			}
+			for _, r := range s.RelatedPaths {
+				affected[r] = struct{}{}
+			}
+		}
+	}
+
+	// Build files block
+	var b strings.Builder
+	b.WriteString("<files>\n")
+	n := 0
+	for _, f := range c.Files {
+		if _, ok := affected[f.Path]; !ok && len(affected) > 0 {
+			continue
+		}
+		body := f.Content
+		if len(body) > 20_000 {
+			i := 20_000
+			for i > 0 && i < len(body) && body[i]&0xC0 == 0x80 {
+				i--
+			}
+			body = body[:i] + "\n…[truncated]"
+		}
+		fmt.Fprintf(&b, "<file path=%q>\n```\n%s\n```\n</file>\n", f.Path, body)
+		n++
+	}
+	b.WriteString("</files>\n")
+	filesBlock = b.String()
+	return
+}

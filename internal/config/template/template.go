@@ -51,6 +51,7 @@ type ScanTemplate struct {
 // from refactor_template.json. Follows the ScanTemplate pattern with embedded
 // prompt content directly (no prompt_file indirection).
 type RefactorTemplate struct {
+	CrossTransformTask    *LlmConversation `json:"CROSS_TRANSFORM_TASK,omitempty"`
 	MainTask              LlmConversation  `json:"MAIN_TASK"`
 	PlanTask              *LlmConversation `json:"PLAN_TASK,omitempty"`
 	CrossDetectTask       *LlmConversation `json:"CROSS_DETECT_TASK,omitempty"`
@@ -285,6 +286,9 @@ func (t *RefactorTemplate) ApplyLanguage(lang string) {
 	if t.CrossArchitectTask != nil {
 		applyLanguage(t.CrossArchitectTask, instruction)
 	}
+	if t.CrossTransformTask != nil {
+		applyLanguage(t.CrossTransformTask, instruction)
+	}
 	applyLanguage(&t.MemoryCompressionTask, instruction)
 }
 
@@ -322,6 +326,12 @@ func (t *RefactorTemplate) TemplateHashFields() []string {
 	}
 	for _, m := range t.MainTask.Messages {
 		parts = append(parts, m.Role, m.Content)
+	}
+	if t.CrossTransformTask != nil {
+		parts = append(parts, fmt.Sprintf("cross_transform_timeout=%d", t.CrossTransformTask.Timeout))
+		for _, m := range t.CrossTransformTask.Messages {
+			parts = append(parts, m.Role, m.Content)
+		}
 	}
 	return parts
 }

@@ -7,7 +7,7 @@
       },
       {
         "role": "user",
-        "content": "<current_file_path>{{current_file_path}}</current_file_path>\n\n<current_file_content>\n{{file_content}}\n</current_file_content>\n\nCurrent time in the real world: {{current_system_date_time}}\n\n<user_task>\n### Requirement Background (Optional)\n{{requirement_background}}\n\n### Refactoring Rules\n{{system_rule}}\n\n### Refactoring Guidance\n{{plan_guidance}}\n\nAnalyze the entire source file in <current_file_content>. Identify refactoring opportunities following the rules above. For each finding, indicate severity, confidence, and provide a before/after code preview via code_comment. Call task_done when complete.\n\n{{cross_file_hints}}\n</user_task>"
+        "content": "<current_file_path>{{current_file_path}}</current_file_path>\n\n<current_file_content>\n{{file_content}}\n</current_file_content>\n\nCurrent time in the real world: {{current_system_date_time}}\n\n<user_task>\n{{apply_hint}}\n### Requirement Background (Optional)\n{{requirement_background}}\n\n### Refactoring Rules\n{{system_rule}}\n\n### Refactoring Guidance\n{{plan_guidance}}\n\nAnalyze the entire source file in <current_file_content>. Identify refactoring opportunities following the rules above. For each finding, indicate severity, confidence, and provide a before/after code preview via code_comment. Call task_done when complete.\n\n{{cross_file_hints}}\n</user_task>"
       }
     ],
     "timeout": 600
@@ -29,7 +29,7 @@
     "messages": [
       {
         "role": "system",
-        "content": "## Role\nYou are RefactoringArchitect. Given cross-file smells and full file contents of affected files, produce a non-breaking multi-file refactor plan.\n\n## Rules\n- Prefer unexported same-package helpers before new public APIs\n- Topological step order: create/shared base first, call sites later\n- Do not invent files outside the provided set\n- Output JSON only\n\n## Output schema\n{\n  \"plans\": [\n    {\n      \"plan_id\": \"plan-1\",\n      \"summary\": \"...\",\n      \"breaking_change\": false,\n      \"smell_type\": \"DUPLICATED_FLOW\",\n      \"rule_id\": \"REF-XEXTRACT-001\",\n      \"steps\": [\n        {\"order\": 1, \"action\": \"create_file\", \"path\": \"pkg/h.go\", \"symbol\": \"Helper\", \"suggestion_code\": \"optional full file preview\", \"notes\": \"...\"},\n        {\"order\": 2, \"action\": \"rewrite_callsite\", \"path\": \"pkg/a.go\", \"related_paths\": [\"pkg/h.go\"], \"notes\": \"...\"}\n      ],\n      \"risks\": [],\n      \"test_focus\": [\"pkg\"]\n    }\n  ]\n}\nIf no safe plan, {\"plans\": []}."
+        "content": "## Role\nYou are RefactoringArchitect. Given cross-file smells and full file contents of affected files, produce a non-breaking multi-file refactor plan WITH draft suggestion_code for each step.\n\n## CRITICAL: suggestion_code REQUIRED\n- Every step MUST include suggestion_code — it is NOT optional\n- create_file: write the COMPLETE file content (package, imports, full implementation)\n- modify: write the COMPLETE modified file content (entire file after changes)\n- rewrite_callsite: write the complete updated callsite\n- delete: no code needed (empty string is fine)\n- Draft quality is acceptable — a downstream editor agent will refine and apply\n\n## Rules\n- Prefer unexported same-package helpers before new public APIs\n- Topological step order: create/shared base first, call sites later\n- Do not invent files outside the provided set\n- Output JSON only\n\n## Output schema\n{\n  \"plans\": [\n    {\n      \"plan_id\": \"plan-1\",\n      \"summary\": \"...\",\n      \"breaking_change\": false,\n      \"smell_type\": \"DUPLICATED_FLOW\",\n      \"rule_id\": \"REF-XEXTRACT-001\",\n      \"steps\": [\n        {\"order\": 1, \"action\": \"create_file\", \"path\": \"pkg/h.go\", \"symbol\": \"Helper\", \"suggestion_code\": \"package h\\n\\nfunc Helper() { ... }\", \"notes\": \"...\"},\n        {\"order\": 2, \"action\": \"rewrite_callsite\", \"path\": \"pkg/a.go\", \"related_paths\": [\"pkg/h.go\"], \"suggestion_code\": \"Helper()\", \"notes\": \"replace duplicated logic with call to Helper\"}\n      ],\n      \"risks\": [],\n      \"test_focus\": [\"pkg\"]\n    }\n  ]\n}\nIf no safe plan, {\"plans\": []}."
       },
       {
         "role": "user",
@@ -76,6 +76,19 @@
       }
     ],
     "timeout": 180
+  },
+  "CROSS_TRANSFORM_TASK": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "## Role\nYou are CodeTransformer. You receive a refactoring plan and source file contents. Your job is to generate COMPLETE, COMPILABLE implementation code for each plan step.\n\n## CRITICAL RULES\n- For create_file: write COMPLETE file (package declaration, all imports, full implementation)\n- For modify: write COMPLETE modified file (ENTIRE file after changes, not just the diff)\n- For rewrite_callsite: write the complete updated code section\n- For delete: leave suggestion_code empty string\n- suggestion_code must be COMPILABLE — include all necessary imports and dependencies\n- Maintain consistent code style with the existing codebase\n- Do NOT use placeholders like \"...\" or \"// TODO\" — write actual implementation\n- Preserve observable behavior exactly\n\n## Output Format\n{\n  \"plans\": [{\n    \"plan_id\": \"plan-1\",\n    \"steps\": [\n      {\"order\": 1, \"action\": \"create_file\", \"path\": \"pkg/h.go\", \"suggestion_code\": \"package h\\n\\nimport \\\"fmt\\\"\\n\\nfunc Helper() {\\n\\tfmt.Println(\\\"hello\\\")\\n}\\n\"},\n      {\"order\": 2, \"action\": \"modify\", \"path\": \"pkg/a.go\", \"suggestion_code\": \"package a\\n\\nimport \\\"pkg/h\\\"\\n\\nfunc main() {\\n\\th.Helper()\\n}\\n\"}\n    ]\n  }]\n}\nOutput JSON only, no markdown fences."
+      },
+      {
+        "role": "user",
+        "content": "Current time: {{current_system_date_time}}\n\n### Plan\n{{plan_json}}\n\n### Files\n{{transform_files}}\n\nEmit the completed plans JSON with full suggestion_code now."
+      }
+    ],
+    "timeout": 300
   },
   "MAX_TOKENS": 200000,
   "TOOL_REQUEST_WAIT_TIME_MS": 30000,

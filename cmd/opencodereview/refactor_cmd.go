@@ -148,6 +148,9 @@ func executeRefactor(ctx context.Context, opts refactorOptions) error {
 	var perFileWriter *reviewstore.PerFileWriter
 
 	crossHints := strings.EqualFold(opts.crossFile, "hints")
+	if opts.apply {
+		cc.Resolver.InjectApplyHint()
+	}
 	ag := refactor.NewAgent(refactor.Args{
 		RepoDir:               cc.RepoDir,
 		Paths:                 refactorPaths,

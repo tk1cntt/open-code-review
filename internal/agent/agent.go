@@ -1351,6 +1351,11 @@ func (a *Agent) executeSubtask(ctx context.Context, d model.Diff, start session.
 			content = strings.ReplaceAll(content, "{{current_system_date_time}}", a.currentDate)
 			content = strings.ReplaceAll(content, "{{current_file_path}}", newPath)
 			content = strings.ReplaceAll(content, "{{system_rule}}", rule)
+			if a.args.Apply {
+				content = strings.ReplaceAll(content, "{{apply_hint}}", "\n\n## APPLY MODE ACTIVE\nYou MUST provide suggestion_code with the EXACT corrected code for EVERY issue you report.\n- suggestion_code must contain the complete corrected code block\n- If you cannot determine the exact fix, provide your best suggestion\n- Do NOT skip suggestion_code — it is REQUIRED in apply mode\n")
+			} else {
+				content = strings.ReplaceAll(content, "{{apply_hint}}", "")
+			}
 			content = strings.ReplaceAll(content, "{{change_files}}", changeFilesExcludingCurrent)
 			content = strings.ReplaceAll(content, "{{diff}}", d.Diff)
 			content = strings.ReplaceAll(content, "{{requirement_background}}", a.args.Background)
@@ -1556,22 +1561,38 @@ func (a *Agent) executeApplyPhase(ctx context.Context, d model.Diff, newPath str
 	rec.Duration = duration
 
 	// Post-apply verification: check suggestion_code is actually in the file.
+	// Cache file reads per-path to avoid redundant I/O.
+	readCache := make(map[string]string)
+	readErrors := 0
 	mismatchCount := 0
 	for _, cm := range actionable {
 		if cm.SuggestionCode == "" {
 			continue
 		}
 		abs := filepath.Join(a.args.RepoDir, filepath.FromSlash(cm.Path))
-		current, err := os.ReadFile(abs)
-		if err != nil {
-			fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: cannot verify %s: %v\n", cm.Path, err)
-			mismatchCount++
+		current, cached := readCache[abs]
+		if !cached {
+			data, err := os.ReadFile(abs)
+			if err != nil {
+				fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: cannot verify %s: %v\n", cm.Path, err)
+				readCache[abs] = "" // cache empty to avoid repeat counting
+				readErrors++
+				continue
+			}
+			current = string(data)
+			readCache[abs] = current
+		}
+		if current == "" {
+			// file was unreadable; already counted as error above
 			continue
 		}
-		if !strings.Contains(string(current), cm.SuggestionCode) {
+		if !strings.Contains(current, cm.SuggestionCode) {
 			fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: WARNING — suggestion_code not found in %s after apply (applied code differs from suggestion)\n", cm.Path)
 			mismatchCount++
 		}
+	}
+	if readErrors > 0 {
+		fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: %d/%d file(s) could not be read for verification\n", readErrors, len(actionable))
 	}
 	if mismatchCount > 0 {
 		fmt.Fprintf(stdout.Writer(), "[ocr] Agentic apply: %d/%d comment(s) mismatch — applied code differs from suggestion_code\n", mismatchCount, len(actionable))
@@ -1611,7 +1632,7 @@ func buildApplyCommentsJSON(comments []model.LlmComment) string {
 		Content        string `json:"content"`
 		StartLine      int    `json:"start_line"`
 		EndLine        int    `json:"end_line"`
-		ExistingCode   string `json:"existing_code"`
+		ExistingCode   string `json:"existing_code,omitempty"`
 		SuggestionCode string `json:"suggestion_code"`
 	}
 	items := make([]applyComment, len(comments))

@@ -16,6 +16,7 @@ type stubResolver struct {
 
 func (s *stubResolver) Resolve(_ string) string       { return s.ruleText }
 func (s *stubResolver) ResolveRefactor(_ string) string { return s.ruleText }
+func (s *stubResolver) InjectApplyHint()              {}
 
 // stubDetailResolver implements both rules.Resolver and rules.DetailResolver.
 type stubDetailResolver struct {
@@ -29,6 +30,7 @@ func (s *stubDetailResolver) Resolve(path string) string {
 func (s *stubDetailResolver) ResolveRefactor(path string) string {
 	return s.Resolve(path)
 }
+func (s *stubDetailResolver) InjectApplyHint() {}
 
 func (s *stubDetailResolver) ResolveDetail(path string) rules.RuleDetail {
 	if d, ok := s.mapping[path]; ok {

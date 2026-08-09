@@ -689,6 +689,7 @@ func (a *Agent) executeSubtask(ctx context.Context, it model.ScanItem, start ses
 		}
 		messages = a.renderMessages(it, rule, planGuidance)
 	}
+	messages = a.applyHint(messages)
 
 	tokenCount := llmloop.CountMessagesTokens(messages)
 	maxAllowed := a.args.Template.MaxTokens
@@ -753,12 +754,12 @@ func (a *Agent) executeWithRetries(ctx context.Context, it model.ScanItem, batch
 		var cancel context.CancelFunc
 		if timeout > 0 {
 			retryTimeout := timeout * time.Duration(attempt+1)
-				// When continuing from a mid-file checkpoint the remaining
-				// work is less than a full cold start — keep the base timeout
-				// instead of doubling it each retry.
-				if start.Mode == session.ModeContinue && retryTimeout > timeout {
-					retryTimeout = timeout
-				}
+			// When continuing from a mid-file checkpoint the remaining
+			// work is less than a full cold start — keep the base timeout
+			// instead of doubling it each retry.
+			if start.Mode == session.ModeContinue && retryTimeout > timeout {
+				retryTimeout = timeout
+			}
 			fileCtx, cancel = context.WithTimeout(ctx, retryTimeout)
 		} else {
 			fileCtx = ctx
@@ -955,6 +956,26 @@ func (a *Agent) fillPlaceholders(content string, it model.ScanItem, rule string,
 	return content
 }
 
+// applyHint substitutes {{apply_hint}} in messages: when --apply is active it
+// inserts the APPLY MODE ACTIVE directive; otherwise it strips the placeholder.
+func (a *Agent) applyHint(messages []llm.Message) []llm.Message {
+	if a.args.Apply {
+		applyHintText := "\n\n## APPLY MODE ACTIVE\nYou MUST provide suggestion_code with the EXACT corrected code for EVERY issue you report.\n- suggestion_code must contain the complete corrected code block\n- If you cannot determine the exact fix, provide your best suggestion\n- Do NOT skip suggestion_code — it is REQUIRED in apply mode\n"
+		for i := range messages {
+			if s, ok := messages[i].Content.(string); ok {
+				messages[i].Content = strings.ReplaceAll(s, "{{apply_hint}}", applyHintText)
+			}
+		}
+	} else {
+		for i := range messages {
+			if s, ok := messages[i].Content.(string); ok {
+				messages[i].Content = strings.ReplaceAll(s, "{{apply_hint}}", "")
+			}
+		}
+	}
+	return messages
+}
+
 func (a *Agent) renderMessages(it model.ScanItem, rule, planGuidance string) []llm.Message {
 	rawMsgs := a.args.Template.MainTask.Messages
 	messages := make([]llm.Message, 0, len(rawMsgs))
@@ -971,7 +992,8 @@ func (a *Agent) renderMessages(it model.ScanItem, rule, planGuidance string) []l
 		content := a.fillPlaceholders(m.Content, it, rule, extra)
 		messages = append(messages, llm.NewTextMessage(m.Role, content))
 	}
-	return messages
+
+	return a.applyHint(messages)
 }
 
 // Preview returns the list of files that would be analyzed without invoking the LLM.
@@ -1010,5 +1032,3 @@ func (a *Agent) Preview(ctx context.Context) (*model.Preview, error) {
 	}
 	return result, nil
 }
-
-
