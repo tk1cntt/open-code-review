@@ -7,6 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -285,6 +288,13 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 		if runErr != nil {
 			a.session.Finalize()
 			return comments, runErr
+		}
+	}
+
+	// Phase L apply — apply local per-file suggestion_code edits to workspace.
+	if a.args.Apply {
+		if applyErr := a.applyLocalComments(); applyErr != nil {
+			fmt.Fprintf(stdout.Writer(), "[ocr] local apply: %v\n", applyErr)
 		}
 	}
 
@@ -853,6 +863,76 @@ func (a *Agent) recordFileSuccess(it model.ScanItem, fingerprint string, comment
 	if a.args.OnFileDone != nil {
 		a.args.OnFileDone(it.Path, comments)
 	}
+}
+
+// applyLocalComments collects LlmComment entries with non-empty SuggestionCode
+// from the comment collector, sorts them bottom-up by StartLine, and applies
+// each one by replacing ExistingCode with SuggestionCode in the workspace file.
+func (a *Agent) applyLocalComments() error {
+	type commentWithLine struct {
+		comment model.LlmComment
+	}
+
+	comments := a.args.CommentCollector.Comments()
+	if len(comments) == 0 {
+		fmt.Fprintln(stdout.Writer(), "[ocr] local apply: no comments to apply")
+		return nil
+	}
+
+	var candidates []commentWithLine
+	for _, c := range comments {
+		if c.SuggestionCode != "" {
+			candidates = append(candidates, commentWithLine{comment: c})
+		}
+	}
+	if len(candidates) == 0 {
+		fmt.Fprintln(stdout.Writer(), "[ocr] local apply: no comments with suggestion_code")
+		return nil
+	}
+
+	// Sort bottom-up by StartLine so earlier replacements don't shift offsets.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].comment.StartLine > candidates[j].comment.StartLine
+	})
+
+	var applied, skipped int
+	for _, cw := range candidates {
+		c := cw.comment
+		abs := filepath.Join(a.args.RepoDir, filepath.FromSlash(c.Path))
+		content, err := os.ReadFile(abs)
+		if err != nil {
+			fmt.Fprintf(stdout.Writer(), "[ocr] local apply: read %s: %v, skipping\n", c.Path, err)
+			skipped++
+			continue
+		}
+
+		old := c.ExistingCode
+		new_ := c.SuggestionCode
+
+		if old == "" {
+			fmt.Fprintf(stdout.Writer(), "[ocr] local apply: %s has suggestion_code but no existing_code, skipping\n", c.Path)
+			skipped++
+			continue
+		}
+
+		if !strings.Contains(string(content), old) {
+			fmt.Fprintf(stdout.Writer(), "[ocr] local apply: existing_code not found in %s, skipping\n", c.Path)
+			skipped++
+			continue
+		}
+
+		newContent := strings.Replace(string(content), old, new_, 1)
+		if err := os.WriteFile(abs, []byte(newContent), 0o644); err != nil {
+			return fmt.Errorf("apply %s: %w", c.Path, err)
+		}
+		fmt.Fprintf(stdout.Writer(), "[ocr] local apply: applied %s (line %d)\n", c.Path, c.StartLine)
+		applied++
+	}
+
+	if applied+skipped > 0 {
+		fmt.Fprintf(stdout.Writer(), "[ocr] local apply: %d applied, %d skipped\n", applied, skipped)
+	}
+	return nil
 }
 
 func (a *Agent) maybeRunPlan(ctx context.Context, it model.ScanItem, rule string) string {
