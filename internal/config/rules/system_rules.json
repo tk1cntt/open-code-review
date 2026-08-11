@@ -42,7 +42,10 @@
     "**/*.{fs,fsx}": "fsharp.md",
     "**/*.{pl,pm,t,psgi,cgi}": "perl.md",
     "**/*.vue": "vue.md",
-    "**/*.{css,scss,sass,less,html,svelte}": "web.md"
+    "**/*.{css,scss,sass,less,html,svelte}": "web.md",
+    "**/*.nix": "nix.md",
+    "**/*.{hs,lhs}": "haskell.md",
+    "**/*.{nim,nims,nimble}": "nim.md"
   },
   "default_refactor_rule": "refactoring/common.md",
   "refactor_rule_map": {

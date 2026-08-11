@@ -46,6 +46,7 @@ type scanOptions struct {
 	noDedup         bool
 	noSummary       bool
 	batch           string
+	maxTokens       int
 	maxTokensBudget int
 	provider        string
 	model           string
@@ -216,7 +217,7 @@ func executeScan(ctx context.Context, opts scanOptions) error {
 	scanPaths := splitPaths(opts.paths)
 
 	if opts.preview {
-		return runScanPreview(cc, scanTpl, scanPaths)
+		return runScanPreview(cc, scanTpl, scanPaths, opts.outputFormat)
 	}
 
 	resumeState, err := loadScanResumeState(cc.RepoDir, opts)
@@ -231,6 +232,12 @@ func executeScan(ctx context.Context, opts scanOptions) error {
 	if err != nil {
 		return err
 	}
+	scanTpl.MaxCompletionTokens = scanTpl.MaxTokens
+	maxTokens, err := resolveMaxTokens(scanTpl.MaxTokens, rt.AppCfg, opts.maxTokens)
+	if err != nil {
+		return err
+	}
+	scanTpl.MaxTokens = maxTokens
 	llmIdentity := &jsonLLMIdentity{
 		Provider: rt.Provider,
 		Model:    rt.Model,
@@ -433,8 +440,8 @@ func persistScanOutputs(
 	}
 }
 
-func runScanPreview(cc *commonContext, scanTpl *template.ScanTemplate, scanPaths []string) error {
-	ag := scan.NewAgent(scan.Args{
+func runScanPreview(cc *commonContext, scanTpl *template.ScanTemplate, scanPaths []string, outputFormat string) error {
+	preview, err := scan.Preview(context.Background(), scan.Args{
 		RepoDir:          cc.RepoDir,
 		Paths:            scanPaths,
 		FileFilter:       cc.FileFilter,
@@ -444,11 +451,8 @@ func runScanPreview(cc *commonContext, scanTpl *template.ScanTemplate, scanPaths
 		// value so MaxFileSizeBytes is consistent.
 		Template: *scanTpl,
 	})
-
-	preview, err := ag.Preview(context.Background())
 	if err != nil {
 		return fmt.Errorf("scan preview failed: %w", err)
 	}
-	outputPreviewText(preview)
-	return nil
+	return outputPreview(preview, outputFormat)
 }

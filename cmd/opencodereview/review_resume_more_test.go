@@ -7,11 +7,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alibaba/open-code-review/internal/model"
 	"github.com/alibaba/open-code-review/internal/session"
 )
 
 // writeRangeResumeSession persists a range-mode session with the given completed
 // file checkpoints and returns its ID. HOME must already point at a temp dir.
+// Comments must be non-empty: zero-comment review_item_done records are treated
+// as incomplete and land in FailedFiles rather than completed Items.
 func writeRangeResumeSession(t *testing.T, repoDir string, files ...string) string {
 	t.Helper()
 	sh := session.New(repoDir, "feature", "fake", session.SessionOptions{
@@ -20,7 +23,9 @@ func writeRangeResumeSession(t *testing.T, repoDir string, files ...string) stri
 		DiffTo:     "feature",
 	})
 	for _, f := range files {
-		sh.RecordReviewItemDone(f, "", f, "fp-"+f, nil)
+		sh.RecordReviewItemDone(f, "", f, "fp-"+f, []model.LlmComment{{
+			Path: f, Content: "ok", StartLine: 1, EndLine: 1,
+		}})
 	}
 	if err := sh.Finalize(); err != nil {
 		t.Fatalf("finalize session: %v", err)
@@ -37,7 +42,7 @@ func TestLoadReviewResumeState_WithSession(t *testing.T) {
 		repoDir := t.TempDir()
 		id := writeRangeResumeSession(t, repoDir, "a.go", "b.go")
 
-		state, err := loadReviewResumeState(repoDir, reviewOptions{resume: id, from: "main", to: "feature"})
+		state, err := loadReviewResumeState(repoDir, &reviewOptions{resume: id, from: "main", to: "feature"})
 		if err != nil {
 			t.Fatalf("loadReviewResumeState: %v", err)
 		}
@@ -52,7 +57,7 @@ func TestLoadReviewResumeState_WithSession(t *testing.T) {
 		id := writeRangeResumeSession(t, repoDir, "a.go")
 
 		// Session was range-mode; request commit-mode resume.
-		_, err := loadReviewResumeState(repoDir, reviewOptions{resume: id, commit: "HEAD"})
+		_, err := loadReviewResumeState(repoDir, &reviewOptions{resume: id, commit: "HEAD"})
 		if err == nil {
 			t.Fatal("expected error for mode mismatch")
 		}
@@ -63,7 +68,7 @@ func TestLoadReviewResumeState_WithSession(t *testing.T) {
 		repoDir := t.TempDir()
 		id := writeRangeResumeSession(t, repoDir) // no items recorded
 
-		_, err := loadReviewResumeState(repoDir, reviewOptions{resume: id, from: "main", to: "feature"})
+		_, err := loadReviewResumeState(repoDir, &reviewOptions{resume: id, from: "main", to: "feature"})
 		if err == nil || !strings.Contains(err.Error(), "no completed review items") {
 			t.Fatalf("got %v, want no-completed-items error", err)
 		}

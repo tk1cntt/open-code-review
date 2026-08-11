@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -172,6 +173,14 @@ func (r *ChatResponse) ToolCalls() []ToolCall {
 	return r.Choices[0].Message.ToolCalls
 }
 
+// ReasoningContent extracts the reasoning content of the first choice, if any.
+func (r *ChatResponse) ReasoningContent() string {
+	if len(r.Choices) == 0 {
+		return ""
+	}
+	return r.Choices[0].Message.ReasoningContent
+}
+
 // ToolDef defines a tool/function available to the model.
 type ToolDef struct {
 	Type     string      `json:"type"`
@@ -195,6 +204,32 @@ type ClientConfig struct {
 	Timeout      time.Duration     // Request timeout
 	ExtraBody    map[string]any    // Vendor-specific fields merged into every request body
 	ExtraHeaders map[string]string // Extra HTTP headers sent with every request
+	RetryCodes   []int             // Additional HTTP status codes that trigger retry
+}
+
+// retryCodesMiddleware returns an HTTP middleware that forces the SDK to retry
+// responses whose status code is in the given set, by injecting the
+// x-should-retry: true response header. Returns nil when codes is empty.
+// The returned function is structurally compatible with both option.Middleware
+// (Anthropic SDK) and openaiopt.Middleware (OpenAI SDK).
+func retryCodesMiddleware(codes []int) func(*http.Request, func(*http.Request) (*http.Response, error)) (*http.Response, error) {
+	if len(codes) == 0 {
+		return nil
+	}
+	codeSet := make(map[int]bool, len(codes))
+	for _, c := range codes {
+		codeSet[c] = true
+	}
+	return func(req *http.Request, next func(*http.Request) (*http.Response, error)) (*http.Response, error) {
+		resp, err := next(req)
+		if err != nil {
+			return resp, err
+		}
+		if codeSet[resp.StatusCode] {
+			resp.Header.Set("x-should-retry", "true")
+		}
+		return resp, err
+	}
 }
 
 // --- Factory ---
@@ -222,6 +257,7 @@ func NewLLMClient(ep ResolvedEndpoint) LLMClient {
 		Timeout:      ep.Timeout,
 		ExtraBody:    ep.ExtraBody,
 		ExtraHeaders: ep.ExtraHeaders,
+		RetryCodes:   ep.RetryCodes,
 	}
 	var inner LLMClient
 	switch ep.Protocol {
@@ -492,6 +528,9 @@ func NewOpenAIClient(cfg ClientConfig) *OpenAIClient {
 	}
 	for k, v := range cfg.ExtraHeaders {
 		opts = append(opts, openaiopt.WithHeader(k, v))
+	}
+	if mw := retryCodesMiddleware(cfg.RetryCodes); mw != nil {
+		opts = append(opts, openaiopt.WithMiddleware(mw))
 	}
 
 	return &OpenAIClient{
@@ -817,6 +856,9 @@ func NewAnthropicClient(cfg ClientConfig) *AnthropicClient {
 	for k, v := range cfg.ExtraHeaders {
 		opts = append(opts, option.WithHeader(k, v))
 	}
+	if mw := retryCodesMiddleware(cfg.RetryCodes); mw != nil {
+		opts = append(opts, option.WithMiddleware(mw))
+	}
 
 	return &AnthropicClient{
 		cfg: cfg,
@@ -969,6 +1011,16 @@ func (c *AnthropicClient) buildAnthropicParams(model string, req ChatRequest) (a
 	if len(tools) > 0 {
 		tools[len(tools)-1].OfTool.CacheControl = anthropic.NewCacheControlEphemeralParam()
 		params.Tools = tools
+	}
+	// Dynamic breakpoint on the latest message so multi-turn history is
+	// cached incrementally: read the full previous prefix, write only the delta.
+	if len(messages) > 0 {
+		last := &messages[len(messages)-1]
+		if len(last.Content) > 0 {
+			if cc := last.Content[len(last.Content)-1].GetCacheControl(); cc != nil {
+				*cc = anthropic.NewCacheControlEphemeralParam()
+			}
+		}
 	}
 	if req.Temperature != nil {
 		params.Temperature = anthropic.Float(*req.Temperature)

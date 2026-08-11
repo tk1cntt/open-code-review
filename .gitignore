@@ -18,7 +18,6 @@ coverage.html
 .env.*
 !.env.example
 
-CLAUDE.md
 pages/package-lock.json
 scripts/hooks/
 scripts/publish/.env.internal
