@@ -13,6 +13,9 @@ import (
 	"strings"
 
 	"github.com/bmatcuk/doublestar/v4"
+
+	"github.com/alibaba/open-code-review/internal/gitcmd"
+	"github.com/alibaba/open-code-review/internal/pathutil"
 )
 
 // Resolver resolves a review rule for a file path.
@@ -77,7 +80,7 @@ func (r *SystemRule) UnmarshalJSON(data []byte) error {
 
 	// Parse path_rule_map.
 	if mapData, ok := raw["path_rule_map"]; ok && len(mapData) > 0 && string(mapData) != "null" {
-		pathRules, err := parseOrderedRuleMap(mapData)
+		pathRules, err := parseOrderedRuleMap(mapData, "path_rule_map")
 		if err != nil {
 			return fmt.Errorf("path_rule_map: %w", err)
 		}
@@ -86,7 +89,7 @@ func (r *SystemRule) UnmarshalJSON(data []byte) error {
 
 	// Parse refactor_rule_map.
 	if mapData, ok := raw["refactor_rule_map"]; ok && len(mapData) > 0 && string(mapData) != "null" {
-		refRules, err := parseOrderedRuleMap(mapData)
+		refRules, err := parseOrderedRuleMap(mapData, "refactor_rule_map")
 		if err != nil {
 			return fmt.Errorf("refactor_rule_map: %w", err)
 		}
@@ -104,7 +107,7 @@ func (r *SystemRule) UnmarshalJSON(data []byte) error {
 
 	// Parse refactor_family_map: pattern → family name (stored temporarily in Rule).
 	if mapData, ok := raw["refactor_family_map"]; ok && len(mapData) > 0 && string(mapData) != "null" {
-		famRules, err := parseOrderedRuleMap(mapData)
+		famRules, err := parseOrderedRuleMap(mapData, "refactor_family_map")
 		if err != nil {
 			return fmt.Errorf("refactor_family_map: %w", err)
 		}
@@ -113,7 +116,7 @@ func (r *SystemRule) UnmarshalJSON(data []byte) error {
 
 	// Parse refactor_profile_map: pattern → profile name.
 	if mapData, ok := raw["refactor_profile_map"]; ok && len(mapData) > 0 && string(mapData) != "null" {
-		profRules, err := parseOrderedRuleMap(mapData)
+		profRules, err := parseOrderedRuleMap(mapData, "refactor_profile_map")
 		if err != nil {
 			return fmt.Errorf("refactor_profile_map: %w", err)
 		}
@@ -123,7 +126,7 @@ func (r *SystemRule) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func parseOrderedRuleMap(data json.RawMessage) ([]PathRule, error) {
+func parseOrderedRuleMap(data json.RawMessage, name string) ([]PathRule, error) {
 	dec := json.NewDecoder(strings.NewReader(string(data)))
 	t, err := dec.Token()
 	if err != nil {
@@ -144,7 +147,7 @@ func parseOrderedRuleMap(data json.RawMessage) ([]PathRule, error) {
 		}
 		var value string
 		if err := dec.Decode(&value); err != nil {
-			return nil, fmt.Errorf("read value for %q: %w", key, err)
+			return nil, fmt.Errorf("read %s value for %q: %w", name, key, err)
 		}
 		rules = append(rules, PathRule{Pattern: key, Rule: value})
 	}
@@ -273,11 +276,28 @@ func LoadCrossFileRefactorRule() (string, error) {
 	return strings.TrimRight(string(content), "\n"), nil
 }
 
+// loadObjCRule reads the embedded Objective-C rule doc used by the ".m"
+// content sniff. It is not referenced from system_rules.json's path_rule_map,
+// so it is loaded explicitly rather than through the PathRules loop.
+func loadObjCRule() (string, error) {
+	content, err := rulesFS.ReadFile("rule_docs/objc.md")
+	if err != nil {
+		return "", fmt.Errorf("read objc rule file: %w", err)
+	}
+	return strings.TrimRight(string(content), "\n"), nil
+}
+
 // RuleDetail contains the resolved rule along with metadata about its source.
 type RuleDetail struct {
 	Rule    string // rule text
 	Source  string // "custom" | "project" | "global" | "system"
-	Pattern string // glob pattern that matched, or "default" for fallback
+	Pattern string // glob pattern that matched, or "default" for fallback — always a plain glob, never annotated
+	// SniffedAs is "" for a plain path match, or the sniffed language (e.g.
+	// "objc") when content sniffing overrode the path-based rule. Internal
+	// only: callers that serialize RuleDetail (e.g. delegateRuleGroupJSON)
+	// must not surface this, since Pattern is a versioned "the glob that
+	// matched" contract that a sniff annotation would silently break.
+	SniffedAs string `json:"-"`
 }
 
 // DetailResolver extends Resolver with source metadata.
@@ -305,22 +325,11 @@ You MUST provide a suggestion_code with exact corrected code for EVERY issue you
 // The first match wins; if none match, it falls back to DefaultRule.
 // Supports full glob syntax including ** for recursive directory matching.
 func (r *SystemRule) Resolve(path string) string {
-	lowerPath := strings.ToLower(path)
-	for _, pr := range r.PathRules {
-		expanded := expandBraces(pr.Pattern)
-		for _, p := range expanded {
-			if matched, _ := doublestar.Match(strings.ToLower(p), lowerPath); matched {
-				if r.applyHint {
-					return pr.Rule + applyHintInstruction
-				}
-				return pr.Rule
-			}
-		}
-	}
+	rule := r.resolveDetail(path).Rule
 	if r.applyHint {
-		return r.DefaultRule + applyHintInstruction
+		return rule + applyHintInstruction
 	}
-	return r.DefaultRule
+	return rule
 }
 
 // CanonicalConfig returns a deterministic, order-stable field list describing this
@@ -468,12 +477,13 @@ func (f *FileFilter) HasInclude() bool {
 }
 
 // IsUserExcluded reports whether the given path matches any user exclude pattern.
+// The check is case-insensitive: both path and pattern are lowercased.
 func (f *FileFilter) IsUserExcluded(path string) bool {
 	lowerPath := strings.ToLower(path)
 	for _, pattern := range f.Exclude {
 		expanded := expandBraces(pattern)
 		for _, p := range expanded {
-			if matched, _ := doublestar.Match(p, lowerPath); matched {
+			if matched, _ := doublestar.Match(strings.ToLower(p), lowerPath); matched {
 				return true
 			}
 		}
@@ -482,6 +492,7 @@ func (f *FileFilter) IsUserExcluded(path string) bool {
 }
 
 // IsUserIncluded reports whether the given path matches any user include pattern.
+// The check is case-insensitive: both path and pattern are lowercased.
 // Returns false when Include is empty (no user include restriction defined).
 func (f *FileFilter) IsUserIncluded(path string) bool {
 	if !f.HasInclude() {
@@ -491,7 +502,7 @@ func (f *FileFilter) IsUserIncluded(path string) bool {
 	for _, pattern := range f.Include {
 		expanded := expandBraces(pattern)
 		for _, p := range expanded {
-			if matched, _ := doublestar.Match(p, lowerPath); matched {
+			if matched, _ := doublestar.Match(strings.ToLower(p), lowerPath); matched {
 				return true
 			}
 		}
@@ -499,10 +510,23 @@ func (f *FileFilter) IsUserIncluded(path string) bool {
 	return false
 }
 
-// ResolverOptions configures rule resolution layers.
+// ResolverOptions configures rule resolution layers and the optional git
+// context used to disambiguate extensions shared by several languages
+// (currently only ".m": MATLAB vs Objective-C). The zero value is valid:
+// empty Ref reads the working tree, which is what `ocr scan` and
+// `ocr rules check` want.
 type ResolverOptions struct {
 	CustomRulePath string // --rule flag value
 	RulesDir       string // --rules-dir value (enterprise rules directory)
+
+	// Ref is the git ref whose content should be inspected — the review head
+	// (--to) in range mode, or --commit in commit mode. Empty reads the
+	// working tree.
+	Ref string
+
+	// Runner bounds concurrent git subprocesses. Optional; when nil the
+	// resolver shells out to git directly.
+	Runner *gitcmd.Runner
 }
 
 // composedResolver implements Resolver with layered priority.
@@ -512,7 +536,8 @@ type composedResolver struct {
 	enterpriseProject *ProjectRule // medium: <rules-dir>/projects/<project>/rule.json
 	enterpriseGlobal  *ProjectRule // medium-low: <rules-dir>/global.json
 	global            *ProjectRule // low: ~/.opencodereview/rule.json
-	system            *SystemRule  // lowest: embedded default
+	system            *SystemRule  // lowest: embedded default (refactor + fallback)
+	sniff             *sniffer     // wraps system for review Resolve/resolveDetail
 
 	applyHint bool
 }
@@ -522,15 +547,23 @@ func (c *composedResolver) InjectApplyHint() {
 	c.applyHint = true
 }
 
-// NewResolver builds a Resolver with the following priority:
-//  1. Custom rule file specified via --rule flag (first match wins)
-//  2. Project-local .opencodereview/rule.json (first match wins)
-//  3. Global ~/.opencodereview/rule.json (first match wins)
-//  4. Embedded system default rules
-//
-// It also returns a FileFilter with the merged include/exclude patterns from all layers.
-func NewResolver(repoDir, customRulePath string) (Resolver, *FileFilter, error) {
-	return NewResolverWithOptions(repoDir, ResolverOptions{CustomRulePath: customRulePath})
+// reviewSystem returns the system layer used for review-rule resolution,
+// wrapping the embedded system rules with the content sniffer when present.
+func (c *composedResolver) reviewSystem() systemLayer {
+	if c.sniff != nil {
+		return c.sniff
+	}
+	return c.system
+}
+
+// NewResolver builds a Resolver with layered priority (see NewResolverWithOptions).
+// customRulePath is copied into opts when opts.CustomRulePath is empty, so
+// callers can pass --rule either as the positional argument or in opts.
+func NewResolver(repoDir, customRulePath string, opts ResolverOptions) (Resolver, *FileFilter, error) {
+	if customRulePath != "" && opts.CustomRulePath == "" {
+		opts.CustomRulePath = customRulePath
+	}
+	return NewResolverWithOptions(repoDir, opts)
 }
 
 // NewResolverWithOptions builds a Resolver with the following priority:
@@ -541,9 +574,18 @@ func NewResolver(repoDir, customRulePath string) (Resolver, *FileFilter, error) 
 //  5. Global ~/.opencodereview/rule.json (first match wins)
 //  6. Embedded system default rules
 //
+// The system layer is wrapped in a sniffer so ".m" files can be resolved as
+// Objective-C when their content says so. Wrapping the *system* layer (rather
+// than the composed resolver) keeps user layers outranking the sniff.
+//
 // It also returns a FileFilter with the merged include/exclude patterns from all layers.
 func NewResolverWithOptions(repoDir string, opts ResolverOptions) (Resolver, *FileFilter, error) {
 	sysRule, err := LoadDefault()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	objcRule, err := loadObjCRule()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -594,6 +636,13 @@ func NewResolverWithOptions(repoDir string, opts ResolverOptions) (Resolver, *Fi
 		enterpriseGlobal:  entGlobalRule,
 		global:            globalRule,
 		system:            sysRule,
+		sniff: &sniffer{
+			inner:    sysRule,
+			repoDir:  repoDir,
+			ref:      opts.Ref,
+			runner:   opts.Runner,
+			objcRule: objcRule,
+		},
 	}, filter, nil
 }
 
@@ -636,7 +685,9 @@ func loadGlobalRule() (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal global rule: %w", err)
 	}
-	resolveRuleEntries(pr.Rules, filepath.Dir(path)); resolveRuleEntries(pr.RefactorRules, filepath.Dir(path))
+	base := filepath.Dir(path)
+	resolveRuleEntries(pr.Rules, base, "")
+	resolveRuleEntries(pr.RefactorRules, base, "")
 	return &pr, nil
 }
 
@@ -654,7 +705,8 @@ func loadEnterpriseGlobalRule(rulesDir string) (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal enterprise global rule: %w", err)
 	}
-	resolveRuleEntries(pr.Rules, rulesDir); resolveRuleEntries(pr.RefactorRules, rulesDir)
+	resolveRuleEntries(pr.Rules, rulesDir, "")
+	resolveRuleEntries(pr.RefactorRules, rulesDir, "")
 	return &pr, nil
 }
 
@@ -677,7 +729,9 @@ func loadEnterpriseProjectRule(rulesDir, repoDir string) (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal enterprise project rule: %w", err)
 	}
-	resolveRuleEntries(pr.Rules, filepath.Dir(path)); resolveRuleEntries(pr.RefactorRules, filepath.Dir(path))
+	base := filepath.Dir(path)
+	resolveRuleEntries(pr.Rules, base, "")
+	resolveRuleEntries(pr.RefactorRules, base, "")
 	return &pr, nil
 }
 
@@ -744,7 +798,9 @@ func loadRuleFile(path string) (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal rule file %s: %w", path, err)
 	}
-	resolveRuleEntries(pr.Rules, filepath.Dir(path)); resolveRuleEntries(pr.RefactorRules, filepath.Dir(path))
+	base := filepath.Dir(path)
+	resolveRuleEntries(pr.Rules, base, "")
+	resolveRuleEntries(pr.RefactorRules, base, "")
 	return &pr, nil
 }
 
@@ -754,8 +810,25 @@ func loadRuleFile(path string) (*ProjectRule, error) {
 // root-relative diff paths. A subproject-local rule.json under the subdirectory is
 // intentionally not consulted; put shared rules at the repo root, or pass --rule.
 func loadProjectRule(repoDir string) (*ProjectRule, error) {
+	confineRoot, err := pathutil.CanonicalPath(repoDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve repo dir %s: %w", repoDir, err)
+	}
+
 	path := filepath.Join(repoDir, ".opencodereview", "rule.json")
-	data, err := os.ReadFile(path)
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("resolve project rule %s: %w", path, err)
+	}
+	if !pathutil.WithinBase(confineRoot, resolved) {
+		fmt.Fprintf(os.Stderr, "[ocr] WARNING: project rule file escapes repo dir: %s\n", path)
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(resolved)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -766,7 +839,12 @@ func loadProjectRule(repoDir string) (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal project rule: %w", err)
 	}
-	resolveRuleEntries(pr.Rules, filepath.Dir(path)); resolveRuleEntries(pr.RefactorRules, filepath.Dir(path))
+	// Resolve relative file references against the directory that contains
+	// rule.json (.opencodereview/), then confine the result to the repo root
+	// so a malicious project rule cannot read files outside the repository.
+	base := filepath.Dir(path)
+	resolveRuleEntries(pr.Rules, base, confineRoot)
+	resolveRuleEntries(pr.RefactorRules, base, confineRoot)
 	return &pr, nil
 }
 
@@ -786,7 +864,7 @@ func (c *composedResolver) Resolve(path string) string {
 			return result
 		}
 	}
-	result := c.system.Resolve(path)
+	result := c.reviewSystem().Resolve(path)
 	if c.applyHint {
 		result += applyHintInstruction
 	}
@@ -888,15 +966,17 @@ func (c *composedResolver) CanonicalConfig() []string {
 	}
 	appendLayer("custom", c.custom)
 	appendLayer("project", c.project)
+	appendLayer("enterprise-project", c.enterpriseProject)
+	appendLayer("enterprise-global", c.enterpriseGlobal)
 	appendLayer("global", c.global)
-	if c.system != nil {
-		fields = append(fields, c.system.CanonicalConfig()...)
+	if layer := c.reviewSystem(); layer != nil {
+		fields = append(fields, layer.CanonicalConfig()...)
 	}
 	return fields
 }
 
 func (c *composedResolver) mergeWithSystemRule(path, rule string) string {
-	systemRule := c.system.Resolve(path)
+	systemRule := c.reviewSystem().Resolve(path)
 
 	if systemRule == "" {
 		return rule
@@ -932,10 +1012,10 @@ func (c *composedResolver) ResolveDetail(path string) RuleDetail {
 	if detail := c.matchProjectRuleDetail(c.global, path, "global"); detail != nil {
 		return *detail
 	}
-	return c.system.resolveDetail(path)
+	return c.reviewSystem().resolveDetail(path)
 }
 
-func (c *composedResolver) matchProjectRuleDetail(pr *ProjectRule, path string, source string) *RuleDetail {
+func (c *composedResolver) matchProjectRuleDetail(pr *ProjectRule, path, source string) *RuleDetail {
 	entry := matchProjectRuleEntry(pr, path)
 	if entry == nil {
 		return nil
@@ -984,18 +1064,16 @@ func looksLikeFilePath(s string) bool {
 	return allowedRuleExts[strings.ToLower(filepath.Ext(s))]
 }
 
-// resolveRuleEntries scans each entry's Rule field. When the value looks like a file
-// path, it reads the file content and replaces the Rule. Absolute paths are used
-// directly; relative paths are resolved against repoDir only. Multi-line and short
-// inline rules are left unchanged. If the file cannot be read, the Rule is cleared
-// (set to empty) and a warning is emitted.
-func resolveRuleEntries(entries []ProjectRuleEntry, repoDir string) {
+// resolveRuleEntries reads file references in each rule entry and replaces them with
+// the file content. confineRoot is the canonical repo root for the untrusted project
+// layer (empty for trusted layers, meaning no confinement).
+func resolveRuleEntries(entries []ProjectRuleEntry, repoDir string, confineRoot string) {
 	for i := range entries {
 		e := &entries[i]
 		if strings.TrimSpace(e.Rule) == "" || !looksLikeFilePath(e.Rule) {
 			continue
 		}
-		if content := tryReadRuleFile(e.Rule, repoDir); content != nil {
+		if content := tryReadRuleFile(e.Rule, repoDir, confineRoot); content != nil {
 			e.Rule = *content
 		} else {
 			e.Rule = ""
@@ -1003,10 +1081,10 @@ func resolveRuleEntries(entries []ProjectRuleEntry, repoDir string) {
 	}
 }
 
-// tryReadRuleFile attempts to read a rule file. Absolute paths are used directly.
-// Relative paths are resolved against repoDir and validated to stay within repoDir.
-// Returns nil when the file cannot be read safely or does not exist.
-func tryReadRuleFile(rule string, repoDir string) *string {
+// tryReadRuleFile reads a rule file reference. Absolute paths are used directly;
+// relative paths resolve against repoDir. When confineRoot is non-empty, the resolved
+// path must stay inside it. Returns nil when the file cannot be read safely.
+func tryReadRuleFile(rule string, repoDir string, confineRoot string) *string {
 	if repoDir == "" {
 		if !filepath.IsAbs(rule) {
 			fmt.Fprintf(os.Stderr, "[ocr] WARNING: cannot resolve relative rule path %q without a repo dir\n", rule)
@@ -1014,7 +1092,7 @@ func tryReadRuleFile(rule string, repoDir string) *string {
 		}
 	}
 	if filepath.IsAbs(rule) {
-		content, err := readRuleFileSafe(rule)
+		content, err := readRuleFileSafe(rule, confineRoot)
 		if err == nil {
 			return &content
 		}
@@ -1034,7 +1112,7 @@ func tryReadRuleFile(rule string, repoDir string) *string {
 		return nil
 	}
 
-	content, err := readRuleFileSafe(resolved)
+	content, err := readRuleFileSafe(resolved, confineRoot)
 	if err == nil {
 		return &content
 	}
@@ -1046,14 +1124,17 @@ func tryReadRuleFile(rule string, repoDir string) *string {
 	return nil
 }
 
-// readRuleFileSafe reads and validates a rule file. It enforces extension whitelist
-// (.md / .txt / .markdown), a 512 KB size cap, and resolves symlinks before checking
-// the path. Symlinks are resolved first, then size is checked via Stat before reading.
-// Returns the trimmed content on success.
-func readRuleFileSafe(path string) (string, error) {
+// readRuleFileSafe reads and validates a rule file: extension whitelist, 512 KB cap,
+// and symlink resolution. When confineRoot is non-empty, the resolved path must stay
+// inside it. Returns the trimmed content on success.
+func readRuleFileSafe(path string, confineRoot string) (string, error) {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", err
+	}
+
+	if confineRoot != "" && !pathutil.WithinBase(confineRoot, resolved) {
+		return "", fmt.Errorf("rule file path %q escapes repo dir %q", resolved, confineRoot)
 	}
 
 	if !allowedRuleExts[strings.ToLower(filepath.Ext(resolved))] {

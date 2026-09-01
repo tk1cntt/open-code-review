@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +32,7 @@ type scanOptions struct {
 	excludes        string
 	outputFormat    string
 	audience        string
+	outputPath      string
 	background      string
 	resume          string // --resume: resume from a previous scan session id
 	resumeMode      string // --resume-mode: continue | restart-failed
@@ -183,8 +186,18 @@ func loadScanResumeState(repoDir string, opts scanOptions) (*session.ResumeState
 	return state, nil
 }
 
-func executeScan(ctx context.Context, opts scanOptions) error {
-	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, "", opts.maxTools, opts.maxGitProcs, false)
+func executeScan(ctx context.Context, opts scanOptions) (retErr error) {
+	out, closeOut, err := resolveOutputWriter(opts.outputPath, opts.outputFormat)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := closeOut(); cerr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close output file: %w", cerr))
+		}
+	}()
+
+	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, "", "", opts.maxTools, opts.maxGitProcs, false)
 	if err != nil {
 		return err
 	}
@@ -217,7 +230,7 @@ func executeScan(ctx context.Context, opts scanOptions) error {
 	scanPaths := splitPaths(opts.paths)
 
 	if opts.preview {
-		return runScanPreview(cc, scanTpl, scanPaths, opts.outputFormat)
+		return runScanPreview(cc, scanTpl, scanPaths, opts.outputFormat, out)
 	}
 
 	resumeState, err := loadScanResumeState(cc.RepoDir, opts)
@@ -232,7 +245,6 @@ func executeScan(ctx context.Context, opts scanOptions) error {
 	if err != nil {
 		return err
 	}
-	scanTpl.MaxCompletionTokens = scanTpl.MaxTokens
 	maxTokens, err := resolveMaxTokens(scanTpl.MaxTokens, rt.AppCfg, opts.maxTokens)
 	if err != nil {
 		return err
@@ -299,7 +311,9 @@ func executeScan(ctx context.Context, opts scanOptions) error {
 	// result persistence share one consistent identifier.
 	reviewID := ag.SessionID()
 	setResumeSessionID(ctx, reviewID)
-	if opts.savePerFile {
+	if opts.savePerFile && reviewID == "" {
+		fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save because the session was not persisted\n")
+	} else if opts.savePerFile {
 		if opts.resultDir == "" {
 			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
 				opts.resultDir = d
@@ -317,9 +331,10 @@ func executeScan(ctx context.Context, opts scanOptions) error {
 		}
 		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
 		if pfwErr != nil {
-			return fmt.Errorf("create per-file writer: %w", pfwErr)
+			fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save: %v\n", pfwErr)
+		} else {
+			perFileWriter = pfw
 		}
-		perFileWriter = pfw
 	}
 
 	q := newQuietHandle(opts.outputFormat, opts.audience)
@@ -330,7 +345,7 @@ func executeScan(ctx context.Context, opts scanOptions) error {
 	var traceID string
 	if telemetry.IsEnabled() {
 		traceID = telemetry.TraceIDFromContext(ctx)
-		if opts.outputFormat != "json" {
+		if !isMachineReadable(opts.outputFormat) {
 			fmt.Fprintf(os.Stderr, "[ocr] TraceID: %s\n", traceID)
 		}
 	}
@@ -360,7 +375,7 @@ func executeScan(ctx context.Context, opts scanOptions) error {
 		if len(comments) > 0 {
 			fmt.Fprintf(os.Stderr, "[ocr] Wrote %d partial finding(s) before failure\n", len(comments))
 		}
-		if emitErr := emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity); emitErr != nil {
+		if emitErr := emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity, out, nil); emitErr != nil {
 			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to emit partial scan result: %v\n", emitErr)
 		}
 		return fmt.Errorf("scan failed: %w", err)
@@ -372,7 +387,7 @@ func executeScan(ctx context.Context, opts scanOptions) error {
 		}
 	}
 
-	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity)
+	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity, out, nil)
 }
 
 func persistScanOutputs(
@@ -440,7 +455,7 @@ func persistScanOutputs(
 	}
 }
 
-func runScanPreview(cc *commonContext, scanTpl *template.ScanTemplate, scanPaths []string, outputFormat string) error {
+func runScanPreview(cc *commonContext, scanTpl *template.ScanTemplate, scanPaths []string, outputFormat string, out io.Writer) error {
 	preview, err := scan.Preview(context.Background(), scan.Args{
 		RepoDir:          cc.RepoDir,
 		Paths:            scanPaths,
@@ -454,5 +469,5 @@ func runScanPreview(cc *commonContext, scanTpl *template.ScanTemplate, scanPaths
 	if err != nil {
 		return fmt.Errorf("scan preview failed: %w", err)
 	}
-	return outputPreview(preview, outputFormat)
+	return outputPreview(preview, outputFormat, out)
 }

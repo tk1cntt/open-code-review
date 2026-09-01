@@ -19,15 +19,15 @@ func TestPrepareFileStart_Modes(t *testing.T) {
 		FailedFiles: map[string]string{"fp-fail": "fail.go"},
 		Conversations: map[string]ConversationCheckpoint{
 			"fp-mid": {
-				Fingerprint: "fp-mid",
-				FilePath:    "mid.go",
-				Messages:    []llm.Message{llm.NewTextMessage("user", "hello")},
-				Round:       2,
-				Model:       "m1",
+				Fingerprint:  "fp-mid",
+				FilePath:     "mid.go",
+				Messages:     []llm.Message{llm.NewTextMessage("user", "hello")},
+				Round:        2,
+				Model:        "m1",
 				TemplateHash: "th1",
-				Status:      CheckpointTimedOut,
+				Status:       CheckpointTimedOut,
 				PlanGuidance: "plan-x",
-				Comments:    []model.LlmComment{{Path: "mid.go", Content: "partial"}},
+				Comments:     []model.LlmComment{{Path: "mid.go", Content: "partial"}},
 			},
 		},
 	}
@@ -87,7 +87,7 @@ func TestSaveAndLoadConversationCheckpoint(t *testing.T) {
 		llm.NewToolCallMessage("thinking", []llm.ToolCall{{
 			ID: "c1", Type: "function",
 			Function: llm.FunctionCall{Name: "file_find", Arguments: `{"query_name":"log-helper"}`},
-		}}),
+		}}, llm.NativeTurn{}, ""),
 		llm.NewToolResultMessage("c1", "found log-helper.ts"),
 	}
 	sh.SaveConversationCheckpoint(ConversationCheckpoint{

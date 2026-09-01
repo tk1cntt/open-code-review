@@ -5,11 +5,15 @@ package tool
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"testing"
 )
 
 func TestShellRun_Echo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("echo is a shell builtin on Windows, not an executable")
+	}
 	dir := t.TempDir()
 	p := NewShellRun(dir)
 	result, err := p.Execute(context.Background(), map[string]any{

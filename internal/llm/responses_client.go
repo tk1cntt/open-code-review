@@ -11,6 +11,7 @@ import (
 
 	openai "github.com/openai/openai-go/v3"
 	openaiopt "github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 )
 
@@ -29,9 +30,14 @@ type OpenAIResponsesClient struct {
 // URL normalization mirrors NewOpenAIClient: cfg.URL is forced to end in
 // /responses, and that suffix is stripped to derive the SDK base URL (the SDK
 // appends "responses" itself).
+// ExtraHeaders are applied per request (not baked into the SDK client)
+// so SessionKeyTemplateVar can expand to the session key each request carries.
 func NewOpenAIResponsesClient(cfg ClientConfig) *OpenAIResponsesClient {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 5 * time.Minute
+	}
+	if cfg.SessionKey == "" {
+		cfg.SessionKey = NewSessionKey()
 	}
 	ensureResponsesEndpoint(&cfg)
 	sdkBaseURL := strings.TrimSuffix(strings.TrimRight(cfg.URL, "/"), "/responses")
@@ -43,11 +49,11 @@ func NewOpenAIResponsesClient(cfg ClientConfig) *OpenAIResponsesClient {
 		openaiopt.WithHeader("User-Agent", userAgent("")),
 		openaiopt.WithRequestTimeout(cfg.Timeout),
 	}
-	for k, v := range cfg.ExtraHeaders {
-		opts = append(opts, openaiopt.WithHeader(k, v))
-	}
 	if mw := retryCodesMiddleware(cfg.RetryCodes); mw != nil {
 		opts = append(opts, openaiopt.WithMiddleware(mw))
+	}
+	if cfg.retryCollector != nil {
+		opts = append(opts, openaiopt.WithMiddleware(newRetryObserver(cfg.retryCollector)))
 	}
 
 	return &OpenAIResponsesClient{
@@ -77,7 +83,19 @@ func ensureResponsesEndpoint(cfg *ClientConfig) {
 
 // CompletionsWithCtx sends a Responses API request and maps the result back to
 // the shared ChatResponse shape.
-func (c *OpenAIResponsesClient) CompletionsWithCtx(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+//
+// The deferred finalizeRequest is this client's boundary for the retry report;
+// see the OpenAI Chat Completions counterpart for why it is deferred and why the
+// results are named.
+func (c *OpenAIResponsesClient) CompletionsWithCtx(ctx context.Context, req ChatRequest) (resp *ChatResponse, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			finalizeRequest(ctx, c.cfg.retryCollector, errRequestPanicked)
+			panic(r)
+		}
+		finalizeRequest(ctx, c.cfg.retryCollector, err)
+	}()
+
 	model := req.Model
 	if model == "" {
 		model = c.cfg.Model
@@ -85,8 +103,16 @@ func (c *OpenAIResponsesClient) CompletionsWithCtx(ctx context.Context, req Chat
 
 	params := c.buildResponsesParams(model, req)
 
+	sessionKey := c.cfg.SessionKey
+	if k := SessionKeyFromContext(ctx); k != "" {
+		sessionKey = k
+	}
+
 	var opts []openaiopt.RequestOption
-	for k, v := range c.cfg.ExtraBody {
+	for k, v := range expandSessionKeyInHeaders(c.cfg.ExtraHeaders, sessionKey) {
+		opts = append(opts, openaiopt.WithHeader(k, v))
+	}
+	for k, v := range expandSessionKeyInBody(c.cfg.ExtraBody, sessionKey) {
 		// This client is non-streaming: it calls Responses.New, which expects a
 		// single JSON body. If a provider config sets extra_body.stream=true
 		// (valid for the Chat Completions client, which switches to a streaming
@@ -116,9 +142,18 @@ func (c *OpenAIResponsesClient) CompletionsWithCtx(ctx context.Context, req Chat
 	// a dead response as success.
 	switch sdkResp.Status {
 	case responses.ResponseStatusFailed, responses.ResponseStatusCancelled:
-		return nil, fmt.Errorf("openai-responses request did not complete: status=%s", sdkResp.Status)
+		err = fmt.Errorf("openai-responses request did not complete: status=%s", sdkResp.Status)
 	case responses.ResponseStatusQueued, responses.ResponseStatusInProgress:
-		return nil, fmt.Errorf("openai-responses returned non-terminal status=%s (background/async mode is not supported)", sdkResp.Status)
+		err = fmt.Errorf("openai-responses returned non-terminal status=%s (background/async mode is not supported)", sdkResp.Status)
+	}
+	if err != nil {
+		// Correct the attempt here, where the status is known. The observer saw
+		// only the HTTP 200 that carried this dead response object, and nothing
+		// downstream would catch the omission: a request whose outcome is failed is
+		// listed with no error attempt at all, producing self-consistent counts
+		// over a record that misstates what happened.
+		reviseAttempt(ctx, c.cfg.retryCollector, ErrorClassProvider, FailurePhaseResponseStatus)
+		return nil, err
 	}
 
 	return c.mapResponsesResponse(sdkResp), nil
@@ -138,6 +173,7 @@ func (c *OpenAIResponsesClient) CompletionsWithCtx(ctx context.Context, req Chat
 //   - PromptCacheKey is set from req.SessionID when non-empty. The caller
 //     generates a random UUID per file session so that all turns within one
 //     file's agent loop share a cache bucket. Only set when non-empty.
+//     An explicit extra_body.prompt_cache_key entry is applied afterwards as a JSON patch.
 func (c *OpenAIResponsesClient) buildResponsesParams(model string, req ChatRequest) responses.ResponseNewParams {
 	var systemParts []string
 	var input []responses.ResponseInputItemUnionParam
@@ -152,6 +188,11 @@ func (c *OpenAIResponsesClient) buildResponsesParams(model string, req ChatReque
 		case "user":
 			input = append(input, responses.ResponseInputItemParamOfMessage(content, responses.EasyInputMessageRoleUser))
 		case "assistant":
+			// Reuse native output items to preserve reasoning/encrypted_content.
+			if items, ok := msg.Native.Payload.([]responses.ResponseInputItemUnionParam); ok && len(items) > 0 {
+				input = append(input, items...)
+				continue
+			}
 			if content != "" {
 				input = append(input, responses.ResponseInputItemParamOfMessage(content, responses.EasyInputMessageRoleAssistant))
 			}
@@ -183,7 +224,8 @@ func (c *OpenAIResponsesClient) buildResponsesParams(model string, req ChatReque
 		Input: responses.ResponseNewParamsInputUnion{
 			OfInputItemList: input,
 		},
-		Store: openai.Bool(false),
+		Store:   openai.Bool(false),
+		Include: []responses.ResponseIncludable{responses.ResponseIncludableReasoningEncryptedContent},
 	}
 
 	if instructions != "" {
@@ -194,6 +236,11 @@ func (c *OpenAIResponsesClient) buildResponsesParams(model string, req ChatReque
 	}
 	if len(tools) > 0 {
 		params.Tools = tools
+		if req.ToolChoice == "required" {
+			params.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+				OfToolChoiceMode: param.NewOpt(responses.ToolChoiceOptionsRequired),
+			}
+		}
 	}
 	if req.MaxTokens > 0 {
 		params.MaxOutputTokens = openai.Int(int64(req.MaxTokens))
@@ -219,11 +266,11 @@ func (c *OpenAIResponsesClient) mapResponsesResponse(sdkResp *responses.Response
 
 	var toolCalls []ToolCall
 	var reasoningParts []string
+	var nativeItems []responses.ResponseInputItemUnionParam
+	// hasActionableItem gates Native: a lone reasoning item (no message or
+	// function_call) is not valid standalone input and risks a 400 on replay.
+	var hasActionableItem bool
 	for _, item := range sdkResp.Output {
-		// TODO(phase): ResponseOutputMessage.Phase (commentary/final_answer) is
-		// currently dropped. For gpt-5.3-codex+ models, preserve and resend
-		// Phase on assistant messages to avoid performance degradation. See
-		// DESIGN_STATE_CACHE_PHASE.md §3.
 		switch item.Type {
 		case "function_call":
 			fc := item.AsFunctionCall()
@@ -235,6 +282,9 @@ func (c *OpenAIResponsesClient) mapResponsesResponse(sdkResp *responses.Response
 					Arguments: fc.Arguments,
 				},
 			})
+			p := fc.ToParam()
+			nativeItems = append(nativeItems, responses.ResponseInputItemUnionParam{OfFunctionCall: &p})
+			hasActionableItem = true
 		case "reasoning":
 			// Best-effort: aggregate every summary entry's Text (not just the
 			// first) so multi-paragraph reasoning isn't truncated.
@@ -244,12 +294,24 @@ func (c *OpenAIResponsesClient) mapResponsesResponse(sdkResp *responses.Response
 					reasoningParts = append(reasoningParts, s.Text)
 				}
 			}
+			p := r.ToParam()
+			nativeItems = append(nativeItems, responses.ResponseInputItemUnionParam{OfReasoning: &p})
+		case "message":
+			m := item.AsMessage()
+			p := m.ToParam()
+			nativeItems = append(nativeItems, responses.ResponseInputItemUnionParam{OfOutputMessage: &p})
+			hasActionableItem = true
 		}
 	}
 
 	var reasoningContent string
 	if len(reasoningParts) > 0 {
 		reasoningContent = strings.Join(reasoningParts, "\n")
+	}
+
+	var native NativeTurn
+	if hasActionableItem && len(nativeItems) > 0 {
+		native = NativeTurn{Family: "openai-responses", Payload: nativeItems}
 	}
 
 	finishReason := mapResponsesFinishReason(string(sdkResp.Status), toolCalls)
@@ -279,6 +341,7 @@ func (c *OpenAIResponsesClient) mapResponsesResponse(sdkResp *responses.Response
 				Content:          contentPtr,
 				ReasoningContent: reasoningContent,
 				ToolCalls:        toolCalls,
+				Native:           native,
 			},
 			FinishReason: finishReason,
 		}},

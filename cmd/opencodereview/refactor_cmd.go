@@ -22,21 +22,21 @@ import (
 )
 
 type refactorOptions struct {
-	toolConfigPath, rulePath, repoDir, paths, excludes string
-	outputFormat, audience, background, resume, resumeMode string
-	saveResult, savePerFile                            bool
-	resultDir, resultProject                           string
+	toolConfigPath, rulePath, repoDir, paths, excludes                  string
+	outputFormat, audience, background, resume, resumeMode              string
+	saveResult, savePerFile                                             bool
+	resultDir, resultProject                                            string
 	concurrency, perFileTimeout, maxTools, maxGitProcs, maxTokensBudget int
-	noPlan                                                               bool
-	provider                                            string
-	model                                              string
-	showHelp                                           bool
-	preview                                            bool
+	noPlan                                                              bool
+	provider                                                            string
+	model                                                               string
+	showHelp                                                            bool
+	preview                                                             bool
 	// Multi-file (F0–F3)
-	mode           string
-	crossFile      string // off | hints
-	apply          bool
-	applyRunTests  bool
+	mode          string
+	crossFile     string // off | hints
+	apply         bool
+	applyRunTests bool
 }
 
 var refactorOpts refactorOptions
@@ -90,7 +90,7 @@ func init() {
 
 func executeRefactor(ctx context.Context, opts refactorOptions) error {
 
-	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, "", opts.maxTools, opts.maxGitProcs, false)
+	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, "", "", opts.maxTools, opts.maxGitProcs, false)
 	if err != nil {
 		return err
 	}
@@ -113,7 +113,7 @@ func executeRefactor(ctx context.Context, opts refactorOptions) error {
 	refactorPaths := splitPaths(opts.paths)
 
 	if opts.preview {
-		return runRefactorPreview(cc, refactorTpl, refactorPaths)
+		return runRefactorPreview(cc, refactorTpl, refactorPaths, opts.outputFormat)
 	}
 
 	resumeState, err := loadRefactorResumeState(cc.RepoDir, opts)
@@ -189,7 +189,9 @@ func executeRefactor(ctx context.Context, opts refactorOptions) error {
 	// result persistence share one consistent identifier.
 	reviewID := ag.SessionID()
 	setResumeSessionID(ctx, reviewID)
-	if opts.savePerFile {
+	if opts.savePerFile && reviewID == "" {
+		fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save because the session was not persisted\n")
+	} else if opts.savePerFile {
 		if opts.resultDir == "" {
 			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
 				opts.resultDir = d
@@ -207,9 +209,10 @@ func executeRefactor(ctx context.Context, opts refactorOptions) error {
 		}
 		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
 		if pfwErr != nil {
-			return fmt.Errorf("create per-file writer: %w", pfwErr)
+			fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save: %v\n", pfwErr)
+		} else {
+			perFileWriter = pfw
 		}
-		perFileWriter = pfw
 	}
 
 	q := newQuietHandle(opts.outputFormat, opts.audience)
@@ -252,7 +255,7 @@ func executeRefactor(ctx context.Context, opts refactorOptions) error {
 			fmt.Fprintf(os.Stderr, "[ocr] Wrote %d partial finding(s) before failure\n", len(comments))
 		}
 		// Emit partial stdout/json (comments + token summary) even on hard failure.
-		if emitErr := emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity); emitErr != nil {
+		if emitErr := emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity, os.Stdout, nil); emitErr != nil {
 			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to emit partial refactor result: %v\n", emitErr)
 		}
 		return fmt.Errorf("refactor failed: %w", err)
@@ -264,7 +267,7 @@ func executeRefactor(ctx context.Context, opts refactorOptions) error {
 		}
 	}
 
-	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity)
+	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity, os.Stdout, nil)
 }
 
 // persistRefactorOutputs writes JSON/markdown/per-file artifacts for both
@@ -334,7 +337,7 @@ func persistRefactorOutputs(
 	}
 }
 
-func runRefactorPreview(cc *commonContext, refactorTpl *template.RefactorTemplate, refactorPaths []string) error {
+func runRefactorPreview(cc *commonContext, refactorTpl *template.RefactorTemplate, refactorPaths []string, outputFormat string) error {
 	ag := refactor.NewAgent(refactor.Args{
 		RepoDir:          cc.RepoDir,
 		Paths:            refactorPaths,
@@ -348,8 +351,7 @@ func runRefactorPreview(cc *commonContext, refactorTpl *template.RefactorTemplat
 	if err != nil {
 		return fmt.Errorf("refactor preview failed: %w", err)
 	}
-	outputPreviewText(preview)
-	return nil
+	return outputPreview(preview, outputFormat, os.Stdout)
 }
 
 func saveRefactorResult(repoDir string, opts refactorOptions, ag *refactor.Agent, comments []model.LlmComment, warnings []llmloop.AgentWarning, duration time.Duration, resultID string) (string, string, error) {

@@ -13,26 +13,26 @@ import (
 )
 
 const (
-	codeCommentCategoryBug             = "bug"
-	codeCommentCategorySecurity        = "security"
-	codeCommentCategoryPerformance     = "performance"
-	codeCommentCategoryMaintainability = "maintainability"
-	codeCommentCategoryTest            = "test"
-	codeCommentCategoryStyle           = "style"
-	codeCommentCategoryDocumentation   = "documentation"
-	codeCommentCategoryOther           = "other"
-	codeCommentCategoryComplexity      = "complexity"
-	codeCommentCategoryNaming          = "naming"
-	codeCommentCategoryDuplication     = "duplication"
-	codeCommentCategoryDesign          = "design"
-	codeCommentCategoryCoupling        = "coupling"
-	codeCommentCategoryData            = "data"
-	codeCommentCategoryControlFlow     = "control_flow"
-	codeCommentCategoryErrorHandling   = "error_handling"
-	codeCommentCategoryDeadCode        = "dead_code"
-	codeCommentCategoryTestability     = "testability"
+	codeCommentCategoryBug              = "bug"
+	codeCommentCategorySecurity         = "security"
+	codeCommentCategoryPerformance      = "performance"
+	codeCommentCategoryMaintainability  = "maintainability"
+	codeCommentCategoryTest             = "test"
+	codeCommentCategoryStyle            = "style"
+	codeCommentCategoryDocumentation    = "documentation"
+	codeCommentCategoryOther            = "other"
+	codeCommentCategoryComplexity       = "complexity"
+	codeCommentCategoryNaming           = "naming"
+	codeCommentCategoryDuplication      = "duplication"
+	codeCommentCategoryDesign           = "design"
+	codeCommentCategoryCoupling         = "coupling"
+	codeCommentCategoryData             = "data"
+	codeCommentCategoryControlFlow      = "control_flow"
+	codeCommentCategoryErrorHandling    = "error_handling"
+	codeCommentCategoryDeadCode         = "dead_code"
+	codeCommentCategoryTestability      = "testability"
 	codeCommentCategoryCrossDuplication = "cross_duplication"
-	codeCommentCategoryCrossFile       = "cross_file"
+	codeCommentCategoryCrossFile        = "cross_file"
 
 	codeCommentSeverityCritical = "critical"
 	codeCommentSeverityHigh     = "high"
@@ -45,22 +45,22 @@ const (
 )
 
 var validCodeCommentCategories = map[string]struct{}{
-	codeCommentCategoryBug:             {},
-	codeCommentCategorySecurity:        {},
-	codeCommentCategoryPerformance:     {},
-	codeCommentCategoryMaintainability: {},
-	codeCommentCategoryTest:            {},
-	codeCommentCategoryStyle:           {},
-	codeCommentCategoryDocumentation:   {},
-	codeCommentCategoryOther:           {},
-	codeCommentCategoryComplexity:      {},
-	codeCommentCategoryNaming:          {},
-	codeCommentCategoryDuplication:     {},
-	codeCommentCategoryDesign:          {},
-	codeCommentCategoryCoupling:        {},
-	codeCommentCategoryData:            {},
-	codeCommentCategoryControlFlow:     {},
-	codeCommentCategoryErrorHandling:   {},
+	codeCommentCategoryBug:              {},
+	codeCommentCategorySecurity:         {},
+	codeCommentCategoryPerformance:      {},
+	codeCommentCategoryMaintainability:  {},
+	codeCommentCategoryTest:             {},
+	codeCommentCategoryStyle:            {},
+	codeCommentCategoryDocumentation:    {},
+	codeCommentCategoryOther:            {},
+	codeCommentCategoryComplexity:       {},
+	codeCommentCategoryNaming:           {},
+	codeCommentCategoryDuplication:      {},
+	codeCommentCategoryDesign:           {},
+	codeCommentCategoryCoupling:         {},
+	codeCommentCategoryData:             {},
+	codeCommentCategoryControlFlow:      {},
+	codeCommentCategoryErrorHandling:    {},
 	codeCommentCategoryDeadCode:         {},
 	codeCommentCategoryTestability:      {},
 	codeCommentCategoryCrossDuplication: {},
@@ -101,9 +101,20 @@ func (p *CodeCommentProvider) Execute(_ context.Context, args map[string]any) (s
 	return CommentSucceed, nil
 }
 
+// ParseCommentsWithPath is like ParseComments but uses defaultPath as a fallback
+// when individual comment objects omit the path field.
+func ParseCommentsWithPath(args map[string]any, defaultPath string) ([]model.LlmComment, string) {
+	comments, errMsg := parseCommentsInner(args, defaultPath)
+	return comments, errMsg
+}
+
 // ParseComments extracts LlmComment entries from tool call arguments without writing
 // to the Collector. Returns parsed comments and an error message (empty on success).
 func ParseComments(args map[string]any) ([]model.LlmComment, string) {
+	return parseCommentsInner(args, "")
+}
+
+func parseCommentsInner(args map[string]any, defaultPath string) ([]model.LlmComment, string) {
 	var rawComments []any
 	if arr, ok := args["comments"].([]any); ok && len(arr) > 0 {
 		rawComments = arr
@@ -144,11 +155,16 @@ func ParseComments(args map[string]any) ([]model.LlmComment, string) {
 		if severity, ok := obj["severity"].(string); ok {
 			cm.Severity = normalizeCodeCommentSeverity(severity)
 		}
-		if path, ok := args["path"].(string); ok {
-			cm.Path = path
-		}
 		if path, ok := obj["path"].(string); ok && path != "" {
 			cm.Path = path
+		}
+		if cm.Path == "" {
+			if path, ok := args["path"].(string); ok {
+				cm.Path = path
+			}
+		}
+		if cm.Path == "" {
+			cm.Path = defaultPath
 		}
 		if v, ok := obj["start_line"].(float64); ok {
 			cm.StartLine = int(v)

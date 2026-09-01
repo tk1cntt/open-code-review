@@ -67,7 +67,7 @@ func TestLoadSession_FullParse(t *testing.T) {
 	writeJSONL(t, filepath.Join(repoDir, "sess1.jsonl"),
 		`{"type":"session_start","timestamp":"2025-06-10T08:00:00Z","cwd":"/home/dev/proj","gitBranch":"feat","model":"claude-3","reviewMode":"commit","diffFrom":"aaa","diffTo":"bbb","diffCommit":"ccc"}`,
 		`{"type":"llm_request","filePath":"main.go","taskType":"main_task","request_no":1,"messages":[{"role":"user","content":"review this"}]}`,
-		`{"type":"llm_response","filePath":"main.go","taskType":"main_task","content":"Code looks good","duration_ms":1500,"model":"claude-3","usage":{"prompt_tokens":100,"completion_tokens":50,"cache_read_tokens":10,"cache_write_tokens":5},"tool_calls":[{"name":"search","arguments":"query"}]}`,
+		`{"type":"llm_response","filePath":"main.go","taskType":"main_task","content":"Code looks good","reasoning_content":"checked for auth issues first","duration_ms":1500,"model":"claude-3","usage":{"prompt_tokens":100,"completion_tokens":50,"cache_read_tokens":10,"cache_write_tokens":5},"tool_calls":[{"name":"search","arguments":"query"}]}`,
 		`{"type":"tool_call","filePath":"main.go","taskType":"main_task","result":"found 3 results","ok":true,"duration_ms":20}`,
 		`{"type":"llm_request","filePath":"util.go","taskType":"plan_task","request_no":1,"messages":[]}`,
 		`{"type":"llm_response","filePath":"util.go","taskType":"plan_task","content":"planning","duration_ms":800,"model":"claude-3","usage":{"prompt_tokens":200,"completion_tokens":80,"cache_read_tokens":0,"cache_write_tokens":0}}`,
@@ -136,6 +136,9 @@ func TestLoadSession_FullParse(t *testing.T) {
 	}
 	if card.ResponseContent != "Code looks good" {
 		t.Errorf("ResponseContent = %q", card.ResponseContent)
+	}
+	if card.ReasoningContent != "checked for auth issues first" {
+		t.Errorf("ReasoningContent = %q", card.ReasoningContent)
 	}
 	if card.DurationMs != 1500 {
 		t.Errorf("DurationMs = %d", card.DurationMs)
@@ -274,7 +277,7 @@ func TestLoadSessionReadsV1Manifest(t *testing.T) {
 	}
 	writeJSONL(t, filepath.Join(repoDir, "manifest.jsonl"),
 		`{"type":"session_start","timestamp":"2025-01-01T00:00:00Z","cwd":"/x","model":"m"}`,
-		`{"type":"session_end","duration_seconds":1,"run_manifest":{"schema_version":"ocr.run-manifest/v1","run_id":"run-1","operation":"review","terminal_state":"complete","repository":{},"input":{"mode":"workspace"},"execution":{},"coverage":{"selected":[{"item_id":"a","path":"a.go"},{"item_id":"b","path":"b.go"}],"completed":[{"item_id":"a","path":"a.go"}],"reused":[{"item_id":"b","path":"b.go"}],"failed":[],"waived":[]},"elapsed_ms":1000}}`)
+		`{"type":"session_end","duration_seconds":1,"files_reviewed":["__grouping__","a.go,b.go","a.go"],"run_manifest":{"schema_version":"ocr.run-manifest/v1","run_id":"run-1","operation":"review","terminal_state":"complete","repository":{},"input":{"mode":"workspace"},"execution":{},"coverage":{"selected":[{"item_id":"a","path":"a.go"},{"item_id":"b","path":"b.go"}],"completed":[{"item_id":"a","path":"a.go"}],"reused":[{"item_id":"b","path":"b.go"}],"failed":[],"waived":[]},"elapsed_ms":1000}}`)
 
 	vs, err := LoadSession(root, "repo", "manifest")
 	if err != nil {
@@ -285,6 +288,9 @@ func TestLoadSessionReadsV1Manifest(t *testing.T) {
 	}
 	if vs.Summary.CompletedCount != 1 || vs.Summary.ReusedCount != 1 || vs.Summary.FailedCount != 0 || vs.Summary.WaivedCount != 0 {
 		t.Fatalf("coverage counts = %+v", vs.Summary)
+	}
+	if got := vs.Summary.FilesReviewed; len(got) != 2 || got[0] != "a.go" || got[1] != "b.go" {
+		t.Fatalf("files reviewed = %v, want [a.go b.go]", got)
 	}
 }
 
@@ -570,7 +576,12 @@ func TestLoadSession_ToolCallWithoutRequest(t *testing.T) {
 }
 
 func TestDiscoverRepos_SkipsUnreadableSubdir(t *testing.T) {
-	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+	// Chmod(0000) is only the read-only bit on Windows, so ReadDir still succeeds
+	// and the repo is discovered rather than skipped.
+	if runtime.GOOS == "windows" {
+		t.Skip("unix permissions not enforced on Windows")
+	}
+	if os.Getuid() == 0 {
 		t.Skip("permission checks are bypassed for root")
 	}
 	root := t.TempDir()
@@ -596,7 +607,12 @@ func TestDiscoverRepos_SkipsUnreadableSubdir(t *testing.T) {
 }
 
 func TestListSessions_SkipsUnreadableFiles(t *testing.T) {
-	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+	// Chmod(0000) is only the read-only bit on Windows, so the "bad" file is still
+	// readable and gets counted as a second session.
+	if runtime.GOOS == "windows" {
+		t.Skip("unix permissions not enforced on Windows")
+	}
+	if os.Getuid() == 0 {
 		t.Skip("permission checks are bypassed for root")
 	}
 	root := t.TempDir()
@@ -867,5 +883,96 @@ func TestLoadSession_ReviewItemFailed_WithComments(t *testing.T) {
 	}
 	if vs.CategoryCount["performance"] != 1 || vs.CategoryCount["bug"] != 1 || vs.CategoryCount["security"] != 1 {
 		t.Errorf("CategoryCount perf=%d bug=%d sec=%d", vs.CategoryCount["performance"], vs.CategoryCount["bug"], vs.CategoryCount["security"])
+	}
+}
+
+func TestLoadSession_ReviewComments(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeJSONL(t, filepath.Join(repoDir, "comments.jsonl"),
+		`{"type":"session_start","timestamp":"2025-01-01T00:00:00Z","cwd":"/x","model":"m"}`,
+		`{"type":"review_item_done","filePath":"main.go","comments":[{"path":"override.go","content":"use a constant","suggestion_code":"const N = 3","existing_code":"3","start_line":10,"end_line":12,"category":"style","severity":"minor"}]}`,
+		`{"type":"review_item_reused","filePath":"util.go","comments":[{"content":"reused finding"}]}`,
+		`{"type":"session_end","duration_seconds":5,"files_reviewed":["main.go"]}`,
+	)
+
+	vs, err := LoadSession(root, "repo", "comments")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(vs.Comments) != 2 {
+		t.Fatalf("Comments = %d, want 2", len(vs.Comments))
+	}
+	if vs.Summary.CommentCount != 2 {
+		t.Errorf("CommentCount = %d, want 2", vs.Summary.CommentCount)
+	}
+
+	c := vs.Comments[0]
+	// path override replaces the record-level filePath.
+	if c.FilePath != "override.go" {
+		t.Errorf("FilePath = %q, want override.go", c.FilePath)
+	}
+	if c.Content != "use a constant" {
+		t.Errorf("Content = %q", c.Content)
+	}
+	if c.SuggestionCode != "const N = 3" {
+		t.Errorf("SuggestionCode = %q", c.SuggestionCode)
+	}
+	if c.ExistingCode != "3" {
+		t.Errorf("ExistingCode = %q", c.ExistingCode)
+	}
+	if c.StartLine != 10 || c.EndLine != 12 {
+		t.Errorf("lines = %d-%d, want 10-12", c.StartLine, c.EndLine)
+	}
+	if c.Category != "style" {
+		t.Errorf("Category = %q", c.Category)
+	}
+	if c.Severity != "minor" {
+		t.Errorf("Severity = %q", c.Severity)
+	}
+
+	// A reused comment with no path falls back to the record-level filePath.
+	reused := vs.Comments[1]
+	if reused.FilePath != "util.go" {
+		t.Errorf("reused FilePath = %q, want util.go", reused.FilePath)
+	}
+	if reused.Content != "reused finding" {
+		t.Errorf("reused Content = %q", reused.Content)
+	}
+}
+
+func TestLoadSession_SessionLevelGroupingTask(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeJSONL(t, filepath.Join(repoDir, "group.jsonl"),
+		`{"type":"session_start","timestamp":"2025-01-01T00:00:00Z","cwd":"/x","model":"m"}`,
+		`{"type":"llm_request","filePath":"__grouping__","taskType":"grouping_task","request_no":1,"messages":[]}`,
+		`{"type":"llm_response","filePath":"__grouping__","taskType":"grouping_task","content":"grouped","duration_ms":10,"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+		`{"type":"llm_request","filePath":"a.go","taskType":"main_task","request_no":1,"messages":[]}`,
+		`{"type":"llm_response","filePath":"a.go","taskType":"main_task","content":"ok","duration_ms":10,"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+		`{"type":"session_end","duration_seconds":1,"files_reviewed":["a.go"]}`,
+	)
+
+	vs, err := LoadSession(root, "repo", "group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vs.Files) != 1 || vs.Files[0].FilePath != "a.go" {
+		t.Fatalf("Files = %+v, want [a.go]", vs.Files)
+	}
+	if len(vs.SessionTasks) != 1 || vs.SessionTasks[0].FilePath != "__grouping__" {
+		t.Fatalf("SessionTasks = %+v, want [__grouping__]", vs.SessionTasks)
+	}
+	if len(vs.SessionTasks[0].Tasks[GroupingTask]) != 1 {
+		t.Errorf("grouping_task cards = %d, want 1", len(vs.SessionTasks[0].Tasks[GroupingTask]))
 	}
 }

@@ -63,13 +63,19 @@ type compressionState struct {
 	pendingJob *compressionJob
 }
 
+// messageTokens counts visible text plus the Native replay payload that
+// ExtractText() does not see.
+func messageTokens(m llm.Message) int {
+	return llm.CountTokens(m.ExtractText()) + m.Native.EstimatedTokens()
+}
+
 // CountMessagesTokens returns the rough token count of msgs by summing the
-// per-message text token count. Exported because both review and scan top
+// per-message token count. Exported because both review and scan top
 // layers may want it for pre-flight checks.
 func CountMessagesTokens(msgs []llm.Message) int {
 	var total int
 	for _, m := range msgs {
-		total += llm.CountTokens(m.ExtractText())
+		total += messageTokens(m)
 	}
 	return total
 }
@@ -107,9 +113,9 @@ func computeActiveZoneSize(rounds []round, messages []llm.Message, maxTokens int
 	count := 0
 	tokensUsed := 0
 	for i := len(rounds) - 1; i >= 0; i-- {
-		roundTokens := llm.CountTokens(messages[rounds[i].assistantIdx].ExtractText())
+		roundTokens := messageTokens(messages[rounds[i].assistantIdx])
 		for _, ti := range rounds[i].toolIdxs {
-			roundTokens += llm.CountTokens(messages[ti].ExtractText())
+			roundTokens += messageTokens(messages[ti])
 		}
 		if tokensUsed+roundTokens > budget {
 			break
@@ -190,6 +196,11 @@ func buildMessageXML(msgs []llm.Message) string {
 		sb.WriteString("    <content>\n")
 		sb.WriteString(fmt.Sprintf("      %s\n", m.ExtractText()))
 		sb.WriteString("    </content>\n")
+		if m.ReasoningContent != "" {
+			sb.WriteString("    <reasoning>\n")
+			sb.WriteString(fmt.Sprintf("      %s\n", m.ReasoningContent))
+			sb.WriteString("    </reasoning>\n")
+		}
 		sb.WriteString("</message>")
 		if i < len(msgs)-1 {
 			sb.WriteString("\n")
@@ -227,16 +238,27 @@ func (r *Runner) runCompression(ctx context.Context, msgs []llm.Message, filePat
 		compressionMsgs = append(compressionMsgs, llm.NewTextMessage(m.Role, content))
 	}
 
+	// The task record is created before the request, not after it, because the
+	// retry report keys request identity on RequestNo and that number only
+	// exists once the record does. The visible consequence is that the
+	// llm_request line reaches the session JSONL before the response: a run
+	// killed mid-request now leaves an llm_request with no response, which
+	// resume ignores (applyResumeLine has no case for it).
+	fs := r.deps.Session.GetOrCreateFileSession(filePath)
+	rec := fs.AppendTaskRecord(session.MemoryCompressionTask, compressionMsgs)
+
+	ctx = llm.ContextWithSessionKey(ctx,
+		llm.SessionTaskKey(r.deps.Session.SessionID, string(session.MemoryCompressionTask), filePath))
+
 	startTime := time.Now()
-	resp, err := r.deps.LLMClient.CompletionsWithCtx(ctx, llm.ChatRequest{
+	reqCtx := r.requestCtx(ctx, filePath, session.MemoryCompressionTask, rec.RequestNo)
+	resp, err := r.deps.LLMClient.CompletionsWithCtx(reqCtx, llm.ChatRequest{
 		Model:     r.deps.Model,
 		Messages:  compressionMsgs,
 		MaxTokens: r.deps.Template.CompletionTokenLimit(),
 	})
 	duration := time.Since(startTime)
 
-	fs := r.deps.Session.GetOrCreateFileSession(filePath)
-	rec := fs.AppendTaskRecord(session.MemoryCompressionTask, compressionMsgs)
 	if err != nil {
 		rec.SetError(err, duration)
 		// Return msgs unchanged: truncating to frozenEnd would discard all
@@ -289,7 +311,11 @@ func (r *Runner) triggerAsyncCompression(ctx context.Context, st *compressionSta
 	st.pendingJob = job
 	st.mu.Unlock()
 
+	// Registered before the goroutine starts so WaitBackground can never miss
+	// a job that was launched but has not run yet.
+	r.bg.Add(1)
 	go func() {
+		defer r.bg.Done()
 		defer cancel()
 		rebuilt, err := r.runCompression(asyncCtx, msgSnapshot, filePath)
 

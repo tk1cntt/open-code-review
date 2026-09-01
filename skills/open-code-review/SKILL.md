@@ -23,46 +23,6 @@ metadata:
 
 A skill for invoking [open-code-review](https://github.com/alibaba/open-code-review) (`ocr`) — an open-source AI code review CLI that reads Git diffs and generates structured, line-level review comments.
 
-## Prerequisites check
-
-Before starting a review, verify the environment:
-
-```bash
-# 1. Check the CLI is installed
-which ocr || echo "NOT INSTALLED"
-
-# 2. Verify LLM connectivity
-ocr llm test
-```
-
-If `ocr` is not installed, install it first:
-
-```bash
-npm install -g @alibaba-group/open-code-review
-```
-
-If `ocr llm test` fails, the user must configure an LLM. Guide them with one of these options:
-
-**Option A — Environment variables (highest priority, recommended for CI):**
-
-```bash
-export OCR_LLM_URL=https://api.anthropic.com/v1/messages
-export OCR_LLM_TOKEN=<api-key>
-export OCR_LLM_MODEL=claude-opus-4-6
-export OCR_USE_ANTHROPIC=true
-```
-
-**Option B — Persistent config:**
-
-```bash
-ocr config set llm.url https://api.anthropic.com/v1/messages
-ocr config set llm.auth_token <api-key>
-ocr config set llm.model claude-opus-4-6
-ocr config set llm.use_anthropic true
-```
-
-Stop here and ask the user to provide credentials — never invent or hardcode API keys.
-
 ## Workflow
 
 ### Step 1: Gather Business Context
@@ -85,10 +45,17 @@ ocr review --audience agent --background "business context here" [user-args]
 - **Default** (no user arguments): reviews staged, unstaged, and untracked changes (workspace mode)
 - **Specific commit**: use `--commit` or `-c` to review a single commit against its parent
 - **Branch comparison**: use `--from <ref>` and `--to <ref>` to review diff between two refs
-- **Timeout**: default timeout is 10 minutes per file; adjust with `--timeout <minutes>`
+- **Effort**: `--effort low|medium|high` (default `medium`) sets review rounds (1/2/3). More rounds improve recall at higher cost
+- **Timeout**: effective timeout per review group = `--timeout` × review rounds. Default `--timeout 15` with default effort `medium` (2 rounds) gives 30 minutes; `low`/`high` give 15/45 minutes.
 - **Concurrency**: default concurrency is 8 file workers; reduce with `--concurrency <n>` if rate limits are hit
+- **Grouping / max-tools**: files are grouped semantically before review. `--max-tools` is the per-group tool-call cap; values 1–49 are clamped up to 50
 - **Preview mode**: use `--preview` or `-p` to preview which files will be reviewed without running the LLM
+- **No filter**: `--no-filter` keeps all comments and skips the LLM post-filter pass
+- **Output file**: `--output <path>` / `-o` writes results to a UTF-8 file (default: stdout)
 - **Resume**: use `--resume <session-id>` to reuse completed results and retry failed files from a previous session
+- **Resume mode**: `--resume-mode continue|restart-failed` (default `continue`) — `continue` uses mid-file checkpoints; `restart-failed` cold-retries failed files
+- **Apply**: `--apply` lets the LLM edit files directly (LLM-as-editor via `file_edit` + `shell_run`)
+- **Save result**: `--save-result` is on by default; `--save-per-file` splits output into per-file markdown; `--rules-dir` points at enterprise/project rules
 - **Installation**: if `ocr` command is not found, install it by running `npm i -g @alibaba-group/open-code-review`
 
 **Common invocation patterns:**
@@ -98,11 +65,15 @@ ocr review --audience agent --background "business context here" [user-args]
 | "review my changes" / "review the working copy" | `ocr review --audience agent -b "context"` |
 | "review this PR" / "review feature branch" | `ocr review --audience agent -b "context" --from main --to <branch>` |
 | "review commit abc123" | `ocr review --audience agent -b "context" --commit abc123` |
+| "review and apply fixes" | `ocr review --audience agent -b "context" --apply` |
 | "what would be reviewed?" (dry-run) | `ocr review --preview` |
 
 **Output mode:**
 
 - Always use `--audience agent` to suppress progress UI and emit only the final summary
+- **Prevent output truncation**: For large reviews or restricted tool environments, redirect output to a temporary file (`ocr review --audience agent ... > /tmp/ocr_out.txt 2>&1`) and inspect it in full via a file reading tool instead of piping through `tail` or `head`, which drops earlier review comments.
+
+**On failure:** If `ocr review` exits non-zero (e.g. an LLM connection error), do not retry blindly — consult the Troubleshooting section below for the matching fix before re-running.
 
 ### Step 3: Read Structured Review Results
 
@@ -131,7 +102,9 @@ Each comment in the JSON contains:
 | `category` | `bug`, `security`, `performance`, `maintainability`, `test`, `style`, `documentation` |
 | `thinking` | Optional LLM reasoning |
 
-Also note the `review.session_id` field — save this for the `--resume` flag in Step 5.
+Also note the `review.session_id` field — save this for the `--resume` flag in Step 6. On Ctrl+C the CLI prints the same session ID so the run can be resumed.
+
+OCR output includes structured `severity` (critical / high / medium / low) and `category` (bug / security / performance / maintainability / test / style / documentation / other) on each comment. Present results grouped by severity, discarding `low` severity items that are likely false positives or nitpicks.
 
 ### Step 4: Classify and Prioritize
 
@@ -147,8 +120,15 @@ Report all actionable findings grouped by file and priority before applying fixe
 
 Check whether the user requested automatic fixes:
 
-- If the user explicitly said "review and fix" or similar → proceed with automatic fixes
+- If the user explicitly said "review and fix" or similar → proceed with automatic fixes (`--apply` when the LLM should edit files directly)
 - If the user only said "review" → ask for permission before applying any changes
+
+When fixing issues and suggestions:
+
+- Focus on critical, high, and medium severity items
+- Apply fixes directly to the code when safe and well-defined
+- For complex fixes requiring manual intervention, clearly describe what needs to be done
+- Always verify fixes with the user before committing
 
 **Fix process:**
 
@@ -175,6 +155,8 @@ ocr review --audience agent -b "context" --from main --to HEAD --resume <session
 - **Retry** files that previously failed (auto-detected)
 - **Re-review** files whose diff content changed (because you edited them)
 
+Use `--resume-mode restart-failed` to cold-retry failed files instead of continuing from a mid-file checkpoint.
+
 ### Step 7: Iterate Until Clean
 
 ```
@@ -188,41 +170,42 @@ Stop when:
 
 ## Output Format
 
-Each comment contains:
+Each comment in OCR's output contains:
 
 - `path`: File path
 - `content`: Review comment text
 - `start_line` / `end_line`: Line range (both 0 means positioning failed)
+- `category`: Issue category (bug, security, performance, maintainability, test, style, documentation, other)
+- `severity`: Issue severity (critical, high, medium, low)
 - `suggestion_code`: Optional fix suggestion
 - `existing_code`: Optional original code snippet
 - `thinking`: Optional LLM reasoning process
 
-After filtering comments by priority, present results using this template:
+Present results grouped by severity using this template:
 
 ```markdown
 ## Code Review Results
 
 **Files reviewed**: N
-**Issues found**: X high priority / Y medium priority
+**Issues found**: X critical, Y high, Z medium
 
-### High Priority
+### Critical
 
-- **`path/to/file.java:42`** — Brief description
+- **`path/to/file.java:42`** [bug] — Brief description
   > Recommendation: How to fix
 
-### Medium Priority
+### High
 
-- **`path/to/file.ts:88`** — Brief description
+- **`path/to/file.java:26`** [bug] — Brief description
+  > Recommendation: How to fix
+
+### Medium
+
+- **`path/to/file.ts:88`** [performance] — Brief description
   > Recommendation: How to fix (if applicable)
 ```
 
-If the review found no issues after filtering, simply state: "Review complete — no issues found in N files."
-
-**Priority classification:**
-
-- **High**: Obvious bugs, security issues, clear mistakes, or well-founded suggestions with precise fix proposals
-- **Medium**: Reasonable concerns but context-dependent, style/performance suggestions, or fixes that require manual implementation
-- **Low**: Discarded silently (likely false positives, lacking context, nitpicks, or meaningless suggestions)
+If no critical, high, or medium severity issues remain after filtering, state: "Review complete — no critical, high, or medium issues found in N files."
 
 **Handling mispositioned comments:**
 
@@ -272,15 +255,16 @@ ocr rules check src/main/java/com/example/Foo.java
 
 ## Gotchas
 
-- **LLM must be configured first** — `ocr review` will fail loudly if no LLM is reachable. Always run `ocr llm test` before the first review.
+- **LLM must be configured first** — `ocr review` will fail loudly if no LLM is reachable. See the Troubleshooting section below if this happens.
 - **Working directory matters** — `ocr review` operates on the Git repo at the current directory. Use `--repo /path/to/repo` to run from elsewhere.
 - **Untracked files are reviewed in workspace mode** — running bare `ocr review` includes staged, unstaged, *and* untracked changes. Stage selectively if you want narrower scope.
 - **Large diffs may hit token limits** — files with very large diffs may be truncated. The default `MAX_TOKENS` is 58888 per request.
 - **Plan phase triggers at 50 lines** — diffs exceeding 50 changed lines run an extra risk-analysis phase before main review. This adds latency but improves quality.
 - **Don't pass `--audience human`** — it streams progress UI that pollutes output. Always use `--audience agent`.
 - **Comment language follows config** — set `language` config to `English` or `Chinese` (default: Chinese) to control review comment language.
-- **`--save-result` is always on** — results are saved to `<repo>/.opencodereview/reviews/`. Read this JSON instead of parsing terminal output.
-- **Use `--resume` after fixing** — it skips unchanged files and retries failed files, making re-review fast.
+- **`--save-result` is always on** — results are saved to `<repo>/.opencodereview/reviews/`. Read this JSON instead of parsing terminal output. `--save-per-file` writes per-file markdown under a tree that mirrors the source.
+- **Use `--resume` after fixing** — it skips unchanged files and retries failed files, making re-review fast. Ctrl+C prints the session ID to resume with.
+- **Avoid output truncation** — Large review runs produce verbose output. Never pipe command output to `tail` or `head` as it drops review comments from earlier sections. Redirect output to a file (`--output` or a shell redirect) and read it in full.
 
 ## Validation
 
@@ -292,6 +276,37 @@ After the review completes, verify success by checking:
 4. Warnings (if any) are displayed in stderr
 
 If errors occurred, check the stderr warnings for details about which files failed and why.
+
+## Troubleshooting
+
+**`ocr: command not found`**
+
+Install the CLI:
+
+```bash
+npm install -g @alibaba-group/open-code-review
+```
+
+**`ocr review` fails with LLM connection error**
+
+Prompt the user to configure an LLM provider.
+
+Interactive setup (recommended):
+
+```bash
+ocr config provider
+```
+
+Manual setup (alternative):
+
+```bash
+ocr config set llm.url https://api.anthropic.com/v1/messages
+ocr config set llm.auth_token <api-key>
+ocr config set llm.model claude-opus-4-6
+ocr config set llm.use_anthropic true
+```
+
+Verify connectivity with `ocr llm test`. Stop here and ask the user to provide credentials — never invent or hardcode API keys.
 
 ## References
 

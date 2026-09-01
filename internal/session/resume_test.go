@@ -24,7 +24,7 @@ func TestSessionFilePath_EmptyID(t *testing.T) {
 
 func TestSessionFilePath_ValidID(t *testing.T) {
 	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
+	setTestHome(t, tmpHome)
 
 	path, err := SessionFilePath("/some/repo", "abc-123")
 	if err != nil {
@@ -113,6 +113,26 @@ func TestItem_ReturnsCopy(t *testing.T) {
 	}
 }
 
+// --- ResumeState.ReusableItem ---
+
+// The manifest settles coverage per item, and only completed and reused are
+// settled as results worth carrying forward. A failed item is settled too — as
+// work that must happen again — so the checkpoint index agreeing is not enough.
+func TestReusableItem_ManifestFailureIsNotReusable(t *testing.T) {
+	s := &ResumeState{
+		Items: map[string]ResumeItem{"fp-failed": {FilePath: "a.go", Fingerprint: "fp-failed"}},
+		Manifest: &RunManifest{
+			Coverage: Coverage{
+				Selected: []CoverageItem{{ItemID: "fp-failed", Fingerprint: "fp-failed"}},
+				Failed:   []CoverageItem{{ItemID: "fp-failed", Fingerprint: "fp-failed"}},
+			},
+		},
+	}
+	if _, ok := s.ReusableItem("fp-failed"); ok {
+		t.Error("an item the parent manifest settled as failed must be reviewed again")
+	}
+}
+
 // --- ValidateOptions ---
 
 func TestValidateOptions_NilState(t *testing.T) {
@@ -171,7 +191,11 @@ func TestValidateOptions_RangeMatches(t *testing.T) {
 	}
 }
 
-func TestValidateOptions_RangeMismatch(t *testing.T) {
+// Ref text is no longer evidence about the input: two spellings can name the
+// same commit and one spelling can name two different commits over time.
+// ValidateResume compares the resolved input identity instead, so ValidateOptions
+// must not reject on the typed refs alone.
+func TestValidateOptions_IgnoresRangeText(t *testing.T) {
 	s := &ResumeState{
 		ReviewMode: ReviewModeRange,
 		DiffFrom:   "main",
@@ -182,8 +206,8 @@ func TestValidateOptions_RangeMismatch(t *testing.T) {
 		DiffFrom:   "main",
 		DiffTo:     "feature-b",
 	})
-	if err == nil {
-		t.Fatal("expected error for range mismatch")
+	if err != nil {
+		t.Errorf("ref text must not decide admission, got: %v", err)
 	}
 }
 
@@ -201,7 +225,7 @@ func TestValidateOptions_CommitMatches(t *testing.T) {
 	}
 }
 
-func TestValidateOptions_CommitMismatch(t *testing.T) {
+func TestValidateOptions_IgnoresCommitText(t *testing.T) {
 	s := &ResumeState{
 		ReviewMode: ReviewModeCommit,
 		DiffCommit: "abc123",
@@ -210,8 +234,8 @@ func TestValidateOptions_CommitMismatch(t *testing.T) {
 		ReviewMode: ReviewModeCommit,
 		DiffCommit: "def456",
 	})
-	if err == nil {
-		t.Fatal("expected error for commit mismatch")
+	if err != nil {
+		t.Errorf("ref text must not decide admission, got: %v", err)
 	}
 }
 
@@ -237,9 +261,7 @@ func TestApplyResumeLine_SessionStart(t *testing.T) {
 		DiffFrom:   "main",
 		DiffTo:     "feature",
 	})
-	if err := s.applyResumeLine(line); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s.applyResumeLine(line)
 	if s.SessionID != "sess-1" {
 		t.Errorf("SessionID = %q", s.SessionID)
 	}
@@ -261,9 +283,7 @@ func TestApplyResumeLine_ReviewItemDone(t *testing.T) {
 		Fingerprint: "fp-handler",
 		Comments:    []model.LlmComment{{Content: "potential nil deref"}},
 	})
-	if err := s.applyResumeLine(line); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s.applyResumeLine(line)
 	if s.CompletedCount() != 1 {
 		t.Fatalf("CompletedCount = %d, want 1", s.CompletedCount())
 	}
@@ -285,9 +305,7 @@ func TestApplyResumeLine_ReviewItemDone_FallbackToNewPath(t *testing.T) {
 		// Non-empty comments required: zero-comment done is treated as incomplete.
 		Comments: []model.LlmComment{{Path: "renamed.go", Content: "ok", StartLine: 1, EndLine: 1}},
 	})
-	if err := s.applyResumeLine(line); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s.applyResumeLine(line)
 	item, ok := s.Item("fp-renamed")
 	if !ok {
 		t.Fatal("missing fp-renamed")
@@ -303,9 +321,7 @@ func TestApplyResumeLine_ReviewItemDone_EmptyFingerprint(t *testing.T) {
 		Type:     "review_item_done",
 		FilePath: "skip.go",
 	})
-	if err := s.applyResumeLine(line); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s.applyResumeLine(line)
 	if s.CompletedCount() != 0 {
 		t.Error("items with empty fingerprint should be skipped")
 	}
@@ -318,9 +334,7 @@ func TestApplyResumeLine_ReviewItemReused(t *testing.T) {
 		FilePath:    "reused.go",
 		Fingerprint: "fp-reused",
 	})
-	if err := s.applyResumeLine(line); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s.applyResumeLine(line)
 	if _, ok := s.Item("fp-reused"); !ok {
 		t.Error("review_item_reused should be tracked in Items")
 	}
@@ -334,9 +348,7 @@ func TestApplyResumeLine_ReviewItemFailed(t *testing.T) {
 		Type:        "review_item_failed",
 		Fingerprint: "fp-fail",
 	})
-	if err := s.applyResumeLine(line); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s.applyResumeLine(line)
 	if _, ok := s.Item("fp-fail"); ok {
 		t.Error("failed item should be removed from Items")
 	}
@@ -349,9 +361,7 @@ func TestApplyResumeLine_ReviewItemFailed_EmptyFingerprint(t *testing.T) {
 	line := mustJSON(t, resumeRecord{
 		Type: "review_item_failed",
 	})
-	if err := s.applyResumeLine(line); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s.applyResumeLine(line)
 	// Should not affect existing items when fingerprint is empty.
 	if s.CompletedCount() != 1 {
 		t.Error("empty fingerprint failure should not affect existing items")
@@ -361,9 +371,7 @@ func TestApplyResumeLine_ReviewItemFailed_EmptyFingerprint(t *testing.T) {
 func TestApplyResumeLine_UnknownType(t *testing.T) {
 	s := &ResumeState{Items: make(map[string]ResumeItem)}
 	line := mustJSON(t, resumeRecord{Type: "session_end"})
-	if err := s.applyResumeLine(line); err != nil {
-		t.Fatalf("unknown record types should be silently ignored, got: %v", err)
-	}
+	s.applyResumeLine(line)
 	if s.CompletedCount() != 0 {
 		t.Error("unknown type should not add items")
 	}
@@ -371,9 +379,11 @@ func TestApplyResumeLine_UnknownType(t *testing.T) {
 
 func TestApplyResumeLine_InvalidJSON(t *testing.T) {
 	s := &ResumeState{Items: make(map[string]ResumeItem)}
-	err := s.applyResumeLine([]byte(`{invalid json}`))
-	if err == nil {
-		t.Fatal("expected error for invalid JSON")
+	if err := s.applyResumeLine([]byte(`{invalid json}`)); err == nil {
+		t.Fatal("an unreadable line must be reported; the caller decides whether it is fatal")
+	}
+	if s.CompletedCount() != 0 {
+		t.Error("an unreadable line must not add items")
 	}
 }
 
@@ -465,7 +475,7 @@ func TestCopyLlmComments_DeepCopy(t *testing.T) {
 
 func TestLoadResumeState_NonexistentFile(t *testing.T) {
 	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
+	setTestHome(t, tmpHome)
 
 	_, err := LoadResumeState("/some/repo", "nonexistent-session")
 	if err == nil {
@@ -475,7 +485,7 @@ func TestLoadResumeState_NonexistentFile(t *testing.T) {
 
 func TestLoadResumeState_EmptyFile(t *testing.T) {
 	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
+	setTestHome(t, tmpHome)
 
 	repoDir := "/test/repo"
 	sessionID := "empty-session"
@@ -501,7 +511,7 @@ func TestLoadResumeState_EmptyFile(t *testing.T) {
 
 func TestLoadResumeState_MultipleRecords(t *testing.T) {
 	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
+	setTestHome(t, tmpHome)
 
 	repoDir := "/test/multi"
 	sessionID := "multi-session"
@@ -572,9 +582,65 @@ func TestLoadResumeState_MultipleRecords(t *testing.T) {
 	}
 }
 
-func TestLoadResumeState_InvalidJSON(t *testing.T) {
+// TestLoadReviewResumeState_CorruptLineDoesNotAbortLoad pins the cost of one
+// unreadable line in a review session: the file it described is reviewed again,
+// and nothing else is affected. Failing the load instead would let a single
+// truncated write cost every other file its checkpoint — the opposite of what a
+// checkpoint is for.
+func TestLoadReviewResumeState_CorruptLineDoesNotAbortLoad(t *testing.T) {
+	setTestHome(t, t.TempDir())
+
+	repoDir := "/test/corrupt"
+	sessionID := "corrupt-session"
+	path, err := SessionFilePath(repoDir, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	doneComment := []model.LlmComment{{Path: "good.go", Content: "ok", StartLine: 1, EndLine: 1}}
+	lines := [][]byte{
+		mustJSON(t, resumeRecord{Type: "session_start", SessionID: sessionID, ReviewMode: ReviewModeRange}),
+		mustJSON(t, resumeRecord{Type: "review_item_done", FilePath: "good.go", Fingerprint: "fp-good", Comments: doneComment}),
+		[]byte(`{"type":"review_item_done","fingerprint":`),
+		mustJSON(t, resumeRecord{Type: "review_item_done", FilePath: "later.go", Fingerprint: "fp-later", Comments: []model.LlmComment{{Path: "later.go", Content: "ok", StartLine: 1, EndLine: 1}}}),
+		mustJSON(t, resumeRecord{Type: "session_end", RunManifest: &RunManifest{
+			Coverage: Coverage{Completed: []CoverageItem{
+				{ItemID: "fp-good", Fingerprint: "fp-good"},
+				{ItemID: "fp-later", Fingerprint: "fp-later"},
+			}},
+		}}),
+	}
+	var buf []byte
+	for _, line := range lines {
+		buf = append(append(buf, line...), '\n')
+	}
+	if err := os.WriteFile(path, buf, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := LoadReviewResumeState(repoDir, sessionID)
+	if err != nil {
+		t.Fatalf("one bad line must not fail a review load: %v", err)
+	}
+	if state.CorruptLines != 1 {
+		t.Fatalf("CorruptLines = %d, want 1", state.CorruptLines)
+	}
+	// Records on both sides of the bad line survive — replay does not stop at it.
+	for _, fp := range []string{"fp-good", "fp-later"} {
+		if _, ok := state.ReusableItem(fp); !ok {
+			t.Errorf("%s should still be reusable", fp)
+		}
+	}
+}
+
+// TestLoadReviewResumeState_CountsCorruptLines pins HEAD's crash-resilience
+// accounting: a truncated write around valid records is skipped, counted, and
+// does not drop the rest of the session.
+func TestLoadReviewResumeState_CountsCorruptLines(t *testing.T) {
 	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
+	setTestHome(t, tmpHome)
 
 	repoDir := "/test/invalid"
 	sessionID := "bad-json"
@@ -585,8 +651,6 @@ func TestLoadResumeState_InvalidJSON(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
-	// Corrupt lines are skipped (P0 hard-crash resilience) so resume can still
-	// load valid records that surround a truncated write.
 	content := []byte("{bad json}\n" +
 		`{"type":"session_start","sessionId":"bad-json","reviewMode":"full_scan"}` + "\n" +
 		`{"type":"review_item_done","filePath":"a.go","fingerprint":"fp-a","comments":[{"path":"a.go","content":"ok","start_line":1,"end_line":1}]}` + "\n")
@@ -594,9 +658,9 @@ func TestLoadResumeState_InvalidJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	state, err := LoadResumeState(repoDir, sessionID)
+	state, err := LoadReviewResumeState(repoDir, sessionID)
 	if err != nil {
-		t.Fatalf("corrupt lines must not fail LoadResumeState: %v", err)
+		t.Fatalf("corrupt lines must not fail LoadReviewResumeState: %v", err)
 	}
 	if state.CorruptLines != 1 {
 		t.Fatalf("CorruptLines = %d, want 1", state.CorruptLines)
@@ -606,9 +670,66 @@ func TestLoadResumeState_InvalidJSON(t *testing.T) {
 	}
 }
 
+// TestLoadResumeState_CorruptLineIsFatal pins the strict entry point, which scan
+// resume uses. Scan has no manifest to arbitrate coverage, so an unreadable line
+// cannot be told apart from a checkpoint that was never written: reporting the
+// damage is the only honest answer, and silently reusing — or silently discarding
+// — every other checkpoint is not.
+func TestLoadResumeState_CorruptLineIsFatal(t *testing.T) {
+	setTestHome(t, t.TempDir())
+
+	repoDir := "/test/corrupt-strict"
+	sessionID := "strict-session"
+	path, err := SessionFilePath(repoDir, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	buf := append(mustJSON(t, resumeRecord{Type: "review_item_done", FilePath: "good.go", Fingerprint: "fp-good", Comments: []model.LlmComment{{Content: "ok"}}}), '\n')
+	buf = append(buf, []byte("{bad json}\n")...)
+	if err := os.WriteFile(path, buf, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := LoadResumeState(repoDir, sessionID); err == nil {
+		t.Fatal("the strict loader must report an unreadable line rather than drop it")
+	}
+}
+
+// TestLoadResumeState_IntactSessionStillReusable guards the scan path against the
+// regression this split exists to prevent: an undamaged session must keep every
+// checkpoint it recorded, with no manifest involved.
+func TestLoadResumeState_IntactSessionStillReusable(t *testing.T) {
+	setTestHome(t, t.TempDir())
+
+	repoDir := "/test/intact-scan"
+	sessionID := "intact-session"
+	path, err := SessionFilePath(repoDir, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	buf := append(mustJSON(t, resumeRecord{Type: "review_item_done", FilePath: "good.go", Fingerprint: "fp-good", Comments: []model.LlmComment{{Content: "ok"}}}), '\n')
+	if err := os.WriteFile(path, buf, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := LoadResumeState(repoDir, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := state.Item("fp-good"); !ok {
+		t.Error("an intact checkpoint must stay reusable without a manifest")
+	}
+}
+
 func TestLoadResumeState_FailThenRedone(t *testing.T) {
 	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
+	setTestHome(t, tmpHome)
 
 	repoDir := "/test/redo"
 	sessionID := "redo-session"

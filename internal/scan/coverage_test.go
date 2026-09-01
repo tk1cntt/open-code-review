@@ -2,12 +2,14 @@ package scan
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/alibaba/open-code-review/internal/config/rules"
 	"github.com/alibaba/open-code-review/internal/config/template"
 	"github.com/alibaba/open-code-review/internal/llm"
+	"github.com/alibaba/open-code-review/internal/llmloop"
 	"github.com/alibaba/open-code-review/internal/model"
 	"github.com/alibaba/open-code-review/internal/session"
 	"github.com/alibaba/open-code-review/internal/tool"
@@ -18,9 +20,11 @@ import (
 type fakeScanClient struct {
 	responses []*llm.ChatResponse
 	idx       int
+	calls     int
 }
 
 func (f *fakeScanClient) CompletionsWithCtx(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+	f.calls++
 	if f.idx >= len(f.responses) {
 		empty := ""
 		return &llm.ChatResponse{
@@ -450,9 +454,12 @@ func TestExecuteSubtask_Success(t *testing.T) {
 	a.currentDate = "2026-06-26 10:00"
 
 	it := model.ScanItem{Path: "main.go", Content: "package main\n", LineCount: 1}
-	err := a.executeSubtask(context.Background(), it, session.FileStart{})
+	completed, _, err := a.executeSubtask(context.Background(), it, session.FileStart{})
 	if err != nil {
 		t.Fatalf("executeSubtask: %v", err)
+	}
+	if !completed {
+		t.Fatal("executeSubtask should complete after task_done")
 	}
 	if a.TotalTokensUsed() != 70 {
 		t.Errorf("TotalTokensUsed() = %d, want 70", a.TotalTokensUsed())
@@ -504,9 +511,12 @@ func TestExecuteSubtask_WithPlan(t *testing.T) {
 	a.currentDate = "2026-06-26 10:00"
 
 	it := model.ScanItem{Path: "handler.go", Content: "package h\nfunc Handle() error { return nil }\n", LineCount: 2}
-	err := a.executeSubtask(context.Background(), it, session.FileStart{})
+	completed, _, err := a.executeSubtask(context.Background(), it, session.FileStart{})
 	if err != nil {
 		t.Fatalf("executeSubtask: %v", err)
+	}
+	if !completed {
+		t.Fatal("executeSubtask should complete after task_done")
 	}
 }
 
@@ -517,7 +527,7 @@ func TestExecuteSubtask_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := a.executeSubtask(ctx, model.ScanItem{Path: "a.go", Content: "x", LineCount: 1}, session.FileStart{})
+	_, _, err := a.executeSubtask(ctx, model.ScanItem{Path: "a.go", Content: "x", LineCount: 1}, session.FileStart{})
 	if err == nil {
 		t.Fatal("expected error for cancelled context")
 	}
@@ -687,6 +697,13 @@ func TestDispatchSubtasks_WithoutTaskDoneIsAllFailed(t *testing.T) {
 		!strings.Contains(warnings[0].Message, "main_task did not complete") {
 		t.Fatalf("warnings = %+v, want one incomplete scan subtask error", warnings)
 	}
+	// Scan opts out of the run manifest and --format json discards the progress
+	// lines, so this warning is the whole diagnostic: it must name the trigger
+	// (here the exhausted MaxToolRequestTimes budget), not just report that the
+	// task did not finish.
+	if want := llmloop.StopMaxRounds.Reason(); !strings.Contains(warnings[0].Message, want) {
+		t.Errorf("warning %q does not name the stop trigger %q", warnings[0].Message, want)
+	}
 }
 
 func TestPhaseEnabled(t *testing.T) {
@@ -750,5 +767,428 @@ func TestPhaseEnabled(t *testing.T) {
 	}
 	if a3.summaryEnabled() {
 		t.Error("summaryEnabled should be false with SkipSummary")
+	}
+}
+
+func scanTaskDoneResponse() *llm.ChatResponse {
+	doneContent := ""
+	return &llm.ChatResponse{
+		Choices: []llm.Choice{{
+			Message: llm.ResponseMessage{
+				Content: &doneContent,
+				ToolCalls: []llm.ToolCall{{
+					ID: "done", Type: "function",
+					Function: llm.FunctionCall{Name: "task_done", Arguments: "{}"},
+				}},
+			},
+		}},
+		Usage: &llm.UsageInfo{PromptTokens: 10, CompletionTokens: 5},
+	}
+}
+
+func scanCodeCommentResponse(contents ...string) *llm.ChatResponse {
+	comments := make([]string, 0, len(contents))
+	for _, content := range contents {
+		comments = append(comments, fmt.Sprintf(`{"content":%q}`, content))
+	}
+	arguments := `{"comments":[` + strings.Join(comments, ",") + `]}`
+	return &llm.ChatResponse{
+		Choices: []llm.Choice{{
+			Message: llm.ResponseMessage{
+				ToolCalls: []llm.ToolCall{{
+					ID:   "comment",
+					Type: "function",
+					Function: llm.FunctionCall{
+						Name:      "code_comment",
+						Arguments: arguments,
+					},
+				}},
+			},
+		}},
+		Usage: &llm.UsageInfo{PromptTokens: 10, CompletionTokens: 5},
+	}
+}
+
+func TestDispatchSubtasks_PersistsDedupedCommentsForResume(t *testing.T) {
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+	t.Setenv("USERPROFILE", testHome)
+	repoDir := t.TempDir()
+	items := []model.ScanItem{{Path: "a.go", Content: "package a\nfunc f() {}\n", LineCount: 2}}
+
+	tpl := makeTemplateWithFullScan()
+	tpl.DedupTask = &template.LlmConversation{
+		Messages: []template.ChatMessage{{Role: "user", Content: "dedup {{batch_comments}}"}},
+	}
+	tpl.BatchStrategy = string(BatchByLanguage)
+	tpl.BatchSize = 1
+	tpl.DedupMinComments = 2
+
+	collector := tool.NewCommentCollector()
+	registry := tool.NewRegistry()
+	registry.Register(&tool.CodeCommentProvider{Collector: collector})
+	registry.Freeze()
+	dedupContent := `{"groups":[{"members":["c-0","c-1"],"merged_content":"combined finding"}]}`
+	client := &fakeScanClient{responses: []*llm.ChatResponse{
+		scanCodeCommentResponse("duplicate finding 1", "duplicate finding 2"),
+		scanTaskDoneResponse(),
+		{
+			Choices: []llm.Choice{{Message: llm.ResponseMessage{Content: &dedupContent}}},
+			Usage:   &llm.UsageInfo{PromptTokens: 10, CompletionTokens: 5},
+		},
+	}}
+	first := NewAgent(Args{
+		Template:         tpl,
+		LLMClient:        client,
+		Model:            "test-model",
+		Tools:            registry,
+		MainToolDefs:     []llm.ToolDef{{Type: "function", Function: llm.FunctionDef{Name: "code_comment"}}},
+		CommentCollector: collector,
+		MaxConcurrency:   1,
+		SkipPlan:         true,
+		SkipSummary:      true,
+		RepoDir:          repoDir,
+		Session: session.New(repoDir, "main", "test-model", session.SessionOptions{
+			ReviewMode: session.ReviewModeFullScan,
+		}),
+	})
+	first.items = items
+	first.currentDate = "2026-08-21"
+
+	comments, err := first.dispatchSubtasks(context.Background())
+	if err != nil {
+		t.Fatalf("first dispatchSubtasks: %v", err)
+	}
+	if len(comments) != 1 || comments[0].Content != "combined finding" {
+		t.Fatalf("first comments = %+v, want one deduped comment", comments)
+	}
+	if err := first.Session().Finalize(); err != nil {
+		t.Fatalf("finalize first session: %v", err)
+	}
+
+	state, err := session.LoadResumeState(repoDir, first.SessionID())
+	if err != nil {
+		t.Fatalf("LoadResumeState: %v", err)
+	}
+	firstItem, ok := state.Item(scanItemFingerprint(items[0]))
+	if !ok || len(firstItem.Comments) != 1 || firstItem.Comments[0].Content != "combined finding" {
+		t.Fatalf("checkpoint for a.go = %+v, want deduped comment", firstItem)
+	}
+	resumedCollector := tool.NewCommentCollector()
+	resumedRegistry := tool.NewRegistry()
+	resumedRegistry.Register(&tool.CodeCommentProvider{Collector: resumedCollector})
+	resumedRegistry.Freeze()
+	resumedClient := &fakeScanClient{}
+	resumed := NewAgent(Args{
+		Template:         tpl,
+		LLMClient:        resumedClient,
+		Model:            "test-model",
+		Tools:            resumedRegistry,
+		MainToolDefs:     []llm.ToolDef{{Type: "function", Function: llm.FunctionDef{Name: "code_comment"}}},
+		CommentCollector: resumedCollector,
+		MaxConcurrency:   1,
+		SkipPlan:         true,
+		SkipSummary:      true,
+		RepoDir:          repoDir,
+		Resume:           state,
+		Session: session.New(repoDir, "main", "test-model", session.SessionOptions{
+			ReviewMode:  session.ReviewModeFullScan,
+			ResumedFrom: first.SessionID(),
+		}),
+	})
+	resumed.items = items
+	resumed.currentDate = "2026-08-21"
+
+	comments, err = resumed.dispatchSubtasks(context.Background())
+	if err != nil {
+		t.Fatalf("resumed dispatchSubtasks: %v", err)
+	}
+	if len(comments) != 1 || comments[0].Content != "combined finding" {
+		t.Fatalf("resumed comments = %+v, want one deduped comment", comments)
+	}
+	if resumedClient.calls != 0 {
+		t.Fatalf("resumed LLM calls = %d, want 0 after canonical checkpoint", resumedClient.calls)
+	}
+	if err := resumed.Session().Finalize(); err != nil {
+		t.Fatalf("finalize resumed session: %v", err)
+	}
+
+	chainedState, err := session.LoadResumeState(repoDir, resumed.SessionID())
+	if err != nil {
+		t.Fatalf("LoadResumeState chained: %v", err)
+	}
+	chainedItem, ok := chainedState.Item(scanItemFingerprint(items[0]))
+	if !ok || len(chainedItem.Comments) != 1 || chainedItem.Comments[0].Content != "combined finding" {
+		t.Fatalf("chained checkpoint for a.go = %+v, want deduped comment", chainedItem)
+	}
+}
+
+func TestDispatchSubtasks_PreservesReusedCheckpointAfterDedup(t *testing.T) {
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+	t.Setenv("USERPROFILE", testHome)
+	repoDir := t.TempDir()
+	item := model.ScanItem{Path: "a.go", Content: "package a\n", LineCount: 1}
+	originalComments := []model.LlmComment{
+		{Path: item.Path, Content: "original finding 1"},
+		{Path: item.Path, Content: "original finding 2"},
+	}
+	resume := &session.ResumeState{
+		SessionID:  "previous-session",
+		Model:      "test-model",
+		ReviewMode: session.ReviewModeFullScan,
+		Items: map[string]session.ResumeItem{
+			scanItemFingerprint(item): {
+				FilePath:    item.Path,
+				OldPath:     item.Path,
+				NewPath:     item.Path,
+				Fingerprint: scanItemFingerprint(item),
+				Comments:    originalComments,
+			},
+		},
+	}
+
+	tpl := makeTemplateWithFullScan()
+	tpl.DedupTask = &template.LlmConversation{
+		Messages: []template.ChatMessage{{Role: "user", Content: "dedup {{batch_comments}}"}},
+	}
+	tpl.DedupMinComments = 2
+	dedupContent := `{"groups":[{"members":["c-0","c-1"],"merged_content":"changed by repeated dedup"}]}`
+	client := &fakeScanClient{responses: []*llm.ChatResponse{{
+		Choices: []llm.Choice{{Message: llm.ResponseMessage{Content: &dedupContent}}},
+		Usage:   &llm.UsageInfo{PromptTokens: 10, CompletionTokens: 5},
+	}}}
+	collector := tool.NewCommentCollector()
+	a := NewAgent(Args{
+		Template:         tpl,
+		LLMClient:        client,
+		Model:            "test-model",
+		CommentCollector: collector,
+		Tools:            tool.NewRegistry(),
+		MaxConcurrency:   1,
+		SkipPlan:         true,
+		SkipSummary:      true,
+		RepoDir:          repoDir,
+		Resume:           resume,
+		Session: session.New(repoDir, "main", "test-model", session.SessionOptions{
+			ReviewMode:  session.ReviewModeFullScan,
+			ResumedFrom: resume.SessionID,
+		}),
+	})
+	a.items = []model.ScanItem{item}
+	a.currentDate = "2026-08-21"
+
+	comments, err := a.dispatchSubtasks(context.Background())
+	if err != nil {
+		t.Fatalf("dispatchSubtasks: %v", err)
+	}
+	if len(comments) != 1 || comments[0].Content != "changed by repeated dedup" {
+		t.Fatalf("comments = %+v, want current run's deduped result", comments)
+	}
+	if err := a.Session().Finalize(); err != nil {
+		t.Fatalf("finalize session: %v", err)
+	}
+
+	state, err := session.LoadResumeState(repoDir, a.SessionID())
+	if err != nil {
+		t.Fatalf("LoadResumeState: %v", err)
+	}
+	checkpoint, ok := state.Item(scanItemFingerprint(item))
+	if !ok || len(checkpoint.Comments) != 2 ||
+		checkpoint.Comments[0].Content != originalComments[0].Content ||
+		checkpoint.Comments[1].Content != originalComments[1].Content {
+		t.Fatalf("reused checkpoint = %+v, want original comments", checkpoint)
+	}
+}
+
+func TestDispatchSubtasks_PreservesMixedDedupCheckpointProvenance(t *testing.T) {
+	testHome := t.TempDir()
+	t.Setenv("HOME", testHome)
+	t.Setenv("USERPROFILE", testHome)
+	repoDir := t.TempDir()
+	items := []model.ScanItem{
+		{Path: "a.go", Content: "package a\n", LineCount: 1},
+		{Path: "b.go", Content: "package b\n", LineCount: 1},
+	}
+
+	tpl := makeTemplateWithFullScan()
+	tpl.DedupTask = &template.LlmConversation{
+		Messages: []template.ChatMessage{{Role: "user", Content: "dedup {{batch_comments}}"}},
+	}
+	tpl.BatchStrategy = string(BatchByLanguage)
+	tpl.BatchSize = 2
+	tpl.DedupMinComments = 2
+	dedupContent := `{"groups":[{"members":["c-0","c-1"],"merged_content":"same-file finding"},{"members":["c-2","c-3"],"merged_content":"cross-file finding"}]}`
+	client := &fakeScanClient{responses: []*llm.ChatResponse{
+		scanCodeCommentResponse("same-file duplicate 1", "same-file duplicate 2", "cross-file finding from a.go"),
+		scanTaskDoneResponse(),
+		scanCodeCommentResponse("cross-file finding from b.go"),
+		scanTaskDoneResponse(),
+		{
+			Choices: []llm.Choice{{Message: llm.ResponseMessage{Content: &dedupContent}}},
+			Usage:   &llm.UsageInfo{PromptTokens: 10, CompletionTokens: 5},
+		},
+	}}
+	collector := tool.NewCommentCollector()
+	registry := tool.NewRegistry()
+	registry.Register(&tool.CodeCommentProvider{Collector: collector})
+	registry.Freeze()
+	a := NewAgent(Args{
+		Template:         tpl,
+		LLMClient:        client,
+		Model:            "test-model",
+		Tools:            registry,
+		MainToolDefs:     []llm.ToolDef{{Type: "function", Function: llm.FunctionDef{Name: "code_comment"}}},
+		CommentCollector: collector,
+		MaxConcurrency:   1,
+		SkipPlan:         true,
+		SkipSummary:      true,
+		RepoDir:          repoDir,
+		Session: session.New(repoDir, "main", "test-model", session.SessionOptions{
+			ReviewMode: session.ReviewModeFullScan,
+		}),
+	})
+	a.items = items
+	a.currentDate = "2026-08-21"
+
+	comments, err := a.dispatchSubtasks(context.Background())
+	if err != nil {
+		t.Fatalf("dispatchSubtasks: %v", err)
+	}
+	if len(comments) != 2 || comments[0].Content != "same-file finding" || comments[1].Content != "cross-file finding" {
+		t.Fatalf("comments = %+v, want same-file and cross-file canonical results", comments)
+	}
+	if err := a.Session().Finalize(); err != nil {
+		t.Fatalf("finalize session: %v", err)
+	}
+
+	state, err := session.LoadResumeState(repoDir, a.SessionID())
+	if err != nil {
+		t.Fatalf("LoadResumeState: %v", err)
+	}
+	aCheckpoint, ok := state.Item(scanItemFingerprint(items[0]))
+	if !ok || len(aCheckpoint.Comments) != 2 ||
+		aCheckpoint.Comments[0].Content != "same-file finding" ||
+		aCheckpoint.Comments[1].Content != "cross-file finding from a.go" {
+		t.Fatalf("checkpoint for a.go = %+v, want canonical same-file and raw cross-file comments", aCheckpoint)
+	}
+	bCheckpoint, ok := state.Item(scanItemFingerprint(items[1]))
+	if !ok || len(bCheckpoint.Comments) != 1 || bCheckpoint.Comments[0].Content != "cross-file finding from b.go" {
+		t.Fatalf("checkpoint for b.go = %+v, want raw cross-file comment", bCheckpoint)
+	}
+}
+
+func TestDispatchSubtasks_ResumeRerunsChangedContent(t *testing.T) {
+	oldItem := model.ScanItem{Path: "changed.go", Content: "package changed\nconst v = 1\n", LineCount: 2}
+	newItem := model.ScanItem{Path: "changed.go", Content: "package changed\nconst v = 2\n", LineCount: 2}
+	resume := &session.ResumeState{
+		SessionID:  "prior-session",
+		Model:      "old-model",
+		ReviewMode: session.ReviewModeFullScan,
+		Items: map[string]session.ResumeItem{
+			scanItemFingerprint(oldItem): {
+				FilePath:    oldItem.Path,
+				OldPath:     oldItem.Path,
+				NewPath:     oldItem.Path,
+				Fingerprint: scanItemFingerprint(oldItem),
+				Comments:    []model.LlmComment{{Path: oldItem.Path, Content: "old finding"}},
+			},
+		},
+	}
+	client := &fakeScanClient{responses: []*llm.ChatResponse{scanTaskDoneResponse()}}
+	a := NewAgent(Args{
+		Template:         makeTemplateWithFullScan(),
+		LLMClient:        client,
+		Model:            "new-model",
+		CommentCollector: tool.NewCommentCollector(),
+		Tools:            tool.NewRegistry(),
+		MaxConcurrency:   1,
+		SkipPlan:         true,
+		SkipDedup:        true,
+		SkipSummary:      true,
+		Resume:           resume,
+		Session: session.New(t.TempDir(), "main", "new-model", session.SessionOptions{
+			ReviewMode:  session.ReviewModeFullScan,
+			ResumedFrom: resume.SessionID,
+		}),
+	})
+	a.items = []model.ScanItem{newItem}
+	a.currentDate = "2026-06-26"
+
+	_, err := a.dispatchSubtasks(context.Background())
+	if err != nil {
+		t.Fatalf("dispatchSubtasks: %v", err)
+	}
+	if client.idx != 1 {
+		t.Fatalf("LLM calls = %d, want 1 because content changed", client.idx)
+	}
+	info := a.ResumeInfo()
+	if info == nil || info.ReusedFiles != 0 || info.RerunFiles != 1 {
+		t.Fatalf("ResumeInfo = %+v, want 0 reused / 1 rerun", info)
+	}
+}
+
+func TestDispatchSubtasks_ResumeMultiBatchAndChained(t *testing.T) {
+	items := []model.ScanItem{
+		{Path: "a.go", Content: "package p\nconst A = 1\n", LineCount: 2},
+		{Path: "b.go", Content: "package p\nconst B = 1\n", LineCount: 2},
+		{Path: "c.go", Content: "package p\nconst C = 1\n", LineCount: 2},
+		{Path: "d.go", Content: "package p\nconst D = 1\n", LineCount: 2},
+		{Path: "e.go", Content: "package p\nconst E = 1\n", LineCount: 2},
+	}
+	resumeItems := make(map[string]session.ResumeItem)
+	for _, idx := range []int{0, 1, 3} {
+		it := items[idx]
+		fingerprint := scanItemFingerprint(it)
+		resumeItems[fingerprint] = session.ResumeItem{
+			FilePath:    it.Path,
+			OldPath:     it.Path,
+			NewPath:     it.Path,
+			Fingerprint: fingerprint,
+			Comments:    []model.LlmComment{{Path: it.Path, Content: "cached " + it.Path}},
+		}
+	}
+	resume := &session.ResumeState{
+		SessionID:  "resume-of-resume",
+		Model:      "old-model",
+		ReviewMode: session.ReviewModeFullScan,
+		Items:      resumeItems,
+	}
+	tpl := makeTemplateWithFullScan()
+	tpl.BatchStrategy = string(BatchByLanguage)
+	tpl.BatchSize = 2
+	client := &fakeScanClient{responses: []*llm.ChatResponse{scanTaskDoneResponse(), scanTaskDoneResponse()}}
+	a := NewAgent(Args{
+		Template:         tpl,
+		LLMClient:        client,
+		Model:            "new-model",
+		CommentCollector: tool.NewCommentCollector(),
+		Tools:            tool.NewRegistry(),
+		MaxConcurrency:   1,
+		SkipPlan:         true,
+		SkipDedup:        true,
+		SkipSummary:      true,
+		Resume:           resume,
+		Session: session.New(t.TempDir(), "main", "new-model", session.SessionOptions{
+			ReviewMode:  session.ReviewModeFullScan,
+			ResumedFrom: resume.SessionID,
+		}),
+	})
+	a.items = items
+	a.currentDate = "2026-06-26"
+
+	comments, err := a.dispatchSubtasks(context.Background())
+	if err != nil {
+		t.Fatalf("dispatchSubtasks: %v", err)
+	}
+	if client.idx != 2 {
+		t.Fatalf("LLM calls = %d, want 2 fresh files across multiple batches", client.idx)
+	}
+	if len(comments) != 3 {
+		t.Fatalf("comments = %+v, want 3 cached comments", comments)
+	}
+	info := a.ResumeInfo()
+	if info == nil || info.ReusedFiles != 3 || info.RerunFiles != 2 {
+		t.Fatalf("ResumeInfo = %+v, want 3 reused / 2 rerun", info)
 	}
 }

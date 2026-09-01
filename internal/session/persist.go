@@ -260,9 +260,9 @@ func (jw *jsonlWriter) WriteLLMRequest(filePath string, taskType TaskType, reque
 	return uuid
 }
 
-// WriteLLMResponse writes a response entry with model, content, tool calls, usage.
+// WriteLLMResponse writes a response entry with model, content, reasoning, tool calls, and usage.
 // Flushed immediately for crash durability.
-func (jw *jsonlWriter) WriteLLMResponse(filePath string, taskType TaskType, content string, toolCalls []map[string]any, model string, usage TokenUsage, duration time.Duration) string {
+func (jw *jsonlWriter) WriteLLMResponse(filePath string, taskType TaskType, content, reasoningContent string, toolCalls []map[string]any, model string, usage TokenUsage, duration time.Duration, nativePayload any) string {
 	uuid := generateUUID()
 
 	jw.mu.Lock()
@@ -285,6 +285,12 @@ func (jw *jsonlWriter) WriteLLMResponse(filePath string, taskType TaskType, cont
 			"cache_read_tokens":  usage.CacheReadTokens,
 			"cache_write_tokens": usage.CacheWriteTokens,
 		},
+	}
+	if reasoningContent != "" {
+		rec["reasoning_content"] = reasoningContent
+	}
+	if nativePayload != nil {
+		rec["native_payload"] = nativePayload
 	}
 	jw.writeRecordLocked(rec)
 	jw.flushLocked()
@@ -426,6 +432,38 @@ func (jw *jsonlWriter) WriteReviewItemPartial(filePath, fingerprint, phase, plan
 		rec["comments"] = comments
 	}
 	jw.writeRecordLocked(rec)
+	jw.flushLocked()
+	jw.lastUUID = uuid
+	return uuid
+}
+
+// WriteResumeLineage writes the one resume_lineage record of a resumed run.
+// Readers that do not know this event type ignore it, so it costs older tooling
+// nothing.
+func (jw *jsonlWriter) WriteResumeLineage(l *ResumeLineage) string {
+	uuid := generateUUID()
+
+	jw.mu.Lock()
+	defer jw.mu.Unlock()
+	rec := map[string]any{
+		"uuid":            uuid,
+		"parentUuid":      jw.lastUUID,
+		"type":            l.Type,
+		"sessionId":       jw.sessionID,
+		"timestamp":       time.Now().UTC().Format(time.RFC3339),
+		"schema_version":  l.SchemaVersion,
+		"run_id":          l.RunID,
+		"parent_run_id":   l.ParentRunID,
+		"source_provider": l.SourceProvider,
+		"source_model":    l.SourceModel,
+		"target_provider": l.TargetProvider,
+		"target_model":    l.TargetModel,
+	}
+	jw.writeRecordLocked(rec)
+	// Flushed like the checkpoint records are, and for the same reason: the point
+	// of lineage is to survive a run that dies. Left buffered it would only reach
+	// disk when the first item completes, which is exactly the window where a run
+	// is most likely to die instead.
 	jw.flushLocked()
 	jw.lastUUID = uuid
 	return uuid

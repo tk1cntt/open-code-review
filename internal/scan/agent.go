@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 alibaba/open-code-review Contributors
+
 package scan
 
 import (
@@ -54,7 +57,18 @@ type Args struct {
 	Background            string
 	GitRunner             *gitcmd.Runner
 	Session               *session.SessionHistory
-	MaxFileSizeBytes      int64
+	// Resume is an optional read-only checkpoint index from a previous scan
+	// session.
+	Resume *session.ResumeState
+	// ResumeMode is session.ResumeModeContinue (default) or ResumeModeRestartFailed.
+	ResumeMode string
+	// OnFileDone is called when each file completes (success or failure).
+	// filePath is the repo-relative source path; comments are the collected
+	// review findings (may be nil/empty). The callback is invoked from the
+	// per-file dispatch goroutine and should be safe for concurrent use.
+	OnFileDone func(filePath string, comments []model.LlmComment)
+
+	MaxFileSizeBytes int64
 	// SkipPlan disables the PLAN_TASK pre-pass even when the template
 	// defines one. Set via the --no-plan CLI flag.
 	SkipPlan bool
@@ -69,15 +83,6 @@ type Args struct {
 	// batches are dispatched. 0 = unlimited. Set via --max-tokens-budget
 	// or ScanTemplate.MaxTokensBudget.
 	MaxTokensBudget int64
-	// Resume is an optional read-only checkpoint index from a previous scan session.
-	Resume *session.ResumeState
-	// ResumeMode is session.ResumeModeContinue (default) or ResumeModeRestartFailed.
-	ResumeMode string
-	// OnFileDone is called when each file completes (success or failure).
-	// filePath is the repo-relative source path; comments are the collected
-	// review findings (may be nil/empty). The callback is invoked from the
-	// per-file dispatch goroutine and should be safe for concurrent use.
-	OnFileDone func(filePath string, comments []model.LlmComment)
 }
 
 // planEnabled / dedupEnabled / summaryEnabled report whether each optional
@@ -99,39 +104,26 @@ func (a *Agent) summaryEnabled() bool {
 // tool-use loop to llmloop.Runner and owns only scan-specific concerns
 // (file enumeration, FULL_SCAN_TASK rendering, per-file filtering).
 type Agent struct {
-	args           Args
-	items          []model.ScanItem
-	currentDate    string
-	session        *session.SessionHistory
-	subtaskFailed  int64 // atomic
-	runner         *llmloop.Runner
-	projectSummary string // populated post-run by maybeRunProjectSummary
-	resumeInfo     *ResumeInfo
-	reusedCount    int64 // number of files reused from previous session (resume only)
+	args             Args
+	items            []model.ScanItem
+	currentDate      string
+	session          *session.SessionHistory
+	subtaskFailed    int64 // atomic
+	runner           *llmloop.Runner
+	resumeInfo       *ResumeInfo
+	scanFingerprints map[string]string
+	projectSummary   string // populated post-run by maybeRunProjectSummary
+	budgetExceeded   bool   // set when the token budget gate stopped dispatch; written only by dispatchBatch's loop
+	reusedCount      int64  // number of files reused from previous session (resume only)
 }
 
 // ResumeInfo summarizes file-level reuse for a resumed scan.
-type ResumeInfo struct {
-	ResumedFrom   string `json:"resumed_from"`
-	ReusedFiles   int64  `json:"reused_files"`
-	RerunFiles    int64  `json:"rerun_files"`
-	PreviousModel string `json:"previous_model,omitempty"`
-	CurrentModel  string `json:"current_model,omitempty"`
-}
+type ResumeInfo = session.ResumeInfo
 
 // ProjectSummary returns the markdown project-level summary produced after
 // all batches finish. Empty when SkipSummary is set, PROJECT_SUMMARY_TASK
 // is absent, no comments were collected, or the summary LLM call failed.
 func (a *Agent) ProjectSummary() string { return a.projectSummary }
-
-// ResumeInfo returns resume metadata for output. Nil means this was not a resume run.
-func (a *Agent) ResumeInfo() *ResumeInfo {
-	if a.resumeInfo == nil {
-		return nil
-	}
-	info := *a.resumeInfo
-	return &info
-}
 
 // NewAgent creates a scan Agent from the given args. The Session is
 // auto-created (review_mode = full_scan) when not supplied.
@@ -143,13 +135,11 @@ func NewAgent(args Args) *Agent {
 		args.CommentCollector = tool.NewCommentCollector()
 	}
 	if args.Session == nil {
-		opts := session.SessionOptions{
-			ReviewMode: session.ReviewModeFullScan,
-		}
-		if args.Resume != nil {
-			opts.ResumedFrom = args.Resume.SessionID
-		}
-		args.Session = session.New(args.RepoDir, "", args.Model, opts)
+		args.Session = session.New(args.RepoDir, "", args.Model, session.SessionOptions{
+			ReviewMode:  session.ReviewModeFullScan,
+			ScanPaths:   args.Paths,
+			ResumedFrom: resumedFromSession(args.Resume),
+		})
 	}
 	a := &Agent{
 		args:    args,
@@ -168,6 +158,9 @@ func NewAgent(args Args) *Agent {
 		// line-number resolver (resolveFromFileContent) can match against
 		// the full file content of the scanned file.
 		DiffLookup: a.lookupDiff,
+		// NewRequestMeta is deliberately left nil. The retry report describes
+		// ocr review; scan shares this Runner, and a nil factory is what keeps
+		// scan's requests out of the report. See llmloop.Deps.NewRequestMeta.
 	})
 	return a
 }
@@ -181,6 +174,7 @@ func toLoopTemplate(s template.ScanTemplate) template.Template {
 	return template.Template{
 		MemoryCompressionTask: s.MemoryCompressionTask,
 		MaxTokens:             s.MaxTokens,
+		MaxCompletionTokens:   s.CompletionTokenLimit(),
 		MaxToolRequestTimes:   s.MaxToolRequestTimes,
 		ReLocationTask:        s.ReLocationTask,
 	}
@@ -203,6 +197,15 @@ func (a *Agent) SessionID() string {
 // without synthesizing a manifest for scan.
 func (a *Agent) RunManifest() *session.RunManifest { return nil }
 
+// ResumeInfo returns resume metadata for output. Nil means this was not a resume run.
+func (a *Agent) ResumeInfo() *ResumeInfo {
+	if a.resumeInfo == nil {
+		return nil
+	}
+	info := *a.resumeInfo
+	return &info
+}
+
 // FilesReviewed returns the number of newly-reviewed (non-reused) items dispatched
 // in this scan run. On resume, this excludes reused results from the previous
 // session; use TotalFilesReviewed for the combined count.
@@ -224,6 +227,13 @@ func (a *Agent) TotalFilesReviewed() int64 { return int64(len(a.items)) }
 // SubtaskFailed returns the number of files whose review subtask failed.
 func (a *Agent) SubtaskFailed() int64 { return atomic.LoadInt64(&a.subtaskFailed) }
 
+// ScanItemFingerprint produces a deterministic hash from a file path for
+// resume checkpoints that do not incorporate file content.
+func ScanItemFingerprint(path string) string {
+	sum := sha256.Sum256([]byte(path))
+	return fmt.Sprintf("%x", sum)
+}
+
 // Diffs returns the scanned items adapted to model.Diff form so callers
 // (e.g. cmd/opencodereview's outputJSON / ResolveLineNumbers) can treat
 // both review and scan results uniformly.
@@ -233,15 +243,6 @@ func (a *Agent) Diffs() []model.Diff {
 		out[i] = *a.items[i].AsDiff()
 	}
 	return out
-}
-
-// ScanItemFingerprint produces a deterministic hash from a file path for
-// resume checkpoints. Unlike review mode where fingerprints incorporate diff
-// content, scan mode uses path alone since scan reviews whole files from the
-// working tree.
-func ScanItemFingerprint(path string) string {
-	sum := sha256.Sum256([]byte(path))
-	return fmt.Sprintf("%x", sum)
 }
 
 // TotalTokensUsed / TotalInputTokens / ... delegate to the underlying runner.
@@ -259,16 +260,83 @@ func (a *Agent) Warnings() []llmloop.AgentWarning { return a.runner.Warnings() }
 // ToolCalls returns per-tool call counts accumulated during scan.
 func (a *Agent) ToolCalls() map[string]int64 { return a.runner.ToolCalls() }
 
-// BudgetExceeded always returns false for scan. Scan self-limits via its own
-// token budget gate and MaxToolRequestTimes; the typed budget_exceeded status
-// and tool-call-budget plumbing are diff-review-path features (see
-// internal/agent). This method exists only so *scan.Agent satisfies the
-// cmd/opencodereview.ResultProvider interface, keeping scan's JSON output
-// unchanged (status stays success / completed_with_*).
-func (a *Agent) BudgetExceeded() bool { return false }
+// BudgetExceeded reports whether the aggregate token budget gate stopped
+// dispatch before every file was reviewed. Diagnostic only: scan still returns
+// its partial comments and a nil error, and the value reaches output solely as
+// summary.budget_exceeded. Per-file MaxToolRequestTimes exhaustion does NOT set
+// it — that is an item-level outcome, not a run-level budget stop.
+func (a *Agent) BudgetExceeded() bool { return a.budgetExceeded }
 
 func (a *Agent) recordWarning(warningType, file, message string) {
 	a.runner.RecordWarning(warningType, file, message)
+}
+
+func (a *Agent) initScanFingerprints(items []model.ScanItem) {
+	if len(items) == 0 {
+		return
+	}
+	a.scanFingerprints = make(map[string]string, len(items))
+	for _, it := range items {
+		a.scanFingerprints[it.Path] = scanItemFingerprint(it)
+	}
+}
+
+func (a *Agent) scanItemFingerprint(it model.ScanItem) string {
+	if a != nil && a.scanFingerprints != nil {
+		if fingerprint := a.scanFingerprints[it.Path]; fingerprint != "" {
+			return fingerprint
+		}
+	}
+	return scanItemFingerprint(it)
+}
+
+func (a *Agent) initResumeInfo(items []model.ScanItem) {
+	resume := a.args.Resume
+	if resume == nil {
+		return
+	}
+	var reused int64
+	var rerun int64
+	for _, it := range items {
+		start := session.PrepareFileStart(resume, a.scanItemFingerprint(it), it.Path, session.PrepareOpts{
+			ResumeMode:   session.NormalizeResumeMode(a.args.ResumeMode),
+			CurrentModel: a.args.Model,
+			TemplateHash: a.templateHash(),
+		})
+		if start.Mode == session.ModeReuse {
+			reused++
+		} else {
+			rerun++
+		}
+	}
+	a.reusedCount = reused
+	a.resumeInfo = &ResumeInfo{
+		ResumedFrom:   resume.SessionID,
+		ReusedFiles:   reused,
+		RerunFiles:    rerun,
+		PreviousModel: resume.Model,
+		CurrentModel:  a.args.Model,
+	}
+	fmt.Fprintf(stdout.Writer(), "[ocr] Resume %s: reusing %d file(s), reviewing %d file(s)\n", resume.SessionID, reused, rerun)
+}
+
+func (a *Agent) resumeItem(fingerprint string) (session.ResumeItem, bool) {
+	if a.args.Resume == nil {
+		return session.ResumeItem{}, false
+	}
+	return a.args.Resume.Item(fingerprint)
+}
+
+func scanItemFingerprint(it model.ScanItem) string {
+	sum := sha256.Sum256([]byte(session.ReviewModeFullScan + "\x00" + it.Path + "\x00" + it.Content))
+	return fmt.Sprintf("%x", sum)
+}
+
+func resumedFromSession(resume *session.ResumeState) string {
+	if resume == nil {
+		return ""
+	}
+	return resume.SessionID
 }
 
 // Run executes the full-scan pipeline: enumerate → filter → token-filter →
@@ -277,6 +345,13 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 	if len(a.args.Template.MainTask.Messages) == 0 {
 		return nil, fmt.Errorf("scan template MAIN_TASK is missing or empty")
 	}
+
+	// Base prompt-cache affinity key for any LLM request in this run that a
+	// task doesn't re-scope. Each task conversation (plan, per-file main
+	// loop, dedup, summary) refines it with llm.SessionTaskKey where it
+	// starts, so affinity keys stay per-conversation — the granularity
+	// provider prompt caches actually reuse prefixes at.
+	ctx = llm.ContextWithSessionKey(ctx, a.SessionID())
 
 	ctx, scanSpan := telemetry.StartSpan(ctx, "scan.enumerate")
 	provider := NewProvider(a.args.RepoDir, a.args.Paths, a.args.GitRunner, a.args.MaxFileSizeBytes)
@@ -295,7 +370,6 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 	totalDiscovered := len(a.items)
 	a.items = a.filterScanItems(a.items)
 	a.items = a.filterLargeScans(a.items)
-	a.items = a.applyResume(a.items)
 
 	if a.args.OnFileDone != nil && a.args.Resume != nil {
 		for _, item := range a.args.Resume.Items {
@@ -310,8 +384,6 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 	if reviewable == 0 {
 		fmt.Fprintln(stdout.Writer(), "[ocr] No reviewable files. Skipping scan.")
 		telemetry.Event(ctx, "scan.no.files")
-		comments := a.args.CommentCollector.Comments()
-		a.maybeRunProjectSummary(ctx, comments)
 		// A clean skip still has to reach disk: if session_end never persisted,
 		// the skip cannot be claimed. Scan has no manifest builder, but the
 		// session_end delivery contract still applies.
@@ -347,6 +419,12 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 
 	// Project-level summary runs after all batches; never blocks return.
 	a.maybeRunProjectSummary(ctx, comments)
+
+	// Join background memory compression before anything finalizes the session.
+	// Those jobs are cancelled rather than awaited when a conversation ends, so
+	// their LLM request can still be in flight here; joining them ensures no
+	// background goroutine is left leaking or writing to a finalized session.
+	a.runner.WaitBackground()
 
 	// A persistence failure is a delivery error in its own right: when the scan
 	// also failed, both facts are reported (errors.Join) rather than letting the
@@ -396,25 +474,21 @@ func (a *Agent) injectScanContentMap() {
 // reviewability rules (binary, extension allowlist, user include/exclude,
 // default excluded paths).
 func (a *Agent) filterScanItems(items []model.ScanItem) []model.ScanItem {
-	// On resume, suppress per-file Skipping noise from whole-repo enumerate.
-	quiet := a.args.Resume != nil
 	var kept []model.ScanItem
 	skipped := 0
 	for _, it := range items {
 		if reason := a.whyExcluded(it); reason != model.ExcludeNone {
-			if !quiet {
-				if it.IsBinary {
-					fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s — binary file\n", it.Path)
-				} else {
-					fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s — filtered by path/extension rules\n", it.Path)
-				}
+			if it.IsBinary {
+				fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s — binary file\n", it.Path)
+			} else {
+				fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s — filtered by path/extension rules\n", it.Path)
 			}
 			skipped++
 			continue
 		}
 		kept = append(kept, it)
 	}
-	if skipped > 0 && !quiet {
+	if skipped > 0 {
 		fmt.Fprintf(stdout.Writer(), "[ocr] Filtered %d file(s) by include/exclude rules\n", skipped)
 	}
 	return kept
@@ -426,115 +500,22 @@ func (a *Agent) filterLargeScans(items []model.ScanItem) []model.ScanItem {
 	if limit <= 0 {
 		return items
 	}
-	quiet := a.args.Resume != nil
 	var kept []model.ScanItem
 	skipped := 0
 	for _, it := range items {
 		tokens := llm.CountTokens(it.Content)
 		if tokens > limit {
-			if !quiet {
-				fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s (~%d tokens exceeds 80%% of max_tokens(%d))\n",
-					it.Path, tokens, a.args.Template.MaxTokens)
-			}
+			fmt.Fprintf(stdout.Writer(), "[ocr] Skipping %s (~%d tokens exceeds 80%% of max_tokens(%d))\n",
+				it.Path, tokens, a.args.Template.MaxTokens)
 			skipped++
 			continue
 		}
 		kept = append(kept, it)
 	}
-	if skipped > 0 && !quiet {
+	if skipped > 0 {
 		fmt.Fprintf(stdout.Writer(), "[ocr] Pre-filtered %d file(s) exceeding 80%% of max_tokens\n", skipped)
 	}
 	return kept
-}
-
-// applyResume separates already-completed items from the dispatch list using
-// the resume checkpoint index. Completed comments are added to the collector
-// and recorded as reused. The returned slice contains only files that need
-// work from the prior session (failed / mid-file continue) — not the rest of
-// the repository.
-func (a *Agent) applyResume(items []model.ScanItem) []model.ScanItem {
-	resume := a.args.Resume
-	if resume == nil {
-		return items
-	}
-
-	// Full-scan resume must not treat every unscoped repo file as "new work".
-	scoped := resume.HasSessionScope()
-
-	toDispatch := make([]model.ScanItem, 0, len(items))
-	var reused, continuing, coldRetry, newFiles int64
-	opts := session.PrepareOpts{
-		ResumeMode:   session.NormalizeResumeMode(a.args.ResumeMode),
-		CurrentModel: a.args.Model,
-		TemplateHash: a.templateHash(),
-	}
-	for _, it := range items {
-		fingerprint := ScanItemFingerprint(it.Path)
-		if scoped && !resume.InSession(fingerprint) {
-			continue
-		}
-		start := session.PrepareFileStart(resume, fingerprint, it.Path, opts)
-		if start.Mode == session.ModeReuse {
-			for _, cm := range start.SeedComments {
-				a.args.CommentCollector.Add(cm)
-			}
-			a.session.RecordReviewItemReused(it.Path, it.Path, it.Path, fingerprint, resume.SessionID, start.SeedComments)
-			reused++
-			continue
-		}
-		if start.Mode == session.ModeContinue {
-			fmt.Fprintf(stdout.Writer(), "[ocr] Resume continuing mid-file: %s (round %d)\n", it.Path, start.Round)
-			continuing++
-		} else if _, wasFailed := resume.FailedFiles[fingerprint]; wasFailed {
-			fmt.Fprintf(stdout.Writer(), "[ocr] Resume retrying previously failed file (cold): %s\n", it.Path)
-			coldRetry++
-		} else {
-			newFiles++
-		}
-		toDispatch = append(toDispatch, it)
-	}
-
-	rerun := int64(len(toDispatch))
-	a.reusedCount = reused
-	a.resumeInfo = &ResumeInfo{
-		ResumedFrom:   resume.SessionID,
-		ReusedFiles:   reused,
-		RerunFiles:    rerun,
-		PreviousModel: resume.Model,
-		CurrentModel:  a.args.Model,
-	}
-	if resume.Model != "" && resume.Model != a.args.Model {
-		fmt.Fprintf(stdout.Writer(), "[ocr] Warning: resume session %q used model %q, current model is %q\n",
-			resume.SessionID, resume.Model, a.args.Model)
-	}
-	fmt.Fprintln(stdout.Writer(), session.FormatResumeSummary(resume.SessionID, reused, continuing, coldRetry, newFiles))
-	return toDispatch
-}
-
-func (a *Agent) templateHash() string {
-	return session.ComputeTemplateHashFrom(&a.args.Template)
-}
-
-func (a *Agent) prepareFileStart(it model.ScanItem) session.FileStart {
-	fingerprint := ScanItemFingerprint(it.Path)
-	if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok && len(cp.Messages) > 0 {
-		return session.FileStart{
-			Mode:         session.ModeContinue,
-			Messages:     cp.Messages,
-			PlanGuidance: cp.PlanGuidance,
-			SeedComments: cp.Comments,
-			Round:        cp.Round,
-			Checkpoint:   cp,
-		}
-	}
-	if a.args.Resume == nil {
-		return session.FileStart{Mode: session.ModeCold}
-	}
-	return session.PrepareFileStart(a.args.Resume, fingerprint, it.Path, session.PrepareOpts{
-		ResumeMode:   session.NormalizeResumeMode(a.args.ResumeMode),
-		CurrentModel: a.args.Model,
-		TemplateHash: a.templateHash(),
-	})
 }
 
 // whyExcluded mirrors agent.whyExcluded but for ScanItem inputs.
@@ -564,7 +545,7 @@ func (a *Agent) whyExcluded(it model.ScanItem) model.ExcludeReason {
 
 func ExtFromPath(path string) string {
 	basename := path
-	if idx := strings.LastIndex(path, "/"); idx >= 0 {
+	if idx := strings.LastIndexAny(path, `/\`); idx >= 0 {
 		basename = path[idx+1:]
 	}
 	dot := strings.LastIndex(basename, ".")
@@ -590,6 +571,8 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 	}
 
 	atomic.StoreInt64(&a.subtaskFailed, 0)
+	a.initScanFingerprints(a.items)
+	a.initResumeInfo(a.items)
 
 	strategy := a.resolveBatchStrategy()
 	batches := GroupBatches(a.items, strategy, a.args.Template.BatchSize)
@@ -604,22 +587,27 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 		// batch and feed them into the per-batch dedup hook.
 		batchStart := a.args.CommentCollector.Snapshot()
 
-		n, budgetHit, err := a.dispatchBatch(ctx, bi, batch)
+		n, budgetHit, checkpoints, err := a.dispatchBatch(ctx, bi, batch)
 		dispatched += n
 		if err != nil {
 			// ctx cancelled mid-batch: stop scheduling further batches but
 			// still return whatever we've collected so far.
+			// Persist completed items so the next resume does not scan them again.
+			a.recordBatchCheckpoints(checkpoints, batchStart, nil)
 			return a.args.CommentCollector.Comments(), err
 		}
 
 		// Drain async comment workers BEFORE dedup so all of this batch's
-		// comments are visible. CommentWorkerPool.Await is cumulative
-		// across batches — that's fine since batches are sequential here.
+		// comments are visible. recordBatchCheckpoints has its own Await for
+		// checkpoint correctness; this one keeps the dedup input complete.
+		// CommentWorkerPool.Await is cumulative across batches - that is fine
+		// since batches are sequential here.
 		if a.args.CommentWorkerPool != nil {
 			a.args.CommentWorkerPool.Await()
 		}
 
-		a.maybeRunDedup(ctx, bi, batchStart)
+		dedupCheckpoints := a.maybeRunDedup(ctx, bi, batchStart)
+		a.recordBatchCheckpoints(checkpoints, batchStart, dedupCheckpoints)
 
 		// The per-file budget gate inside dispatchBatch tripped — stop
 		// scheduling any remaining batches.
@@ -628,14 +616,61 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 		}
 	}
 
-	comments := a.args.CommentCollector.Comments()
 	failed := atomic.LoadInt64(&a.subtaskFailed)
 	if failed > 0 && failed == dispatched {
-		// Still return any partial findings collected before timeout/failure so
-		// the CLI can persist and display them.
-		return comments, fmt.Errorf("all %d file scan(s) failed — check your LLM configuration and API key", dispatched)
+		return nil, fmt.Errorf("all %d file scan(s) failed — check your LLM configuration and API key", dispatched)
 	}
-	return comments, nil
+	return a.args.CommentCollector.Comments(), nil
+}
+
+type batchCheckpoint struct {
+	item             model.ScanItem
+	reused           bool
+	originalComments []model.LlmComment
+}
+
+// recordBatchCheckpoints persists safe per-file comments after batch dedup.
+// New same-file groups use the canonical result. Reused items keep their source
+// checkpoint, and cross-file groups keep raw per-file comments so invalidating
+// one file cannot erase another file's finding on resume.
+func (a *Agent) recordBatchCheckpoints(
+	checkpoints []batchCheckpoint,
+	batchStart int,
+	dedupCheckpoints map[string][]model.LlmComment,
+) {
+	if len(checkpoints) == 0 {
+		return
+	}
+	if a.args.CommentWorkerPool != nil {
+		a.args.CommentWorkerPool.Await()
+	}
+	finalCommentsByPath := groupCommentsByPath(a.args.CommentCollector.Since(batchStart))
+	for _, checkpoint := range checkpoints {
+		fingerprint := a.scanItemFingerprint(checkpoint.item)
+		comments := finalCommentsByPath[checkpoint.item.Path]
+		if checkpoint.reused {
+			comments = checkpoint.originalComments
+			sourceSessionID := ""
+			if a.args.Resume != nil {
+				sourceSessionID = a.args.Resume.SessionID
+			}
+			a.session.RecordReviewItemReused(checkpoint.item.Path, checkpoint.item.Path, checkpoint.item.Path,
+				fingerprint, sourceSessionID, comments)
+			continue
+		}
+		if dedupCheckpoints != nil {
+			comments = dedupCheckpoints[checkpoint.item.Path]
+		}
+		a.session.RecordReviewItemDone(checkpoint.item.Path, checkpoint.item.Path, checkpoint.item.Path, fingerprint, comments)
+	}
+}
+
+func groupCommentsByPath(comments []model.LlmComment) map[string][]model.LlmComment {
+	byPath := make(map[string][]model.LlmComment)
+	for _, comment := range comments {
+		byPath[comment.Path] = append(byPath[comment.Path], comment)
+	}
+	return byPath
 }
 
 // resolveBatchStrategy reads the strategy from the scan template, defaulting
@@ -646,8 +681,9 @@ func (a *Agent) resolveBatchStrategy() BatchStrategy {
 
 // dispatchBatch fans out the files of a single batch concurrently and
 // blocks until they all finish (or ctx is cancelled). Returns the number
-// of files dispatched, whether the token budget was hit mid-batch, and
-// ctx.Err() if cancelled.
+// of files dispatched, whether the token budget was hit mid-batch, the
+// completed/reused files whose checkpoints need recording, and ctx.Err()
+// if cancelled.
 //
 // The budget gate is checked per file, right after acquiring the
 // concurrency slot and before launching the subtask: if the tokens already
@@ -655,7 +691,7 @@ func (a *Agent) resolveBatchStrategy() BatchStrategy {
 // budget, the file (and all remaining files in the batch) are skipped.
 // This keeps overrun bounded by roughly one in-flight file per worker,
 // instead of a whole batch as the coarse batch-level gate did.
-func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.ScanItem) (int64, bool, error) {
+func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.ScanItem) (int64, bool, []batchCheckpoint, error) {
 	concurrency := a.args.MaxConcurrency
 	if concurrency <= 0 {
 		concurrency = 8
@@ -664,23 +700,45 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 	timeout := time.Duration(a.args.ConcurrentTaskTimeout) * time.Minute
 
 	var (
-		wg         sync.WaitGroup
-		dispatched int64
-		budgetHit  bool
+		wg            sync.WaitGroup
+		dispatched    int64
+		budgetHit     bool
+		checkpointsMu sync.Mutex
+		checkpoints   []batchCheckpoint
 	)
 
 	for i := range batch {
+		it := batch[i]
+		fingerprint := a.scanItemFingerprint(it)
+		start := a.prepareFileStart(it)
+		if start.Mode == session.ModeReuse {
+			for _, cm := range start.SeedComments {
+				a.args.CommentCollector.Add(cm)
+			}
+			checkpointsMu.Lock()
+			checkpoints = append(checkpoints, batchCheckpoint{
+				item:             it,
+				reused:           true,
+				originalComments: start.SeedComments,
+			})
+			checkpointsMu.Unlock()
+			continue
+		}
+
 		// Per-file budget look-ahead. Stop before acquiring a slot so we
 		// don't even queue work that would blow the budget.
 		if a.args.MaxTokensBudget > 0 {
 			used := a.runner.TotalTokensUsed()
-			projected := used + EstimateFileTokens(batch[i], a.planEnabled())
+			projected := used + EstimateFileTokens(it, a.planEnabled())
 			if projected > a.args.MaxTokensBudget {
 				fmt.Fprintf(stdout.Writer(), "[ocr] token budget reached (used %s + next-file est ≈ %s > budget %s) — skipping %s and remaining files\n",
-					HumanTokens(used), HumanTokens(projected), HumanTokens(a.args.MaxTokensBudget), batch[i].Path)
-				a.recordWarning("token_budget_reached", batch[i].Path,
+					HumanTokens(used), HumanTokens(projected), HumanTokens(a.args.MaxTokensBudget), it.Path)
+				a.recordWarning("token_budget_reached", it.Path,
 					fmt.Sprintf("stopped in batch #%d: used %d tokens + next-file estimate exceeds budget %d", batchIdx, used, a.args.MaxTokensBudget))
 				budgetHit = true
+				// budgetHit is per-batch and dies with this call; the field is
+				// the run-level signal emitRunResult reads after Run returns.
+				a.budgetExceeded = true
 				break
 			}
 		}
@@ -689,20 +747,30 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 		case sem <- struct{}{}:
 		case <-ctx.Done():
 			wg.Wait()
-			return dispatched, budgetHit, ctx.Err()
+			return dispatched, budgetHit, checkpoints, ctx.Err()
 		}
 
 		dispatched++
 		wg.Add(1)
-		go func(it model.ScanItem) {
+		go func(it model.ScanItem, fingerprint string, start session.FileStart) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			fingerprint := ScanItemFingerprint(it.Path)
-			start := a.prepareFileStart(it)
+			var fileCtx context.Context
+			var cancel context.CancelFunc
+			if timeout > 0 {
+				fileCtx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			} else {
+				fileCtx = ctx
+			}
 
 			const maxRetries = 3
-			var lastErr error
+			var (
+				completedOK bool
+				skipReason  string
+				lastErr     error
+			)
 			for attempt := 0; attempt < maxRetries; attempt++ {
 				if attempt > 0 {
 					if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok && len(cp.Messages) > 0 {
@@ -714,10 +782,10 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 							Round:        cp.Round,
 							Checkpoint:   cp,
 						}
-						if reason := llm.RetryReason(lastErr); reason == llm.RetryReasonRateLimit {
+						if llm.RetryReason(lastErr) == llm.RetryReasonRateLimit {
 							select {
 							case <-time.After(2 * time.Second):
-							case <-ctx.Done():
+							case <-fileCtx.Done():
 							}
 						}
 						fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask continuing from checkpoint for %s (batch #%d, attempt %d/%d, round %d)\n",
@@ -725,57 +793,30 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 					} else {
 						a.args.CommentCollector.RemoveByPath(it.Path)
 						start = session.FileStart{Mode: session.ModeCold}
+						backoff := time.Duration(1<<(attempt-1)) * time.Second
+						fmt.Fprintf(stdout.Writer(), "[ocr] Scan retry %d/%d for %s after %v\n", attempt, maxRetries-1, it.Path, backoff)
+						select {
+						case <-time.After(backoff):
+						case <-fileCtx.Done():
+						}
+						if fileCtx.Err() != nil {
+							lastErr = fileCtx.Err()
+							break
+						}
 					}
 				}
-
-				var fileCtx context.Context
-				var cancel context.CancelFunc
-				if timeout > 0 {
-					retryTimeout := timeout * time.Duration(attempt+1)
-					fileCtx, cancel = context.WithTimeout(ctx, retryTimeout)
-				} else {
-					fileCtx = ctx
-				}
-
-				lastErr = a.executeSubtask(fileCtx, it, start)
-				if cancel != nil {
-					cancel()
-				}
-
+				completedOK, skipReason, lastErr = a.executeSubtask(fileCtx, it, start)
 				if lastErr == nil {
 					break
 				}
-
-				reason := llm.RetryReason(lastErr)
-				shouldRetry := llm.IsRetryableLLMError(lastErr)
-				if !shouldRetry || attempt == maxRetries-1 {
-					if shouldRetry {
-						fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask exhausted retries for %s (batch #%d, %d attempt(s), reason=%s): %v\n",
-							it.Path, batchIdx, maxRetries, reason, lastErr)
-					}
-					// Permanent errors fall through to the failure path below (single log).
-					break
-				}
-
-				switch reason {
-				case llm.RetryReasonTimeout:
-					fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask timeout for %s (batch #%d, attempt %d/%d), retrying with extended timeout...\n",
-						it.Path, batchIdx, attempt+1, maxRetries)
-				case llm.RetryReasonRateLimit:
-					fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask rate-limited (429/502/503) for %s (batch #%d, attempt %d/%d), retrying...\n",
-						it.Path, batchIdx, attempt+1, maxRetries)
-				default:
-					fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask retryable error for %s (batch #%d, attempt %d/%d, reason=%s): %v\n",
-						it.Path, batchIdx, attempt+1, maxRetries, reason, lastErr)
-				}
+				fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask error for %s (batch #%d, attempt %d/%d): %v\n",
+					it.Path, batchIdx, attempt+1, maxRetries, lastErr)
 			}
-
 			if lastErr != nil {
 				atomic.AddInt64(&a.subtaskFailed, 1)
 				comments := a.args.CommentCollector.CommentsForPath(it.Path)
-				reason := llm.RetryReason(lastErr)
 				status := session.CheckpointFailed
-				if reason == llm.RetryReasonTimeout {
+				if llm.RetryReason(lastErr) == llm.RetryReasonTimeout {
 					status = session.CheckpointTimedOut
 				}
 				planGuidance := ""
@@ -790,25 +831,37 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 				if a.args.OnFileDone != nil {
 					a.args.OnFileDone(it.Path, comments)
 				}
-				fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask error for %s (batch #%d, reason=%s): %v\n",
-					it.Path, batchIdx, reason, lastErr)
-				telemetry.ErrorEvent(context.WithoutCancel(ctx), "scan.subtask.error", lastErr,
+				fmt.Fprintf(stdout.Writer(), "[ocr] Scan subtask error for %s (batch #%d): %v\n", it.Path, batchIdx, lastErr)
+				telemetry.ErrorEvent(fileCtx, "scan.subtask.error", lastErr,
 					telemetry.AnyToAttr("file.path", it.Path),
-					telemetry.AnyToAttr("batch.index", batchIdx),
-					telemetry.AnyToAttr("error.reason", reason))
+					telemetry.AnyToAttr("batch.index", batchIdx))
 				a.recordWarning("scan_subtask_error", it.Path, lastErr.Error())
 				return
 			}
+			if !completedOK {
+				comments := a.args.CommentCollector.CommentsForPath(it.Path)
+				if skipReason != "" {
+					atomic.AddInt64(&a.subtaskFailed, 1)
+					a.session.RecordReviewItemFailed(it.Path, it.Path, it.Path, fingerprint, skipReason, comments)
+					a.recordWarning("scan_subtask_error", it.Path, skipReason)
+				}
+				if a.args.OnFileDone != nil {
+					a.args.OnFileDone(it.Path, comments)
+				}
+				return
+			}
 			comments := a.args.CommentCollector.CommentsForPath(it.Path)
-			a.session.RecordReviewItemDone(it.Path, it.Path, it.Path, fingerprint, comments)
 			if a.args.OnFileDone != nil {
 				a.args.OnFileDone(it.Path, comments)
 			}
-		}(batch[i])
+			checkpointsMu.Lock()
+			checkpoints = append(checkpoints, batchCheckpoint{item: it})
+			checkpointsMu.Unlock()
+		}(it, fingerprint, start)
 	}
 
 	wg.Wait()
-	return dispatched, budgetHit, nil
+	return dispatched, budgetHit, checkpoints, nil
 }
 
 // executeSubtask runs the scan pipeline for one file:
@@ -821,16 +874,16 @@ func (a *Agent) dispatchBatch(ctx context.Context, batchIdx int, batch []model.S
 // is small enough that planning overhead outweighs gain, or the plan call
 // itself fails. Plan failure never blocks the main review — it falls back
 // to v1 (plan-less) behavior.
-func (a *Agent) executeSubtask(ctx context.Context, it model.ScanItem, start session.FileStart) error {
+func (a *Agent) executeSubtask(ctx context.Context, it model.ScanItem, start session.FileStart) (bool, string, error) {
 	ctx, span := telemetry.StartSpan(ctx, "scan.subtask."+it.Path)
 	defer span.End()
 	telemetry.SetAttr(span, "file.path", it.Path)
 
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return false, "", ctx.Err()
 	}
 
-	fingerprint := ScanItemFingerprint(it.Path)
+	fingerprint := a.scanItemFingerprint(it)
 	a.session.RecordFileStarted(it.Path, fingerprint, session.PhaseMain)
 	defer llmloop.ClearCheckpointHook(a.runner)
 
@@ -840,7 +893,7 @@ func (a *Agent) executeSubtask(ctx context.Context, it model.ScanItem, start ses
 
 	rule := ""
 	if a.args.SystemRule != nil {
-		rule = a.args.SystemRule.Resolve(strings.ToLower(it.Path))
+		rule = a.args.SystemRule.Resolve(it.Path)
 	}
 
 	var (
@@ -874,19 +927,52 @@ func (a *Agent) executeSubtask(ctx context.Context, it model.ScanItem, start ses
 			telemetry.AnyToAttr("file.path", it.Path),
 			telemetry.AnyToAttr("tokens", tokenCount),
 			telemetry.AnyToAttr("max_tokens", maxAllowed))
-		return nil
+		return false, "", nil
 	}
 
 	llmloop.BindSessionCheckpoint(a.runner, a.session, fingerprint, planGuidance, a.args.Model, a.templateHash())
 	a.runner.SetCompletedRounds(completedRounds)
-	completed, _, err := a.runner.RunPerFile(ctx, messages, it.Path)
+	completed, stop, err := a.runner.RunPerFile(ctx, messages, it.Path)
 	if err != nil {
-		return err
+		return false, "", err
 	}
 	if !completed {
-		return fmt.Errorf("main_task did not complete before stopping")
+		// Scan sessions opt out of the run manifest, so this one string is the
+		// whole diagnostic: it feeds both RecordReviewItemFailed and the
+		// scan_subtask_error warning, and under --format json the [ocr] progress
+		// lines that would say which exit fired are discarded. Name the trigger
+		// via the shared Reason() instead of a second hardcoded sentence, so
+		// scan and review never describe the same stop differently. The prefix
+		// stays for the resume records and warnings that already match on it.
+		return false, "main_task did not complete before stopping: " + stop.Reason(), nil
 	}
-	return nil
+	return true, "", nil
+}
+
+func (a *Agent) templateHash() string {
+	return session.ComputeTemplateHashFrom(&a.args.Template)
+}
+
+func (a *Agent) prepareFileStart(it model.ScanItem) session.FileStart {
+	fingerprint := a.scanItemFingerprint(it)
+	if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok && len(cp.Messages) > 0 {
+		return session.FileStart{
+			Mode:         session.ModeContinue,
+			Messages:     cp.Messages,
+			PlanGuidance: cp.PlanGuidance,
+			SeedComments: cp.Comments,
+			Round:        cp.Round,
+			Checkpoint:   cp,
+		}
+	}
+	if a.args.Resume == nil {
+		return session.FileStart{Mode: session.ModeCold}
+	}
+	return session.PrepareFileStart(a.args.Resume, fingerprint, it.Path, session.PrepareOpts{
+		ResumeMode:   session.NormalizeResumeMode(a.args.ResumeMode),
+		CurrentModel: a.args.Model,
+		TemplateHash: a.templateHash(),
+	})
 }
 
 // maybeRunPlan invokes PLAN_TASK on the file and returns a human-readable
@@ -914,23 +1000,16 @@ func (a *Agent) maybeRunPlan(ctx context.Context, it model.ScanItem, rule string
 		messages = append(messages, llm.NewTextMessage(m.Role, content))
 	}
 
-	// Nested timeout on the parent ctx: plan deadline only cancels planCtx,
-	// leaving remaining fileCtx budget for main review. Parent cancel still
-	// propagates — do not use WithoutCancel here.
-	if ctx.Err() != nil {
-		return noPlan
-	}
-	planCtx, planCancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer planCancel()
-
 	fs := a.session.GetOrCreateFileSession(it.Path)
 	rec := fs.AppendTaskRecord(session.PlanTask, messages)
+	ctx = llm.ContextWithSessionKey(ctx,
+		llm.SessionTaskKey(a.session.SessionID, string(session.PlanTask), it.Path))
 	startTime := time.Now()
 
-	resp, err := a.args.LLMClient.CompletionsWithCtx(planCtx, llm.ChatRequest{
+	resp, err := a.args.LLMClient.CompletionsWithCtx(ctx, llm.ChatRequest{
 		Model:     a.args.Model,
 		Messages:  messages,
-		MaxTokens: a.args.Template.MaxTokens,
+		MaxTokens: a.args.Template.CompletionTokenLimit(),
 	})
 	if err != nil {
 		rec.SetError(err, time.Since(startTime))
@@ -978,12 +1057,14 @@ func (a *Agent) maybeRunProjectSummary(ctx context.Context, comments []model.Llm
 	const pathKey = "__scan_project_summary__"
 	fs := a.session.GetOrCreateFileSession(pathKey)
 	rec := fs.AppendTaskRecord(session.MemoryCompressionTask, messages) // reuse existing task type
+	ctx = llm.ContextWithSessionKey(ctx,
+		llm.SessionTaskKey(a.session.SessionID, string(session.MemoryCompressionTask), pathKey))
 	startTime := time.Now()
 
 	resp, err := a.args.LLMClient.CompletionsWithCtx(ctx, llm.ChatRequest{
 		Model:     a.args.Model,
 		Messages:  messages,
-		MaxTokens: a.args.Template.MaxTokens,
+		MaxTokens: a.args.Template.CompletionTokenLimit(),
 	})
 	if err != nil {
 		rec.SetError(err, time.Since(startTime))
@@ -1025,10 +1106,12 @@ func buildSummaryCommentsList(comments []model.LlmComment) string {
 // at least DedupMinComments comments, invokes the DEDUP_TASK LLM to merge
 // near-duplicate findings. On any failure (LLM error / malformed JSON /
 // invalid grouping) the original batch comments are kept unchanged — dedup
-// is a best-effort optimization, never a correctness gate.
-func (a *Agent) maybeRunDedup(ctx context.Context, batchIdx, batchStart int) {
+// is a best-effort optimization, never a correctness gate. The returned map
+// contains safe per-file checkpoints: canonical comments for same-file groups
+// and original comments for cross-file groups.
+func (a *Agent) maybeRunDedup(ctx context.Context, batchIdx, batchStart int) map[string][]model.LlmComment {
 	if !a.dedupEnabled() {
-		return
+		return nil
 	}
 	dt := a.args.Template.DedupTask
 	minN := a.args.Template.DedupMinComments
@@ -1038,7 +1121,7 @@ func (a *Agent) maybeRunDedup(ctx context.Context, batchIdx, batchStart int) {
 
 	batchComments := a.args.CommentCollector.Since(batchStart)
 	if len(batchComments) < minN {
-		return
+		return nil
 	}
 
 	payload := buildDedupCommentsJSON(batchComments)
@@ -1053,32 +1136,35 @@ func (a *Agent) maybeRunDedup(ctx context.Context, batchIdx, batchStart int) {
 	pathKey := fmt.Sprintf("__scan_dedup_batch_%d__", batchIdx)
 	fs := a.session.GetOrCreateFileSession(pathKey)
 	rec := fs.AppendTaskRecord(session.MemoryCompressionTask, messages) // reuse existing task type; no scan-specific type to invent
+	ctx = llm.ContextWithSessionKey(ctx,
+		llm.SessionTaskKey(a.session.SessionID, string(session.MemoryCompressionTask), pathKey))
 	startTime := time.Now()
 
 	resp, err := a.args.LLMClient.CompletionsWithCtx(ctx, llm.ChatRequest{
 		Model:     a.args.Model,
 		Messages:  messages,
-		MaxTokens: a.args.Template.MaxTokens,
+		MaxTokens: a.args.Template.CompletionTokenLimit(),
 	})
 	if err != nil {
 		rec.SetError(err, time.Since(startTime))
 		fmt.Fprintf(stdout.Writer(), "[ocr] scan dedup failed for batch #%d: %v (keeping originals)\n", batchIdx, err)
-		return
+		return nil
 	}
 	rec.SetResponse(resp, time.Since(startTime))
 	a.runner.RecordUsage(resp.Usage)
 
-	deduped, ok := applyDedupGroups(resp.Content(), batchComments)
+	deduped, dedupCheckpoints, ok := applyDedupGroupsWithCheckpoints(resp.Content(), batchComments)
 	if !ok {
 		fmt.Fprintf(stdout.Writer(), "[ocr] scan dedup batch #%d: malformed groups, keeping originals\n", batchIdx)
-		return
+		return nil
 	}
 	if len(deduped) == len(batchComments) {
 		// No-op result — don't bother rewriting the collector.
-		return
+		return nil
 	}
 	a.args.CommentCollector.ReplaceSince(batchStart, deduped)
 	fmt.Fprintf(stdout.Writer(), "[ocr] scan dedup batch #%d: %d → %d comments\n", batchIdx, len(batchComments), len(deduped))
+	return dedupCheckpoints
 }
 
 // buildDedupCommentsJSON renders the batch comments as a JSON list with
@@ -1110,10 +1196,18 @@ func buildDedupCommentsJSON(comments []model.LlmComment) string {
 // when the groups don't cover every input id exactly once (safety: we
 // refuse to silently drop comments we can't account for).
 func applyDedupGroups(rawJSON string, originals []model.LlmComment) ([]model.LlmComment, bool) {
+	comments, _, ok := applyDedupGroupsWithCheckpoints(rawJSON, originals)
+	return comments, ok
+}
+
+func applyDedupGroupsWithCheckpoints(
+	rawJSON string,
+	originals []model.LlmComment,
+) ([]model.LlmComment, map[string][]model.LlmComment, bool) {
 	stripped := llmloop.StripMarkdownFences(rawJSON)
 	stripped = strings.TrimSpace(stripped)
 	if stripped == "" {
-		return nil, false
+		return nil, nil, false
 	}
 	var parsed struct {
 		Groups []struct {
@@ -1122,7 +1216,7 @@ func applyDedupGroups(rawJSON string, originals []model.LlmComment) ([]model.Llm
 		} `json:"groups"`
 	}
 	if err := json.Unmarshal([]byte(stripped), &parsed); err != nil {
-		return nil, false
+		return nil, nil, false
 	}
 
 	idToIdx := make(map[string]int, len(originals))
@@ -1132,34 +1226,48 @@ func applyDedupGroups(rawJSON string, originals []model.LlmComment) ([]model.Llm
 
 	seen := make(map[string]bool, len(originals))
 	var out []model.LlmComment
+	checkpoints := make(map[string][]model.LlmComment)
 	for _, g := range parsed.Groups {
 		if len(g.Members) == 0 {
-			return nil, false
+			return nil, nil, false
 		}
 		canonicalIdx, ok := idToIdx[g.Members[0]]
 		if !ok {
-			return nil, false
+			return nil, nil, false
 		}
+		memberPaths := make(map[string]bool)
+		memberIndices := make([]int, 0, len(g.Members))
 		for _, id := range g.Members {
-			if _, exists := idToIdx[id]; !exists {
-				return nil, false // unknown id
+			idx, exists := idToIdx[id]
+			if !exists {
+				return nil, nil, false // unknown id
 			}
 			if seen[id] {
-				return nil, false // duplicate assignment
+				return nil, nil, false // duplicate assignment
 			}
 			seen[id] = true
+			memberPaths[originals[idx].Path] = true
+			memberIndices = append(memberIndices, idx)
 		}
 		canonical := originals[canonicalIdx]
 		if len(g.Members) > 1 && g.MergedContent != "" {
 			canonical.Content = g.MergedContent
 		}
 		out = append(out, canonical)
+		if len(memberPaths) == 1 {
+			checkpoints[canonical.Path] = append(checkpoints[canonical.Path], canonical)
+			continue
+		}
+		for _, idx := range memberIndices {
+			original := originals[idx]
+			checkpoints[original.Path] = append(checkpoints[original.Path], original)
+		}
 	}
 
 	if len(seen) != len(originals) {
-		return nil, false // some id missing
+		return nil, nil, false // some id missing
 	}
-	return out, true
+	return out, checkpoints, true
 }
 
 // formatPlanGuidance parses the PLAN_TASK JSON output into a markdown

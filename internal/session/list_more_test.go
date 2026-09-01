@@ -66,7 +66,7 @@ func TestRecordReviewItem_NilReceiver(t *testing.T) {
 	var sh *SessionHistory
 	sh.RecordReviewItemDone("a.go", "", "", "fp", nil)
 	sh.RecordReviewItemReused("a.go", "", "", "fp", "src", nil)
-	sh.RecordReviewItemFailed("a.go", "", "", "fp", "boom")
+	sh.RecordReviewItemFailed("a.go", "", "", "fp", "boom", nil)
 }
 
 // TestRecordReviewItem_EmptyFilePathUsesNewPath covers the filePath == "" →
@@ -85,7 +85,7 @@ func TestRecordReviewItem_EmptyFilePathUsesNewPath(t *testing.T) {
 		t.Error("RecordReviewItemReused with empty filePath should key FileSession by newPath")
 	}
 
-	sh.RecordReviewItemFailed("", "old.go", "failed.go", "fp3", "boom")
+	sh.RecordReviewItemFailed("", "old.go", "failed.go", "fp3", "boom", nil)
 	if _, ok := sh.FileSessions["failed.go"]; !ok {
 		t.Error("RecordReviewItemFailed with empty filePath should key FileSession by newPath")
 	}

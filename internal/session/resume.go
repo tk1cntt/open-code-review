@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 alibaba/open-code-review Contributors
+
 package session
 
 import (
@@ -7,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/alibaba/open-code-review/internal/llm"
@@ -16,15 +20,17 @@ import (
 
 // ResumeState is the replayed, read-only checkpoint index for one prior session.
 type ResumeState struct {
-	SessionID  string
-	RepoDir    string
-	GitBranch  string
-	Model      string
-	ReviewMode string
-	DiffFrom   string
-	DiffTo     string
-	DiffCommit string
-	Items      map[string]ResumeItem
+	SessionID        string
+	RepoDir          string
+	GitBranch        string
+	Model            string
+	ReviewMode       string
+	DiffFrom         string
+	DiffTo           string
+	DiffCommit       string
+	ScanPaths        []string
+	HasScanPathScope bool
+	Items            map[string]ResumeItem
 	// FailedFiles maps fingerprint → newPath for files that failed in the
 	// previous session, so callers can log which files are being retried.
 	FailedFiles map[string]string
@@ -32,8 +38,25 @@ type ResumeState struct {
 	Conversations map[string]ConversationCheckpoint
 	// Partials maps fingerprint → latest review_item_partial record.
 	Partials map[string]PartialItem
-	// CorruptLines is the number of JSONL lines skipped during load.
+	// CorruptLines is the number of JSONL lines skipped during a lenient load
+	// (LoadReviewResumeState). Strict LoadResumeState fails instead of skipping.
 	CorruptLines int
+
+	// Manifest is the parent run's coverage snapshot, carried only by the
+	// session_end record. A nil Manifest means the parent's input identity cannot
+	// be verified, not that the parent did no work.
+	Manifest *RunManifest
+
+	// Closed reports whether a session_end record was replayed. A session can
+	// close without a manifest — legacy sessions predate manifests, and a run that
+	// never froze one still writes session_end — so Closed is what tells an
+	// interrupted parent apart from one that closed with nothing to verify.
+	Closed bool
+
+	// reusable caches the parent manifest's completed and reused fingerprints,
+	// built on first use by ReusableItem. Reuse is decided on one goroutine
+	// before any dispatch begins, so this needs no lock.
+	reusable map[string]bool
 }
 
 // ResumeItem is a completed file-level checkpoint, keyed by diff fingerprint.
@@ -66,6 +89,7 @@ type resumeRecord struct {
 	DiffFrom            string             `json:"diffFrom"`
 	DiffTo              string             `json:"diffTo"`
 	DiffCommit          string             `json:"diffCommit"`
+	ScanPaths           *[]string          `json:"scanPaths"`
 	FilePath            string             `json:"filePath"`
 	OldPath             string             `json:"oldPath"`
 	NewPath             string             `json:"newPath"`
@@ -81,6 +105,7 @@ type resumeRecord struct {
 	CommentFingerprints []string           `json:"commentFingerprints"`
 	Status              string             `json:"status"`
 	StopReason          string             `json:"stopReason"`
+	RunManifest         *RunManifest       `json:"run_manifest"`
 }
 
 // SessionFilePath returns the JSONL path for a persisted session.
@@ -95,10 +120,26 @@ func SessionFilePath(repoDir, sessionID string) (string, error) {
 	return filepath.Join(home, ".opencodereview", sessionSubDir, encodeRepoPath(repoDir), sessionID+".jsonl"), nil
 }
 
-// LoadResumeState replays a previous session JSONL into a fingerprint index.
-// Corrupt / truncated JSONL lines are skipped with a warning so a hard crash
-// mid-write cannot block the entire resume.
+// LoadResumeState replays a previous session JSONL into a fingerprint index. A
+// record that cannot be parsed fails the load: with nothing to arbitrate coverage,
+// a dropped line is indistinguishable from a checkpoint that was never written,
+// and the pair it may have belonged to — a review_item_failed retracting an
+// earlier done record — cannot be reconstructed from the rest of the file.
 func LoadResumeState(repoDir, sessionID string) (*ResumeState, error) {
+	return loadResumeState(repoDir, sessionID, false)
+}
+
+// LoadReviewResumeState replays a review session, dropping records it cannot
+// parse. Review reuse is gated on the parent manifest rather than on these lines
+// (see ReusableItem), so an unreadable checkpoint just means its file is reviewed
+// again — which is what a corrupted checkpoint is supposed to do. Failing the
+// whole load instead would turn one bad line into the loss of every other file's
+// checkpoint.
+func LoadReviewResumeState(repoDir, sessionID string) (*ResumeState, error) {
+	return loadResumeState(repoDir, sessionID, true)
+}
+
+func loadResumeState(repoDir, sessionID string, skipUnparseable bool) (*ResumeState, error) {
 	path, err := SessionFilePath(repoDir, sessionID)
 	if err != nil {
 		return nil, err
@@ -128,7 +169,10 @@ func LoadResumeState(repoDir, sessionID string) (*ResumeState, error) {
 			if len(trimmed) == 0 {
 				// skip blank
 			} else if err := state.applyResumeLine(trimmed); err != nil {
-				// Skip corrupt lines rather than failing the whole resume (P0).
+				if !skipUnparseable {
+					return nil, err
+				}
+				// Skip corrupt lines rather than failing the whole review resume.
 				state.CorruptLines++
 				fmt.Fprintf(stdout.Writer(), "[ocr] Warning: skipping corrupt resume line %d in session %q: %v\n", lineNo, sessionID, err)
 			}
@@ -173,6 +217,8 @@ func (s *ResumeState) ensureMaps() {
 	}
 }
 
+// applyResumeLine folds one record into the index. It reports an unparseable
+// line to the caller, which decides whether that is fatal.
 func (s *ResumeState) applyResumeLine(line []byte) error {
 	var rec resumeRecord
 	if err := json.Unmarshal(line, &rec); err != nil {
@@ -263,6 +309,13 @@ func (s *ResumeState) applyResumeLine(line []byte) error {
 		}
 	case "file_started":
 		// Diagnostic only; no state mutation required for resume.
+	case "session_end":
+		s.Closed = true
+		// Last one wins: a session file holds at most one session_end, but
+		// replaying a truncated write should not clear an earlier good one.
+		if rec.RunManifest != nil {
+			s.Manifest = rec.RunManifest
+		}
 	}
 	return nil
 }
@@ -280,9 +333,15 @@ func (s *ResumeState) applySessionStart(rec resumeRecord) {
 	s.DiffFrom = rec.DiffFrom
 	s.DiffTo = rec.DiffTo
 	s.DiffCommit = rec.DiffCommit
+	if rec.ScanPaths != nil {
+		s.ScanPaths = normalizeScanPaths(*rec.ScanPaths)
+		s.HasScanPathScope = true
+	}
 }
 
-// CompletedCount returns the number of reusable file-level checkpoints.
+// CompletedCount returns the number of file-level checkpoints replay recovered.
+// Review reuse is narrower — see ReusableItem — while scan, having no manifest
+// to consult, reuses exactly these.
 func (s *ResumeState) CompletedCount() int {
 	if s == nil {
 		return 0
@@ -391,7 +450,59 @@ func (s *ResumeState) Partial(fingerprint string) (PartialItem, bool) {
 	return p, true
 }
 
-// ValidateOptions verifies that the requested review range matches the prior session.
+// ReusableItem returns the checkpoint for fingerprint only if the parent
+// manifest also recorded that fingerprint as completed or reused.
+//
+// The manifest is the single source of truth for coverage, so a checkpoint line
+// alone is not enough: the parent froze its verdict per item, and a replayed
+// record that the manifest does not vouch for is a record whose outcome the
+// parent did not stand behind. This is also what makes a dropped
+// review_item_failed line harmless here — the failure is recorded in the
+// manifest too, and coverage never lies about it.
+func (s *ResumeState) ReusableItem(fingerprint string) (ResumeItem, bool) {
+	if s == nil || s.Manifest == nil {
+		return ResumeItem{}, false
+	}
+	if s.reusable == nil {
+		s.reusable = manifestReusableFingerprints(s.Manifest)
+	}
+	if !s.reusable[fingerprint] {
+		return ResumeItem{}, false
+	}
+	if item, ok := s.Item(fingerprint); ok {
+		return item, true
+	}
+	// A completed/reused manifest item with zero comments is parked in
+	// FailedFiles by applyResumeLine so scan (no manifest) still retries
+	// empty "done" records. Trust the coverage snapshot: no-findings is a
+	// valid completed review.
+	if path, ok := s.FailedFiles[fingerprint]; ok {
+		return ResumeItem{FilePath: path, NewPath: path, Fingerprint: fingerprint}, true
+	}
+	return ResumeItem{}, false
+}
+
+// manifestReusableFingerprints collects the fingerprints the parent manifest
+// settled as completed or reused. Both count: a parent that itself resumed
+// carries forward results it did not compute, and those are no less final.
+func manifestReusableFingerprints(m *RunManifest) map[string]bool {
+	out := make(map[string]bool, len(m.Coverage.Completed)+len(m.Coverage.Reused))
+	for _, group := range [][]CoverageItem{m.Coverage.Completed, m.Coverage.Reused} {
+		for _, item := range group {
+			if item.Fingerprint != "" {
+				out[item.Fingerprint] = true
+			}
+		}
+	}
+	return out
+}
+
+// ValidateOptions verifies that this session can be resumed in the requested
+// review mode at all. It deliberately does not compare the ref text the user
+// typed: `abc1234` and `abc1234def` can name the same commit while a ref whose
+// name did not change can name a new one, so ref spellings are neither
+// sufficient nor necessary evidence about the input. ValidateResume compares the
+// resolved input identity instead.
 func (s *ResumeState) ValidateOptions(opts SessionOptions) error {
 	if s == nil {
 		return nil
@@ -412,22 +523,76 @@ func (s *ResumeState) ValidateOptions(opts SessionOptions) error {
 		return fmt.Errorf("resume session review mode %q does not match current mode %q", s.ReviewMode, opts.ReviewMode)
 	}
 	switch opts.ReviewMode {
-	case ReviewModeRange:
-		if s.DiffFrom != opts.DiffFrom || s.DiffTo != opts.DiffTo {
-			return fmt.Errorf("resume session range %q..%q does not match current range %q..%q", s.DiffFrom, s.DiffTo, opts.DiffFrom, opts.DiffTo)
-		}
-	case ReviewModeCommit:
-		if s.DiffCommit != opts.DiffCommit {
-			return fmt.Errorf("resume session commit %q does not match current commit %q", s.DiffCommit, opts.DiffCommit)
-		}
+	case ReviewModeRange, ReviewModeCommit:
+		// Ref text is not evidence about the input; ValidateResume compares identity.
 	case ReviewModeFullScan:
-		// Full-scan fingerprint is path-based; no diff validation needed.
+		// Full-scan fingerprint is path-based; path scope is ValidateScanOptions.
 	case ReviewModeWorkspace:
 		// Workspace mode fingerprints are path-based; no diff range to match.
 	default:
 		return fmt.Errorf("resume mode %q is not supported", opts.ReviewMode)
 	}
 	return nil
+}
+
+// ValidateScanOptions verifies that the previous session was a full-file scan.
+func (s *ResumeState) ValidateScanOptions(scanPaths []string) error {
+	if s == nil {
+		return nil
+	}
+	if s.ReviewMode == "" {
+		return fmt.Errorf("resume session %q is missing review mode metadata", s.SessionID)
+	}
+	if s.ReviewMode != ReviewModeFullScan {
+		return fmt.Errorf("resume session review mode %q does not match current mode %q", s.ReviewMode, ReviewModeFullScan)
+	}
+	current := normalizeScanPaths(scanPaths)
+	if s.HasScanPathScope && !equalStringSlices(s.ScanPaths, current) {
+		return fmt.Errorf("resume session scan path scope %q does not match current scope %q", formatScanScope(s.ScanPaths), formatScanScope(current))
+	}
+	return nil
+}
+
+func normalizeScanPaths(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		p = strings.TrimPrefix(p, "./")
+		p = strings.TrimSuffix(filepath.ToSlash(p), "/")
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func formatScanScope(paths []string) string {
+	if len(paths) == 0 {
+		return "<whole repo>"
+	}
+	return strings.Join(paths, ",")
 }
 
 func copyLlmComments(in []model.LlmComment) []model.LlmComment {

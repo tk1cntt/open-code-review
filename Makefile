@@ -2,7 +2,7 @@
 	build-all dist sha256sum version-info \
 	build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64 \
 	build-windows-amd64 build-windows-arm64 \
-	license-check license-add
+	license-check license-add english-check
 
 BINARY_NAME := opencodereview
 GO          := go
@@ -32,6 +32,12 @@ endef
 build:
 	$(GO) build -ldflags "$(LD_FLAGS)" -o $(DIST_DIR)/$(BINARY_NAME) ./cmd/opencodereview
 
+# No node_modules filter is needed for the docs site: pages/go.mod puts it in a
+# module of its own, so `go list ./...` skips that subtree entirely -- see that
+# file for why a module boundary is used instead of a per-command grep. Deleting
+# it brings pages/node_modules/flatted/golang back into this list.
+# The /extensions/ filter still earns its keep: extensions/vscode has no Go code
+# of ours, but its eslint dependency installs another copy of flatted's.
 PACKAGES := $(shell $(GO) list ./... | grep -v /extensions/)
 
 test:
@@ -64,7 +70,7 @@ fmt:
 vet:
 	LC_ALL=C $(GO) vet $(PACKAGES)
 
-check: license-check
+check: license-check english-check
 	$(GO) mod tidy
 	gofmt -s -w .
 	LC_ALL=C $(GO) vet $(PACKAGES)
@@ -72,6 +78,9 @@ check: license-check
 
 license-check:
 	@bash scripts/verify-license.sh
+
+english-check:
+	@$(GO) run scripts/verify-english-only.go
 
 license-add:
 	@bash scripts/add-license.sh

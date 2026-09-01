@@ -11,7 +11,7 @@ import (
 
 func TestLoadComments_ReturnsCommentsInOrder(t *testing.T) {
 	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
+	setTestHome(t, tmpHome)
 	repoDir := t.TempDir()
 
 	sh := New(repoDir, "main", "test-model", SessionOptions{
@@ -25,7 +25,7 @@ func TestLoadComments_ReturnsCommentsInOrder(t *testing.T) {
 	sh.RecordReviewItemReused("b.go", "b.go", "b.go", "fp-b", "prior-session", []model.LlmComment{
 		{Path: "b.go", Content: "cached", Severity: "medium"},
 	})
-	sh.RecordReviewItemFailed("c.go", "c.go", "c.go", "fp-c", "boom")
+	sh.RecordReviewItemFailed("c.go", "c.go", "c.go", "fp-c", "boom", nil)
 	sh.Finalize()
 
 	got, err := LoadComments(repoDir, sh.SessionID)
@@ -45,7 +45,7 @@ func TestLoadComments_ReturnsCommentsInOrder(t *testing.T) {
 
 func TestLoadComments_LaterCheckpointSupersedes(t *testing.T) {
 	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
+	setTestHome(t, tmpHome)
 	repoDir := t.TempDir()
 
 	sh := New(repoDir, "main", "test-model", SessionOptions{
@@ -61,7 +61,7 @@ func TestLoadComments_LaterCheckpointSupersedes(t *testing.T) {
 	sh.RecordReviewItemDone("b.go", "b.go", "b.go", "fp-b", []model.LlmComment{
 		{Path: "b.go", Content: "kept"},
 	})
-	sh.RecordReviewItemFailed("b.go", "b.go", "b.go", "fp-b", "boom")
+	sh.RecordReviewItemFailed("b.go", "b.go", "b.go", "fp-b", "boom", nil)
 	sh.Finalize()
 
 	got, err := LoadComments(repoDir, sh.SessionID)
@@ -75,7 +75,7 @@ func TestLoadComments_LaterCheckpointSupersedes(t *testing.T) {
 
 func TestLoadComments_MissingSession(t *testing.T) {
 	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
+	setTestHome(t, tmpHome)
 	if _, err := LoadComments(t.TempDir(), "nonexistent"); err == nil {
 		t.Fatal("expected error for missing session")
 	}

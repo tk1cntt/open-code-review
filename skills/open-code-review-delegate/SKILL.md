@@ -22,26 +22,12 @@ metadata:
 
 A skill for performing AI code review where OCR provides deterministic engineering (file filtering, rule resolution) and the host agent performs the actual review using its own intelligence and tools.
 
-## Prerequisites
-
-```bash
-which ocr || echo "NOT INSTALLED"
-```
-
-If `ocr` is not installed:
-
-```bash
-npm install -g @alibaba-group/open-code-review
-```
-
-No LLM configuration is needed for delegation mode.
-
 ## Workflow
 
 ### Step 1: Preview — Determine What to Review
 
 ```bash
-ocr delegate preview [--from <ref> --to <ref>] [--commit <hash>] [--exclude <patterns>]
+ocr delegate preview --format json [--from <ref> --to <ref>] [--commit <hash>] [--exclude <patterns>]
 ```
 
 This outputs:
@@ -61,7 +47,7 @@ This outputs:
 ### Step 2: Get Rules for Files
 
 ```bash
-ocr delegate rule <path1> <path2> ...
+ocr delegate rule --format json <path1> <path2> ...
 ```
 
 Pass the reviewable file paths from Step 1. Output is grouped by rule content — files sharing the same rule appear under one group, avoiding repetition.
@@ -90,12 +76,17 @@ cat <path>
 
 ### Step 4: Review Each File
 
-For each reviewable file:
+Create a checklist containing every `reviewable_files` entry. For each reviewable file:
+
+Use `(path, status)` as the checklist identity. Workspace mode can report the same path twice when a staged deletion is followed by an untracked recreation.
 
 1. Get its diff (Step 3)
 2. Consult its Rule Group (from Step 2) for the review checklist
 3. Conduct a thorough review, using appropriate context tools as needed
 4. Record findings in structured format (Step 5)
+5. Mark the file `reviewed`, or `skipped` with a concrete reason
+
+For large changes, review in bounded batches grouped by shared rules and diff size. Do not stop after finding the first high-severity issue.
 
 ### Step 5: Save and Format Output
 
@@ -116,11 +107,15 @@ Each comment must follow this structure:
 
 ### Step 6: Classify and Report
 
+Before reporting, verify that every previewed file is accounted for. Include `total_files`, `reviewed_files`, `skipped_files`, and `coverage_rate` in the summary. A skipped file must include its reason.
+
 Group findings by severity:
 
 - **Critical/High**: Bugs, security issues, data loss risks — **must fix**, always report
 - **Medium**: Performance concerns, error handling gaps, maintainability issues — **fix if clear**, report with context
 - **Low**: Style nits, minor suggestions — **skip silently** unless clearly valuable
+
+Discard likely false positives silently.
 
 ### Step 7: Fix Issues
 
@@ -179,7 +174,8 @@ Stop when:
 | `--rule <path>` | Custom rule.json path |
 | `--exclude <patterns>` | Comma-separated exclude patterns |
 | `-b, --background <text>` | Business context |
-| `-B, --background-file <path>` | Business context from Markdown file |
+| `-B, --background-file <path>` | Business context from Markdown file (takes precedence over `-b`) |
+| `-f, --format <text\|json>` | Output format; use `json` for agent integrations |
 
 ## Save Results Convention
 
@@ -207,3 +203,43 @@ Each JSON file should use the same schema as OCR's built-in `--save-result` outp
 - **Background context** — pass `--background` to `preview` when you have requirement context; it appears in the output for your reference during review.
 - **Always save JSON results** — the fix loop depends on structured data. Don't rely on terminal output alone.
 - **Use the JSON for the fix loop** — read `path`, `start_line`, `end_line`, `suggestion_code`, `severity` fields to apply precise fixes.
+- **Coverage is mandatory** — every `reviewable_files` entry must end as reviewed or explicitly skipped; do not silently omit files.
+
+### Recovering Oversized Background Context
+
+`--background-file` has two independent limits. The raw file must not exceed
+1 MiB, and the sanitized content must not exceed 8000 characters. Either
+condition aborts the command. When the command reports either limit:
+
+1. Do not silently truncate the source file.
+2. Summarize the original material while preserving its requirements,
+   constraints, acceptance criteria, and other review-critical details.
+3. Retry the affected command by passing the summary as one shell-safe
+   argument (for example, use a quoted/escaped argument produced by the host
+   shell, or write it to a new size-bounded file and pass that file). Do not
+   place untrusted summary text directly in a double-quoted shell template;
+   `$()`, backticks, quotes, and variable references can still be evaluated.
+   Omit the original `--background-file` so the CLI does not reload the same
+   oversized file and fail again.
+4. If a faithful summary is not possible, omit the OCR background entirely and
+   read the original material directly during the review.
+
+### Troubleshooting CLI Version Compatibility
+
+The `--format` flag is available in `ocr` v1.9.0 and later. The Skill and the
+installed CLI can be updated independently. If a requested `preview` or `rule`
+command with `--format json` fails specifically with `unknown flag: --format`,
+rerun it without the flag and use text output for the rest of the delegation
+run. Preserve the explicit mode, ref, file, and rule information from that
+output; do not parse text output as JSON or invent missing schema fields. Do
+not retry without the flag for any other error; report it and stop the affected
+workflow.
+
+The host-agent Skill may consume the equivalent text output to complete its
+review checklist. Programmatic integrations that require `schema_version` or
+other JSON fields must require a JSON-capable CLI instead: verify with
+`ocr --version` and upgrade when necessary:
+
+```bash
+npm install -g @alibaba-group/open-code-review
+```
