@@ -1,0 +1,44 @@
+name: _merge_probe
+on:
+  push:
+    branches:
+      - chore/resolve-dev-upstream-20260912
+permissions:
+  contents: write
+jobs:
+  merge-probe:
+    if: "!contains(github.event.head_commit.message, '[merge-probe]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Attempt upstream merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git remote add upstream https://github.com/alibaba/open-code-review.git
+          git fetch upstream main
+          set +e
+          git merge --no-commit --no-ff upstream/main
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            git diff --name-only --diff-filter=U > MERGE_CONFLICTS.txt
+            echo "MERGE CONFLICTS:" >> MERGE_CONFLICTS.txt
+            git status --short >> MERGE_CONFLICTS.txt
+            git merge --abort
+            git add MERGE_CONFLICTS.txt
+            git commit -m "chore: report upstream merge conflicts [merge-probe]"
+            git push origin HEAD
+            exit 0
+          fi
+          git commit -m "Merge upstream alibaba/open-code-review main into dev [merge-probe]"
+          rm -f .github/workflows/_merge_probe.yml
+          git add -A
+          git commit -m "chore: remove merge probe helper [merge-probe]"
+          git push origin HEAD
