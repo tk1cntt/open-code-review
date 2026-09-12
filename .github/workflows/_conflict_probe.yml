@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Extract conflict hunks
+      - name: Extract per-file conflict hunks
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -23,17 +23,24 @@ jobs:
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then
-            git checkout --conflict=diff3 -- $(git diff --name-only --diff-filter=U)
-            : > CONFLICT_HUNKS.txt
-            for f in $(git diff --name-only --diff-filter=U); do
-              printf '\n===== %s =====\n' "$f" >> CONFLICT_HUNKS.txt
-              grep -n -B25 -A25 '^<<<<<<<\|^=======$\|^>>>>>>> ' "$f" >> CONFLICT_HUNKS.txt || true
+            rm -rf CONFLICTS
+            mkdir CONFLICTS
+            files=$(git diff --name-only --diff-filter=U)
+            for f in $files; do
+              out="CONFLICTS/$(basename "$f").txt"
+              {
+                echo "===== $f ====="
+                grep -n -B20 -A80 '^<<<<<<<\|^=======$\|^>>>>>>> ' "$f" || true
+              } > "$out"
             done
             git merge --abort
+            git add CONFLICTS
+            git commit -m "chore: capture per-file upstream conflict hunks"
+            git push origin HEAD
           else
-            echo "NO CONFLICTS" > CONFLICT_HUNKS.txt
+            echo NO_CONFLICTS > CONFLICTS.txt
             git merge --abort
+            git add CONFLICTS.txt
+            git commit -m "chore: record no conflicts"
+            git push origin HEAD
           fi
-          git add CONFLICT_HUNKS.txt
-          git commit -m "chore: capture upstream conflict hunks"
-          git push origin HEAD
