@@ -1,0 +1,35 @@
+name: _conflict_probe
+on:
+  push:
+    branches:
+      - fix/dev-upstream-conflicts-20260912
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Probe merge conflicts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/alibaba/open-code-review.git
+          git fetch upstream main
+          set +e
+          git merge --no-commit --no-ff upstream/main
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            git diff --name-only --diff-filter=U > MERGE_CONFLICTS.txt
+            git status --short >> MERGE_CONFLICTS.txt
+            git merge --abort
+          else
+            echo "NO CONFLICTS" > MERGE_CONFLICTS.txt
+            git merge --abort
+          fi
+          git add MERGE_CONFLICTS.txt
+          git commit -m "chore: record dev upstream merge conflicts"
+          git push origin HEAD
