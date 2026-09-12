@@ -1,0 +1,32 @@
+name: _resolve_upstream
+on:
+  push:
+    branches:
+      - fix/upstream-merge-20260912-work
+permissions:
+  contents: read
+  issues: write
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Merge upstream and report conflicts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/alibaba/open-code-review.git
+          git fetch upstream main
+          if git merge --no-edit --no-ff upstream/main; then
+            MERGE_SHA=$(git rev-parse HEAD)
+            gh api repos/tk1cntt/open-code-review/issues/2/comments -f body="Upstream merge succeeds. Merge commit: ${MERGE_SHA}"
+          else
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            CONFLICTS=$(cat /tmp/conflicts.txt)
+            gh api repos/tk1cntt/open-code-review/issues/2/comments -f body="Upstream merge conflicts:\n\n${CONFLICTS}"
+            git merge --abort
+          fi
