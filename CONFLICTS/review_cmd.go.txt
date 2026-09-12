@@ -1,0 +1,292 @@
+===== cmd/opencodereview/review_cmd.go =====
+9-	"path/filepath"
+10-	"sort"
+11-	"strings"
+12-	"time"
+13-
+14-	"github.com/alibaba/open-code-review/internal/agent"
+15-	"github.com/alibaba/open-code-review/internal/diff"
+16-	"github.com/alibaba/open-code-review/internal/llm"
+17-	"github.com/alibaba/open-code-review/internal/mcp"
+18-	"github.com/alibaba/open-code-review/internal/model"
+19-	"github.com/alibaba/open-code-review/internal/reviewstore"
+20-	"github.com/alibaba/open-code-review/internal/session"
+21-	"github.com/alibaba/open-code-review/internal/telemetry"
+22-	"github.com/alibaba/open-code-review/internal/tool"
+23-	"github.com/spf13/cobra"
+24-
+25-	"go.opentelemetry.io/otel/codes"
+26-)
+27-
+28-type reviewOptions struct {
+29:<<<<<<< HEAD
+30-	toolConfigPath     string
+31-	rulePath           string
+32-	repoDir            string
+33-	from               string
+34-	to                 string
+35-	commit             string
+36-	resume             string
+37-	resumeMode         string
+38-	excludes           string
+39-	outputFormat       string
+40-	audience           string
+41-	outputPath         string
+42-	background         string
+43-	backgroundFile     string
+44-	provider           string
+45-	model              string
+46-	concurrency        int
+47-	perFileTimeout     int
+48-	maxTools           int
+49-	maxGitProcs        int
+50-	maxTokens          int
+51-	maxTokensBudget    int
+52-	effort             string
+53-	noFilter           bool
+54-	preview            bool
+55-	rulesDir           string
+56-	saveResult         bool
+57-	savePerFile        bool
+58-	resultDir          string
+59-	resultProject      string
+60-	resultSourceBranch string
+61-	resultTargetBranch string
+62-	apply              bool
+63:=======
+64-	toolConfigPath        string
+65-	rulePath              string
+66-	repoDir               string
+67-	from                  string
+68-	to                    string
+69-	commit                string
+70-	resume                string
+71-	excludes              string
+72-	outputFormat          string
+73-	audience              string
+74-	outputPath            string
+75-	background            string
+76-	backgroundFile        string
+77-	provider              string
+78-	model                 string
+79-	concurrency           int
+80-	concurrentTaskTimeout int
+81-	maxTools              int
+82-	maxGitProcs           int
+83-	maxTokens             int
+84-	maxTokensBudget       int
+85-	effort                string
+86-	noFilter              bool
+87-	preview               bool
+88:>>>>>>> upstream/main
+89-}
+90-
+91-var reviewOpts reviewOptions
+92-
+93-var reviewCmd = &cobra.Command{
+94-	Use:     "review [flags]",
+95-	Aliases: []string{"r"},
+96-	Short:   "Start a diff-based code review",
+97-	Long:    "OpenCodeReview - AI-Powered Code Review CLI\n\nStart a diff-based code review using a configurable LLM.",
+98-	Args:    cobra.NoArgs,
+99-	Example: `  # Review staged + unstaged + untracked changes in current workspace
+100-  ocr review
+101-
+102-  # Review a branch against its base (merge-base mode)
+103-  ocr review --from master --to dev-ref
+104-
+105-  # Review a specific commit
+106-  ocr review --commit abc123
+107-  ocr review -c abc123
+108-
+109-  # Resume a previous range review
+110-  ocr review --from master --to dev-ref --resume <session-id>
+111-
+112-  # Output JSON format
+113-  ocr review --format json
+114-  ocr review -f json
+115-
+116-  # Agent mode (summary only, no progress lines)
+117-  ocr review --audience agent
+118-
+119-  # Preview which files will be reviewed
+120-  ocr review --preview
+121-  ocr review -c abc123 -p
+122-
+123-  # Exclude generated files / fixtures
+124-  ocr review --exclude '**/generated/*,**/testdata/*'
+125-
+126-  # Provide requirement/business context inline or from a Markdown file
+127-  ocr review --background "Adding rate limiting to the login API"
+128-  ocr review --background-file ./docs/requirements.md`,
+129-	RunE: func(cmd *cobra.Command, args []string) error {
+130-		if err := validateReviewOptions(&reviewOpts); err != nil {
+131-			return err
+132-		}
+133-		// First signal cancels the context so the defer chain shuts down
+134-		// gracefully; a second signal force-exits instead of being dropped
+135-		// for the whole shutdown window (see interrupt.go).
+136-		ctx, stop := interruptContextWithForcedExit(cmd.Context())
+137-		defer stop()
+138-		return executeReviewContext(ctx, reviewOpts)
+139-	},
+140-}
+141-
+142-func init() {
+143-	registerReviewFlags(reviewCmd, &reviewOpts)
+144-}
+145-
+146-func executeReview(ctx context.Context, opts reviewOptions) error {
+147-	return executeReviewContext(ctx, opts)
+148-}
+149-
+150-func executeReviewContext(ctx context.Context, opts reviewOptions) (retErr error) {
+151-	out, closeOut, err := resolveOutputWriter(opts.outputPath, opts.outputFormat)
+152-	if err != nil {
+153-		return err
+154-	}
+155-	closeOutPending := true
+156-	finishOutput := func() error {
+157-		if !closeOutPending {
+158-			return nil
+159-		}
+160-		closeOutPending = false
+161-		if cerr := closeOut(); cerr != nil {
+162-			return fmt.Errorf("close output file: %w", cerr)
+163-		}
+164-		return nil
+165-	}
+166-	defer func() {
+167-		if cerr := finishOutput(); cerr != nil {
+168-			retErr = errors.Join(retErr, cerr)
+--
+288-		Provider:              rt.Provider,
+289-		Background:            opts.background,
+290-		GitRunner:             cc.GitRunner,
+291-		Resume:                resumeState,
+292-		ResumeMode:            opts.resumeMode,
+293-		SealedInput:           sealedInput,
+294-		MaxTokensBudget:       int64(opts.maxTokensBudget),
+295-		Apply:                 opts.apply,
+296-		ApplyToolDefs:         applyToolDefs,
+297-		SkipFilter:            opts.noFilter,
+298-		OnFileDone: func(filePath string, comments []model.LlmComment) {
+299-			if perFileWriter != nil {
+300-				if err := perFileWriter.WriteFile(filePath, comments); err != nil {
+301-					fmt.Fprintf(os.Stderr, "[ocr] warning: per-file save failed for %s: %v\n", filePath, err)
+302-				}
+303-			}
+304-		},
+305-		RuntimeConfig: rt.RuntimeConfig,
+306-	})
+307-
+308:<<<<<<< HEAD
+309-	// Use the session ID as the review result ID so --resume and review
+310-	// result persistence share one consistent identifier.
+311-	reviewID := ag.SessionID()
+312-	setResumeSessionID(ctx, reviewID)
+313-	if opts.savePerFile && reviewID == "" {
+314-		fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save because the session was not persisted\n")
+315-	} else if opts.savePerFile {
+316-		if opts.resultDir == "" {
+317-			opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+318-		}
+319-		projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(cc.RepoDir))
+320-		projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir))
+321-		project := reviewstore.ProjectInfo{
+322-			ID:      projectID,
+323-			Name:    projectName,
+324-			RepoDir: cc.RepoDir,
+325-			WebURL:  os.Getenv("CI_PROJECT_URL"),
+326-		}
+327-		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
+328-		if pfwErr != nil {
+329-			fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save: %v\n", pfwErr)
+330-		} else {
+331-			perFileWriter = pfw
+332-		}
+333-	}
+334:=======
+335-	closeRaw := bindRawWriter(rt.RawHolder, cc.RepoDir, ag.Session())
+336-	defer closeRaw()
+337:>>>>>>> upstream/main
+338-
+339-	// Silence progress output during execution; restored before the trace
+340-	// summary in agent-text mode (and on function exit otherwise).
+341-	q := newQuietHandle(opts.outputFormat, opts.audience)
+342-	defer q.Restore()
+343-
+344-	runCtx, span := telemetry.StartSpan(telemetry.ContextWithTraceParentFromEnv(ctx), "review.run")
+345-	defer span.End()
+346-	telemetry.SetAttr(span, "review.repo", cc.RepoDir)
+347-	telemetry.SetAttr(span, "review.from", opts.from)
+348-	telemetry.SetAttr(span, "review.to", opts.to)
+349-	telemetry.SetAttr(span, "review.model", rt.Model)
+350-	var traceID string
+351-	if telemetry.IsEnabled() {
+352-		traceID = telemetry.TraceIDFromContext(runCtx)
+353-		if !isMachineReadable(opts.outputFormat) {
+354-			fmt.Fprintf(os.Stderr, "[ocr] TraceID: %s\n", traceID)
+355-		}
+356-	}
+357-	startTime := time.Now()
+358-
+359-	var finalized bool
+360-	defer func() {
+361-		if perFileWriter != nil && !finalized {
+362-			if _, fErr := perFileWriter.Finalize(reviewstore.ReviewInfo{}, reviewstore.GitLabInfo{}, nil); fErr != nil {
+363-				fmt.Fprintf(os.Stderr, "[ocr] warning: failed to finalize partial per-file output: %v\n", fErr)
+364-			}
+365-		}
+366-	}()
+367-
+368-	comments, runErr := ag.Run(runCtx)
+369-	duration := time.Since(startTime)
+370-
+371-	manifest := ag.RunManifest()
+372-
+373-	// Freeze the retry report at the same boundary as the manifest: ag.Run has
+374-	// returned and joined its background work, so every request this run made is
+375-	// finalized and the report can no longer change. run_id is the session's
+376-	// in-memory UUID (ag.Session().SessionID) rather than ag.SessionID(), which
+377-	// returns "" when persistence failed — the report's logical_request_id must
+378-	// stay stable and unique per run even for an unpersisted session.
+379-	retryReport, freezeErr := rt.RetryCollector.Freeze(ag.Session().SessionID)
+380-	if freezeErr != nil {
+381-		// A construction error means the collector's invariants were violated, so
+382-		// the report is self-contradictory and must not be published at all
+383-		// (Freeze already returned nil). Retry reporting is observability only, so
+384-		// its invariant failure must not change the review's exit status.
+385-		fmt.Fprintf(os.Stderr, "[ocr] warning: freeze retry report: %v (retry report suppressed)\n", freezeErr)
+386-	}
+387-
+388-	resultErr := reviewResultError(runErr, manifest)
+389-	if resultErr != nil {
+390-		span.SetStatus(codes.Error, resultErr.Error())
+391-		span.RecordError(resultErr)
+392-	}
+393-
+394-	// A successfully constructed manifest is publishable even when execution or
+395-	// session delivery failed. Emit it first, then return the independent process
+396-	// error so JSON consumers retain the complete coverage diagnosis.
+397-	var emitErr error
+398-	emitted := manifest != nil || runErr == nil
+399-	if emitted {
+400-		emitErr = emitRunResult(runCtx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity, out, retryReport)
+401-		if emitErr != nil {
+402-			emitErr = fmt.Errorf("emit review result: %w", emitErr)
+403-		} else {
+404-			// Commit the report before potentially slow MCP shutdown. The deferred
+405-			// close remains a fallback for every earlier return and emit failure.
+406-			emitErr = finishOutput()
+407-		}
+408-	}
+409-	if resultErr != nil {
+410-		q.Restore()
+411-		// The report has exactly one exit per run. emitRunResult already published
+412-		// it whenever it ran (which it does even for a fully failed run, since a
+413-		// failed manifest is still publishable), so the failure-usage path gets it
+414-		// only when that call was skipped entirely.
+415-		failureReport := retryReport
+416-		if emitted {
+417-			failureReport = nil

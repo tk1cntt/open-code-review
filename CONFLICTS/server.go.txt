@@ -1,0 +1,302 @@
+===== internal/viewer/server.go =====
+1-package viewer
+2-
+3-import (
+4-	"embed"
+5-	"fmt"
+6-	"html/template"
+7-	"io/fs"
+8-	"net"
+9-	"net/http"
+10-	"os"
+11-	"strconv"
+12-	"strings"
+13-	"time"
+14-
+15-	"github.com/alibaba/open-code-review/internal/reviewstore"
+16-)
+17-
+18-//go:embed templates/*.html static/style.css
+19-var assets embed.FS
+20-
+21:<<<<<<< HEAD
+22-// ServerOptions configures the viewer HTTP server.
+23-type ServerOptions struct {
+24-	Addr       string
+25-	ReviewsDir string
+26-}
+27-
+28-func StartServer(addr string) error {
+29-	return StartServerWithOptions(ServerOptions{Addr: addr})
+30-}
+31-
+32-func StartServerWithOptions(opts ServerOptions) error {
+33:=======
+34-// StartServer binds addr and serves until the listener fails. openMode is one
+35-// of OpenAuto, OpenAlways or OpenNever; callers should have run
+36-// ValidateOpenMode first, and anything unrecognized behaves as OpenAuto.
+37-func StartServer(addr, openMode string) error {
+38:>>>>>>> upstream/main
+39-	root, err := SessionsRoot()
+40-	if err != nil {
+41-		return fmt.Errorf("resolve sessions root: %w", err)
+42-	}
+43-
+44:<<<<<<< HEAD
+45-	reviewsRoot := opts.ReviewsDir
+46-	if reviewsRoot == "" {
+47-		reviewsRoot = os.Getenv("OCR_REVIEWS_DIR")
+48-	}
+49-
+50-	mux := http.NewServeMux()
+51-
+52-	// Static assets (must be registered before "/" catch-all)
+53-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS()))))
+54-
+55-	// Routes
+56-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+57-		handleRepos(w, r, root)
+58-	})
+59-	mux.HandleFunc("/r/{repo}", func(w http.ResponseWriter, r *http.Request) {
+60-		repo := r.PathValue("repo")
+61-		if !isValidPathSegment(repo) {
+62-			http.Error(w, "invalid repo path", http.StatusBadRequest)
+63-			return
+64-		}
+65-		handleSessions(w, r, root, repo)
+66-	})
+67-	mux.HandleFunc("/r/{repo}/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
+68-		repo := r.PathValue("repo")
+69-		sid := r.PathValue("sessionID")
+70-		if !isValidPathSegment(repo) || !isValidPathSegment(sid) {
+71-			http.Error(w, "invalid path", http.StatusBadRequest)
+72-			return
+73-		}
+74-		handleSession(w, r, root, repo, sid)
+75-	})
+76:=======
+77-	mux := newMux(root)
+78:>>>>>>> upstream/main
+79-
+80-	// JSON API for review results
+81-	if reviewsRoot != "" {
+82-		mux.HandleFunc("/api/reviews", func(w http.ResponseWriter, r *http.Request) {
+83-			handleAPIReviews(w, r, reviewsRoot)
+84-		})
+85-		mux.HandleFunc("/api/reviews/{project}", func(w http.ResponseWriter, r *http.Request) {
+86-			project := r.PathValue("project")
+87-			if !isValidPathSegment(project) {
+88-				writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid project"))
+89-				return
+90-			}
+91-			handleAPIProjectReviews(w, r, reviewsRoot, project)
+92-		})
+93-		mux.HandleFunc("/api/reviews/{project}/{reviewID}", func(w http.ResponseWriter, r *http.Request) {
+94-			project := r.PathValue("project")
+95-			reviewID := r.PathValue("reviewID")
+96-			if !isValidPathSegment(project) || !isValidPathSegment(reviewID) {
+97-				writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid path"))
+98-				return
+99-			}
+100-			handleAPIReviewDetail(w, r, reviewsRoot, project, reviewID)
+101-		})
+102-	}
+103-
+104-	// Wrap the mux with a Host-header allowlist. Without this, any web page
+105-	// the user visits can DNS-rebind its origin to 127.0.0.1 and read the
+106-	// session JSONL exposed by this viewer (which contains LLM request bodies
+107-	// = source code being reviewed and the LLM's analysis of it).
+108-	allowed := resolveAllowedHostsFromEnv(opts.Addr)
+109-	guarded := hostGuard(allowed, mux)
+110-
+111-	srv := &http.Server{
+112:<<<<<<< HEAD
+113-		Addr:    opts.Addr,
+114-		Handler: guarded,
+115-	}
+116-
+117-	fmt.Printf("\nOpen browser: http://%s\n", DisplayAddr(opts.Addr))
+118-	return srv.ListenAndServe()
+119:=======
+120-		Handler: handler,
+121-	}
+122-
+123-	// Bind before printing or opening anything: once Listen returns, early
+124-	// connections queue in the accept backlog instead of being refused, so the
+125-	// browser cannot outrun the server.
+126-	ln, err := net.Listen("tcp", addr)
+127-	if err != nil {
+128-		return fmt.Errorf("listen on %s: %w", addr, err)
+129-	}
+130-	// srv.Serve takes ownership and closes ln itself; this covers the
+131-	// early-return path below and any future one. Close is idempotent enough
+132-	// here — the second call just reports ErrClosed, which nothing reads.
+133-	defer ln.Close()
+134-
+135-	url, err := displayURL(addr, ln.Addr().String())
+136-	if err != nil {
+137-		return err
+138-	}
+139-
+140-	serveErr := make(chan error, 1)
+141-	go func() {
+142-		serveErr <- srv.Serve(ln)
+143-	}()
+144-
+145-	autoOpen, suppressed := shouldAutoOpen(openMode)
+146-	if suppressed != "" {
+147-		fmt.Printf("Viewer ready: %s (browser not opened: %s)\n", url, suppressed)
+148-	} else {
+149-		fmt.Printf("Viewer ready: %s\n", url)
+150-	}
+151-	if autoOpen {
+152-		go func() {
+153-			if err := openBrowser(url); err != nil {
+154-				browserWarnf("could not open browser: %v", err)
+155-			}
+156-		}()
+157-	}
+158-
+159-	return <-serveErr
+160-}
+161-
+162-// newMux builds the viewer's routing table against a sessions root. The
+163-// viewer is read-only: the document routes are registered with GET-only
+164-// patterns (which also serve HEAD), so the ServeMux itself answers any other
+165-// method with 405 + Allow before a handler runs. The root pattern matches
+166-// exactly "/" via {$}; every other unmatched path gets the ServeMux's 404.
+167-// New routes must register method-qualified patterns to keep this contract
+168-// testable (TestMux_HasNoWriteRoutes).
+169-func newMux(root string) *http.ServeMux {
+170-	mux := http.NewServeMux()
+171-
+172-	// Static assets.
+173-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS()))))
+174-
+175-	// Routes
+176-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+177-		handleRepos(w, r, root)
+178-	})
+179-	mux.HandleFunc("GET /r/{repo}", func(w http.ResponseWriter, r *http.Request) {
+180-		repo := r.PathValue("repo")
+181-		if unsafeSegment(repo) {
+182-			http.Error(w, "invalid repo path", http.StatusBadRequest)
+183-			return
+184-		}
+185-		handleSessions(w, r, root, repo)
+186-	})
+187-	// Registered before the {sessionID} wildcard for readability only: a
+188-	// literal segment wins over a wildcard whatever the order.
+189-	mux.HandleFunc("GET /r/{repo}/compare", func(w http.ResponseWriter, r *http.Request) {
+190-		repo := r.PathValue("repo")
+191-		if unsafeSegment(repo) {
+192-			http.Error(w, "invalid repo path", http.StatusBadRequest)
+193-			return
+194-		}
+195-		handleCompare(w, r, root, repo)
+196-	})
+197-	mux.HandleFunc("GET /r/{repo}/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
+198-		repo := r.PathValue("repo")
+199-		sid := r.PathValue("sessionID")
+--
+214-// built from the requested address (resolveAllowedHostsFromEnv). Using the
+215-// resolved form makes the two disagree, so `ocr viewer --addr box.local:5483`
+216-// would auto-open http://192.168.1.10:5483 and land on "403 forbidden host".
+217-//
+218-// The port comes from the listener so `--addr :0` reports the port the kernel
+219-// actually assigned rather than the literal 0.
+220-func displayURL(requestedAddr, listenerAddr string) (string, error) {
+221-	_, port, err := net.SplitHostPort(listenerAddr)
+222-	if err != nil {
+223-		return "", fmt.Errorf("parse listener addr %q: %w", listenerAddr, err)
+224-	}
+225-	return "http://" + DisplayAddr(net.JoinHostPort(splitBindHost(requestedAddr), port)), nil
+226-}
+227-
+228-// unsafeSegment rejects a URL-supplied name that must stay a single directory
+229-// or file name once it reaches filepath.Join. ServeMux unescapes each path
+230-// segment, so "%2F" and "%5C" arrive here as real separators; "\" is one on
+231-// Windows, so it is rejected everywhere "/" is.
+232-func unsafeSegment(s string) bool {
+233-	return strings.Contains(s, "..") || strings.ContainsAny(s, `/\`)
+234:>>>>>>> upstream/main
+235-}
+236-
+237-var cstZone = func() *time.Location {
+238-	loc, err := time.LoadLocation("Asia/Shanghai")
+239-	if err != nil {
+240-		loc = time.FixedZone("CST", 8*60*60)
+241-	}
+242-	return loc
+243-}()
+244-
+245-// isValidPathSegment delegates to reviewstore.IsSafePathSegment so the
+246-// HTTP-layer validation stays consistent with the store-layer validation.
+247-func isValidPathSegment(segment string) bool {
+248-	return reviewstore.IsSafePathSegment(segment)
+249-}
+250-
+251-func formatTime(t time.Time) string {
+252-	return t.In(cstZone).Format("2006-01-02 15:04")
+253-}
+254-
+255-// CommentFileGroup groups review comments by file path for template rendering.
+256-type CommentFileGroup struct {
+257-	FilePath string
+258-	Comments []*ReviewComment
+259-}
+260-
+261-// SeverityCount holds counts for each severity level.
+262-type SeverityCount struct {
+263-	Critical int
+264-	High     int
+265-	Medium   int
+266-	Low      int
+267-}
+268-
+269-// CategoryCount holds counts for each review comment category.
+270-type CategoryCount struct {
+271-	Bug             int
+272-	Security        int
+273-	Performance     int
+274-	Maintainability int
+275-	Test            int
+276-	Style           int
+277-	Documentation   int
+278-	Other           int
+279-}
+280-
+281-var knownCommentCategories = map[string]struct{}{
+282-	"bug":             {},
+283-	"security":        {},
+284-	"performance":     {},
+285-	"maintainability": {},
+286-	"test":            {},
+287-	"style":           {},
+288-	"documentation":   {},
+289-	"other":           {},
+290-}
+291-
+292-func normalizedCommentCategory(category string) string {
+293-	category = strings.ToLower(strings.TrimSpace(category))
+294-	if _, ok := knownCommentCategories[category]; ok {
+295-		return category
+296-	}
+297-	return "other"
+298-}
+299-
+300-func normalizedCommentSeverity(severity string) string {
+301-	return strings.ToLower(strings.TrimSpace(severity))
+302-}
+303-
+304-func categoryCounts(comments []*ReviewComment) CategoryCount {
+305-	var counts CategoryCount
+306-	for _, comment := range comments {
+307-		switch normalizedCommentCategory(comment.Category) {
+308-		case "bug":
+309-			counts.Bug++
+310-		case "security":
+311-			counts.Security++
+312-		case "performance":
+313-			counts.Performance++
+314-		case "maintainability":

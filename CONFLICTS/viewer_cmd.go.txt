@@ -1,0 +1,72 @@
+===== cmd/opencodereview/viewer_cmd.go =====
+1-// SPDX-License-Identifier: Apache-2.0
+2-// Copyright 2026 alibaba/open-code-review Contributors
+3-
+4-package main
+5-
+6-import (
+7:<<<<<<< HEAD
+8-	"fmt"
+9-	"os"
+10-
+11:=======
+12:>>>>>>> upstream/main
+13-	"github.com/alibaba/open-code-review/internal/viewer"
+14-	"github.com/spf13/cobra"
+15-)
+16-
+17-type viewerOptions struct {
+18:<<<<<<< HEAD
+19-	addr       string
+20-	reviewsDir string
+21:=======
+22-	addr string
+23-	open string
+24:>>>>>>> upstream/main
+25-}
+26-
+27-var viewerOpts viewerOptions
+28-
+29-var viewerCmd = &cobra.Command{
+30-	Use:     "viewer [flags]",
+31-	Aliases: []string{"v"},
+32-	Short:   "Start the WebUI session viewer",
+33-	Long:    "Session history WebUI viewer.",
+34-	Args:    cobra.NoArgs,
+35:<<<<<<< HEAD
+36-	Example: `  ocr viewer                     # start on default port
+37-  ocr viewer --addr :3000        # bind to all interfaces on port 3000
+38-  ocr viewer --reviews-dir /path/to/reviews`,
+39-	RunE: func(cmd *cobra.Command, args []string) error {
+40-		if viewerOpts.reviewsDir == "" {
+41-			viewerOpts.reviewsDir = os.Getenv("OCR_REVIEWS_DIR")
+42-		}
+43-		fmt.Printf("Open Code Review Viewer starting on http://%s\n", viewer.DisplayAddr(viewerOpts.addr))
+44-		return viewer.StartServerWithOptions(viewer.ServerOptions{
+45-			Addr:       viewerOpts.addr,
+46-			ReviewsDir: viewerOpts.reviewsDir,
+47-		})
+48:=======
+49-	Example: `  ocr viewer                     # start and open the browser
+50-  ocr viewer --addr :3000        # bind to all interfaces on port 3000
+51-  ocr viewer --open=never        # just print the URL
+52-  ocr viewer --open=always       # force it when auto declines (piped output, WSL)`,
+53-	RunE: func(cmd *cobra.Command, args []string) error {
+54-		if err := viewer.ValidateOpenMode(viewerOpts.open); err != nil {
+55-			return err
+56-		}
+57-		return viewer.StartServer(viewerOpts.addr, viewerOpts.open)
+58:>>>>>>> upstream/main
+59-	},
+60-}
+61-
+62-func init() {
+63-	viewerCmd.Flags().StringVar(&viewerOpts.addr, "addr", "localhost:5483", "listen address")
+64:<<<<<<< HEAD
+65-	viewerCmd.Flags().StringVar(&viewerOpts.reviewsDir, "reviews-dir", "", "root directory for review result JSON files (env: OCR_REVIEWS_DIR)")
+66:=======
+67-	viewerCmd.Flags().StringVar(&viewerOpts.open, "open", viewer.OpenAuto,
+68-		"when to open the browser: auto (only on a local terminal with a display), always, or never")
+69-	viewerCmd.RegisterFlagCompletionFunc("open", completeEnum(viewer.OpenAuto, viewer.OpenAlways, viewer.OpenNever))
+70:>>>>>>> upstream/main
+71-}

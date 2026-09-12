@@ -1,0 +1,234 @@
+===== internal/viewer/store.go =====
+315-	ReasoningContent string // the model's reasoning/thinking text for this turn, if the provider exposed any
+316-	ToolCalls        []ToolCallInfo
+317-	DurationMs       int64
+318-	Error            string
+319-	Model            string
+320-	PromptTokens     int
+321-	CompletionTokens int
+322-	CacheReadTokens  int
+323-	CacheWriteTokens int
+324-}
+325-
+326-// ToolCallInfo summarizes a single tool call.
+327-type ToolCallInfo struct {
+328-	Name       string
+329-	Arguments  string
+330-	Result     string
+331-	Ok         bool
+332-	DurationMs int64
+333-}
+334-
+335:<<<<<<< HEAD
+336-// ReviewFinding represents a single code review finding from LlmComment.
+337-type ReviewFinding struct {
+338-	FilePath       string
+339-	Content        string
+340-	SuggestionCode string
+341-	ExistingCode   string
+342-	StartLine      int
+343-	EndLine        int
+344-	Category       string
+345-	Severity       string
+346:=======
+347-// safeSegment validates that s is safe to use as a single path component and
+348-// returns it unchanged. Every caller must join the returned value, not its
+349-// own copy of s: a validate-then-use-the-original-variable shape leaves the
+350-// join sourced from the untrusted argument, which static path-injection
+351-// analysis (this codebase's CodeQL scan included) cannot tell apart from a
+352-// join with no check at all. Returning the checked value is what makes the
+353-// join provably downstream of the check.
+354-func safeSegment(s string) (string, error) {
+355-	if s == "" || strings.Contains(s, "..") || strings.ContainsAny(s, `/\`) {
+356-		return "", fmt.Errorf("invalid path segment: %q", s)
+357-	}
+358-	return s, nil
+359:>>>>>>> upstream/main
+360-}
+361-
+362-// LoadSession fully parses a JSONL file into a ViewSession.
+363-func LoadSession(root, encodedRepo, sessionID string) (*ViewSession, error) {
+364-	encodedRepo, err := safeSegment(encodedRepo)
+365-	if err != nil {
+366-		return nil, err
+367-	}
+368-	sessionID, err = safeSegment(sessionID)
+369-	if err != nil {
+370-		return nil, err
+371-	}
+372-	path := filepath.Join(root, encodedRepo, sessionID+".jsonl")
+373-	f, err := os.Open(path) //nolint:gosec // encodedRepo and sessionID are validated by safeSegment above
+374-	if err != nil {
+375-		return nil, fmt.Errorf("open session file: %w", err)
+376-	}
+377-	defer f.Close()
+378-
+379-	vs := &ViewSession{
+380-		Files:         make([]*FileGroup, 0),
+381-		SeverityCount: make(map[string]int),
+382-		CategoryCount: make(map[string]int),
+383-	}
+384-	vs.Summary.Aborted = true
+385-	fileIndex := make(map[string]*FileGroup)
+386-	markOccurrences := make(map[string]int)
+387-
+388-	readErr := readJSONLLines(f, func(line []byte) {
+389-		var rec map[string]any
+390-		if err := json.Unmarshal(line, &rec); err != nil {
+391-			return // skip malformed lines
+392-		}
+393-		typ, _ := rec["type"].(string)
+394-
+395-		switch typ {
+396-		case "session_start":
+397-			if ts, ok := rec["timestamp"].(string); ok {
+398-				vs.Summary.Timestamp, _ = time.Parse(time.RFC3339, ts)
+399-			}
+400-			if cwd, ok := rec["cwd"].(string); ok {
+401-				vs.Summary.CWD = cwd
+402-			}
+403-			if branch, ok := rec["gitBranch"].(string); ok {
+404-				vs.Summary.GitBranch = branch
+405-			}
+406-			if model, ok := rec["model"].(string); ok {
+407-				vs.Summary.Model = model
+408-			}
+409-			if rm, ok := rec["reviewMode"].(string); ok {
+410-				vs.Summary.ReviewMode = rm
+411-			}
+412-			if v, ok := rec["diffFrom"].(string); ok {
+413-				vs.Summary.DiffFrom = v
+414-			}
+415-			if v, ok := rec["diffTo"].(string); ok {
+416-				vs.Summary.DiffTo = v
+417-			}
+418-			if v, ok := rec["diffCommit"].(string); ok {
+419-				vs.Summary.DiffCommit = v
+420-			}
+421-
+422-		case "llm_request":
+423-			fp, _ := rec["filePath"].(string)
+424-			tt, _ := rec["taskType"].(string)
+425-			reqNo := 0
+426-			if n, ok := rec["request_no"].(float64); ok {
+427-				reqNo = int(n)
+428-			}
+429-			msgs := rec["messages"]
+430-
+431-			tc := &TaskCard{RequestMessages: msgs, RequestNo: reqNo}
+432-
+433-			fg := fileIndex[fp]
+434-			if fg == nil {
+435-				fg = &FileGroup{FilePath: fp, Tasks: make(map[TaskType][]*TaskCard)}
+436-				fileIndex[fp] = fg
+437-				vs.Files = append(vs.Files, fg)
+438-			}
+439-			fg.Tasks[TaskType(tt)] = append(fg.Tasks[TaskType(tt)], tc)
+--
+577-						rc.Content = v
+578-					}
+579-					if v, ok := cm["suggestion_code"].(string); ok {
+580-						rc.SuggestionCode = v
+581-					}
+582-					if v, ok := cm["existing_code"].(string); ok {
+583-						rc.ExistingCode = v
+584-					}
+585-					if v, ok := cm["start_line"].(float64); ok {
+586-						rc.StartLine = int(v)
+587-					}
+588-					if v, ok := cm["end_line"].(float64); ok {
+589-						rc.EndLine = int(v)
+590-					}
+591-					if v, ok := cm["category"].(string); ok {
+592-						rc.Category = v
+593-					}
+594-					if v, ok := cm["severity"].(string); ok {
+595-						rc.Severity = v
+596-					}
+597:<<<<<<< HEAD
+598-					if rc.Content == "" && rc.SuggestionCode == "" {
+599-						continue
+600-					}
+601:=======
+602-					rc.MarkID = commentMarkID(recUUID, ci, rc, markOccurrences)
+603:>>>>>>> upstream/main
+604-					vs.Comments = append(vs.Comments, rc)
+605-					if rc.Severity != "" {
+606-						vs.SeverityCount[strings.ToLower(rc.Severity)]++
+607-					}
+608-					if rc.Category != "" {
+609-						vs.CategoryCount[strings.ToLower(rc.Category)]++
+610-					}
+611-				}
+612-			}
+613-
+614-		case "session_end":
+615-			applySessionEnd(&vs.Summary, rec)
+616-		}
+617-	})
+618-
+619-	// Aggregate token usage across all task cards
+620-	fileBreakdown := make([]FileTokenUsage, 0, len(vs.Files))
+621-	for _, fg := range vs.Files {
+622-		ft := FileTokenUsage{FilePath: fg.FilePath}
+623-		for _, cards := range fg.Tasks {
+624-			for _, c := range cards {
+625-				vs.TokenUsage.TotalPromptTokens += c.PromptTokens
+626-				vs.TokenUsage.TotalCompletionTokens += c.CompletionTokens
+627-				vs.TokenUsage.TotalCacheReadTokens += c.CacheReadTokens
+628-				vs.TokenUsage.TotalCacheWriteTokens += c.CacheWriteTokens
+629-				if c.ResponseContent != "" || c.PromptTokens > 0 {
+630-					vs.TokenUsage.RequestCount++
+631-				}
+632-				ft.PromptTokens += c.PromptTokens
+633-				ft.CompletionTokens += c.CompletionTokens
+634-				ft.CacheReadTokens += c.CacheReadTokens
+635-				ft.CacheWriteTokens += c.CacheWriteTokens
+636-			}
+637-		}
+638-		fileBreakdown = append(fileBreakdown, ft)
+639-	}
+640-	sort.Slice(fileBreakdown, func(i, j int) bool {
+641-		return fileBreakdown[i].PromptTokens+fileBreakdown[i].CompletionTokens > fileBreakdown[j].PromptTokens+fileBreakdown[j].CompletionTokens
+642-	})
+643-	vs.TokenUsage.FileTokenBreakdown = fileBreakdown
+644-
+645-	// Separate session-level virtual paths from real file paths.
+646-	realFiles := make([]*FileGroup, 0, len(vs.Files))
+647-	for _, fg := range vs.Files {
+648-		if isSessionLevelPath(fg.FilePath) {
+649-			vs.SessionTasks = append(vs.SessionTasks, fg)
+650-		} else {
+651-			realFiles = append(realFiles, fg)
+652-		}
+653-	}
+654-	vs.Files = realFiles
+655-
+656-	sort.Slice(vs.Files, func(i, j int) bool {
+657-		return vs.Files[i].FilePath < vs.Files[j].FilePath
+658-	})
+659-
+660-	vs.Summary.SessionID = sessionID
+661-	vs.Summary.CommentCount = len(vs.Comments)
+662-	return vs, readErr
+663-}
+664-
+665-// commentMarkID returns a stable identity for one comment within an immutable
+666-// session file. Records carry a top-level uuid: uuid#commentIndex is exact,
+667-// collision-free, and identical on every reload. Legacy records without a
+668-// uuid fall back to a sha256 over every comment field plus an occurrence
+669-// counter, so exact duplicate comments still get distinct identities.
+670-func commentMarkID(recordUUID string, commentIndex int, rc *ReviewComment, occurrences map[string]int) string {
+671-	if recordUUID != "" {
+672-		return fmt.Sprintf("%s#%d", recordUUID, commentIndex)
+673-	}
+674-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%d\x00%d\x00%s\x00%s",
+675-		rc.FilePath, rc.Content, rc.SuggestionCode, rc.ExistingCode,
+676-		rc.StartLine, rc.EndLine, rc.Category, rc.Severity)))
+677-	key := hex.EncodeToString(sum[:])
+678-	n := occurrences[key]
+679-	occurrences[key] = n + 1
+680-	return fmt.Sprintf("%s#%d", key, n)
+681-}
+682-
+683-func applySessionEnd(summary *SessionSummary, rec map[string]any) {

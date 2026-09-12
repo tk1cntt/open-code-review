@@ -1,0 +1,121 @@
+===== internal/viewer/store_load_test.go =====
+930-	if c.StartLine != 10 || c.EndLine != 12 {
+931-		t.Errorf("lines = %d-%d, want 10-12", c.StartLine, c.EndLine)
+932-	}
+933-	if c.Category != "style" {
+934-		t.Errorf("Category = %q", c.Category)
+935-	}
+936-	if c.Severity != "minor" {
+937-		t.Errorf("Severity = %q", c.Severity)
+938-	}
+939-
+940-	// A reused comment with no path falls back to the record-level filePath.
+941-	reused := vs.Comments[1]
+942-	if reused.FilePath != "util.go" {
+943-		t.Errorf("reused FilePath = %q, want util.go", reused.FilePath)
+944-	}
+945-	if reused.Content != "reused finding" {
+946-		t.Errorf("reused Content = %q", reused.Content)
+947-	}
+948-}
+949-
+950:<<<<<<< HEAD
+951-func TestLoadSession_SessionLevelGroupingTask(t *testing.T) {
+952:=======
+953-func TestLoadSession_MarkIDStableAndDistinct(t *testing.T) {
+954-	root := t.TempDir()
+955-	writeMarkIdentityFixture(t, root, "repo", "s1")
+956-
+957-	first, err := LoadSession(root, "repo", "s1")
+958-	if err != nil {
+959-		t.Fatal(err)
+960-	}
+961-	second, err := LoadSession(root, "repo", "s1")
+962-	if err != nil {
+963-		t.Fatal(err)
+964-	}
+965-
+966-	if len(first.Comments) != 4 || len(second.Comments) != 4 {
+967-		t.Fatalf("comments = %d/%d, want 4/4", len(first.Comments), len(second.Comments))
+968-	}
+969-	for i := range first.Comments {
+970-		if first.Comments[i].MarkID == "" {
+971-			t.Fatalf("comment %d has empty MarkID", i)
+972-		}
+973-		if first.Comments[i].MarkID != second.Comments[i].MarkID {
+974-			t.Errorf("comment %d MarkID unstable: %q vs %q", i, first.Comments[i].MarkID, second.Comments[i].MarkID)
+975-		}
+976-	}
+977-
+978-	// uuid-bearing record: identity is uuid#index — duplicates in one record
+979-	// stay distinct by construction.
+980-	if first.Comments[0].MarkID == first.Comments[1].MarkID {
+981-		t.Errorf("duplicate comments in one record share MarkID %q", first.Comments[0].MarkID)
+982-	}
+983-	if first.Comments[0].MarkID != "11111111-2222-3333-4444-555555555555#0" ||
+984-		first.Comments[1].MarkID != "11111111-2222-3333-4444-555555555555#1" {
+985-		t.Errorf("uuid record MarkIDs = %q, %q; want #0 and #1", first.Comments[0].MarkID, first.Comments[1].MarkID)
+986-	}
+987-
+988-	// legacy uuid-less record: fallback hash + occurrence counter keeps exact
+989-	// duplicates distinct and stable.
+990-	if first.Comments[2].MarkID == first.Comments[3].MarkID {
+991-		t.Errorf("legacy duplicate comments share MarkID %q", first.Comments[2].MarkID)
+992-	}
+993-	if !strings.Contains(first.Comments[2].MarkID, "#") {
+994-		t.Errorf("legacy MarkID = %q, want hash#occurrence form", first.Comments[2].MarkID)
+995-	}
+996-}
+997-
+998-func TestLoadSession_MarkIDUnicodeFields(t *testing.T) {
+999:>>>>>>> upstream/main
+1000-	root := t.TempDir()
+1001-	repoDir := filepath.Join(root, "repo")
+1002-	if err := os.MkdirAll(repoDir, 0755); err != nil {
+1003-		t.Fatal(err)
+1004-	}
+1005:<<<<<<< HEAD
+1006-
+1007-	writeJSONL(t, filepath.Join(repoDir, "group.jsonl"),
+1008-		`{"type":"session_start","timestamp":"2025-01-01T00:00:00Z","cwd":"/x","model":"m"}`,
+1009-		`{"type":"llm_request","filePath":"__grouping__","taskType":"grouping_task","request_no":1,"messages":[]}`,
+1010-		`{"type":"llm_response","filePath":"__grouping__","taskType":"grouping_task","content":"grouped","duration_ms":10,"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+1011-		`{"type":"llm_request","filePath":"a.go","taskType":"main_task","request_no":1,"messages":[]}`,
+1012-		`{"type":"llm_response","filePath":"a.go","taskType":"main_task","content":"ok","duration_ms":10,"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+1013-		`{"type":"session_end","duration_seconds":1,"files_reviewed":["a.go"]}`,
+1014-	)
+1015-
+1016-	vs, err := LoadSession(root, "repo", "group")
+1017-	if err != nil {
+1018-		t.Fatal(err)
+1019-	}
+1020-	if len(vs.Files) != 1 || vs.Files[0].FilePath != "a.go" {
+1021-		t.Fatalf("Files = %+v, want [a.go]", vs.Files)
+1022-	}
+1023-	if len(vs.SessionTasks) != 1 || vs.SessionTasks[0].FilePath != "__grouping__" {
+1024-		t.Fatalf("SessionTasks = %+v, want [__grouping__]", vs.SessionTasks)
+1025-	}
+1026-	if len(vs.SessionTasks[0].Tasks[GroupingTask]) != 1 {
+1027-		t.Errorf("grouping_task cards = %d, want 1", len(vs.SessionTasks[0].Tasks[GroupingTask]))
+1028:=======
+1029-	writeJSONL(t, filepath.Join(repoDir, "s.jsonl"),
+1030-		`{"type":"session_start","timestamp":"2025-01-01T00:00:00Z","cwd":"/x","model":"m"}`,
+1031-		`{"type":"review_item_done","filePath":"main.go","comments":[`+
+1032-			`{"content":"emoji \u00e9\u4e2d\u6587 finding","path":"main.go","category":"bug","severity":"high"}]}`,
+1033-		`{"type":"session_end","duration_seconds":5}`,
+1034-	)
+1035-
+1036-	first, err := LoadSession(root, "repo", "s")
+1037-	if err != nil {
+1038-		t.Fatal(err)
+1039-	}
+1040-	second, err := LoadSession(root, "repo", "s")
+1041-	if err != nil {
+1042-		t.Fatal(err)
+1043-	}
+1044-	if first.Comments[0].MarkID == "" || first.Comments[0].MarkID != second.Comments[0].MarkID {
+1045-		t.Fatalf("unicode fallback MarkID = %q / %q, want non-empty and stable",
+1046-			first.Comments[0].MarkID, second.Comments[0].MarkID)
+1047:>>>>>>> upstream/main
+1048-	}
+1049-}

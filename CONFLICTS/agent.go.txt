@@ -1,0 +1,108 @@
+===== internal/scan/agent.go =====
+938-		} else {
+939-			planGuidance = a.maybeRunPlan(ctx, it, rule)
+940-		}
+941-		messages = a.renderMessages(it, rule, planGuidance)
+942-	}
+943-
+944-	tokenCount := llmloop.CountMessagesTokens(messages)
+945-	maxAllowed := a.args.Template.MaxTokens
+946-	tokenLimit := llmloop.PromptTokenLimit(maxAllowed)
+947-	if tokenCount > tokenLimit {
+948-		msg := fmt.Sprintf("prompt tokens (%d) exceed %d%% of max_tokens(%d)", tokenCount, 80, maxAllowed)
+949-		fmt.Fprintf(stdout.Writer(), "[ocr] WARNING: %s for %s\n", msg, it.Path)
+950-		a.recordWarning("token_threshold_exceeded", it.Path, msg)
+951-		telemetry.Event(ctx, "token.threshold.exceeded",
+952-			telemetry.AnyToAttr("file.path", it.Path),
+953-			telemetry.AnyToAttr("tokens", tokenCount),
+954-			telemetry.AnyToAttr("max_tokens", maxAllowed))
+955-		return false, "", nil
+956-	}
+957-
+958:<<<<<<< HEAD
+959-	llmloop.BindSessionCheckpoint(a.runner, a.session, fingerprint, planGuidance, a.args.Model, a.templateHash())
+960-	a.runner.SetCompletedRounds(completedRounds)
+961-	completed, stop, err := a.runner.RunPerFile(ctx, messages, it.Path)
+962:=======
+963-	completed, stop, err := a.runner.RunMainTask(ctx, messages, it.Path)
+964:>>>>>>> upstream/main
+965-	if err != nil {
+966-		return false, "", err
+967-	}
+968-	if !completed {
+969-		// Scan sessions opt out of the run manifest, so this one string is the
+970-		// whole diagnostic: it feeds both RecordReviewItemFailed and the
+971-		// scan_subtask_error warning, and under --format json the [ocr] progress
+972-		// lines that would say which exit fired are discarded. Name the trigger
+973-		// via the shared Reason() instead of a second hardcoded sentence, so
+974-		// scan and review never describe the same stop differently. The prefix
+975-		// stays for the resume records and warnings that already match on it.
+976-		return false, "main_task did not complete before stopping: " + stop.Reason(), nil
+977-	}
+978-	return true, "", nil
+979-}
+980-
+981-func (a *Agent) templateHash() string {
+982-	return session.ComputeTemplateHashFrom(&a.args.Template)
+983-}
+984-
+985-func (a *Agent) prepareFileStart(it model.ScanItem) session.FileStart {
+986-	fingerprint := a.scanItemFingerprint(it)
+987-	if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok && len(cp.Messages) > 0 {
+988-		return session.FileStart{
+989-			Mode:         session.ModeContinue,
+990-			Messages:     cp.Messages,
+991-			PlanGuidance: cp.PlanGuidance,
+992-			SeedComments: cp.Comments,
+993-			Round:        cp.Round,
+994-			Checkpoint:   cp,
+995-		}
+996-	}
+997-	if a.args.Resume == nil {
+998-		return session.FileStart{Mode: session.ModeCold}
+999-	}
+1000-	return session.PrepareFileStart(a.args.Resume, fingerprint, it.Path, session.PrepareOpts{
+1001-		ResumeMode:   session.NormalizeResumeMode(a.args.ResumeMode),
+1002-		CurrentModel: a.args.Model,
+1003-		TemplateHash: a.templateHash(),
+1004-	})
+1005-}
+1006-
+1007-// maybeRunPlan invokes PLAN_TASK on the file and returns a human-readable
+1008-// guidance string suitable for {{plan_guidance}} substitution. Returns "(no
+1009-// pre-scan plan; review the entire file as usual)" when planning is
+1010-// disabled or fails — that sentinel is intentionally non-empty so the
+1011-// surrounding "### Pre-scan Focus Areas" header in MAIN_TASK has content
+1012-// instead of dangling.
+1013-func (a *Agent) maybeRunPlan(ctx context.Context, it model.ScanItem, rule string) string {
+1014-	const noPlan = "(no pre-scan plan; review the entire file as usual)"
+1015-
+1016-	if !a.planEnabled() {
+1017-		return noPlan
+1018-	}
+1019-	pt := a.args.Template.PlanTask
+1020-
+1021-	// Render plan messages.
+1022-	messages := make([]llm.Message, 0, len(pt.Messages))
+1023-	for _, m := range pt.Messages {
+1024-		content := m.Content
+1025-		content = strings.ReplaceAll(content, "{{current_system_date_time}}", a.currentDate)
+1026-		content = strings.ReplaceAll(content, "{{current_file_path}}", it.Path)
+1027-		content = strings.ReplaceAll(content, "{{system_rule}}", rule)
+1028-		content = strings.ReplaceAll(content, "{{file_content}}", it.Content)
+1029-		messages = append(messages, llm.NewTextMessage(m.Role, content))
+1030-	}
+1031-
+1032-	fs := a.session.GetOrCreateFileSession(it.Path)
+1033-	rec := fs.AppendTaskRecord(session.PlanTask, messages)
+1034-	ctx = llm.ContextWithSessionKey(ctx,
+1035-		llm.SessionTaskKey(a.session.SessionID, string(session.PlanTask), it.Path))
+1036-	startTime := time.Now()
+1037-
+1038-	resp, err := a.args.LLMClient.CompletionsWithCtx(ctx, llm.ChatRequest{
+1039-		Model:     a.args.Model,
+1040-		Messages:  messages,
+1041-		MaxTokens: a.args.Template.CompletionTokenLimit(),
+1042-	})
+1043-	if err != nil {
+1044-		rec.SetError(err, time.Since(startTime))

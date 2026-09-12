@@ -1,0 +1,290 @@
+===== cmd/opencodereview/scan_cmd.go =====
+8-	"os"
+9-	"path/filepath"
+10-	"strings"
+11-	"time"
+12-
+13-	"github.com/alibaba/open-code-review/internal/config/template"
+14-	"github.com/alibaba/open-code-review/internal/llm"
+15-	"github.com/alibaba/open-code-review/internal/llmloop"
+16-	"github.com/alibaba/open-code-review/internal/model"
+17-	"github.com/alibaba/open-code-review/internal/reviewstore"
+18-	"github.com/alibaba/open-code-review/internal/scan"
+19-	"github.com/alibaba/open-code-review/internal/session"
+20-	"github.com/alibaba/open-code-review/internal/telemetry"
+21-	"github.com/alibaba/open-code-review/internal/tool"
+22-	"github.com/spf13/cobra"
+23-
+24-	"go.opentelemetry.io/otel/codes"
+25-)
+26-
+27-type scanOptions struct {
+28:<<<<<<< HEAD
+29-	toolConfigPath  string
+30-	rulePath        string
+31-	repoDir         string
+32-	paths           string
+33-	excludes        string
+34-	outputFormat    string
+35-	audience        string
+36-	outputPath      string
+37-	background      string
+38-	resume          string // --resume: resume from a previous scan session id
+39-	resumeMode      string // --resume-mode: continue | restart-failed
+40-	saveResult      bool   // --save-result: persist final scan result for the WebUI review viewer
+41-	savePerFile     bool   // --save-per-file: split output into per-file markdown files
+42-	resultDir       string // --result-dir: root directory for persisted scan results
+43-	resultProject   string // --result-project: display project name/path for persisted results
+44-	concurrency     int
+45-	perFileTimeout  int
+46-	maxTools        int
+47-	maxGitProcs     int
+48-	preview         bool
+49-	noPlan          bool
+50-	noDedup         bool
+51-	noSummary       bool
+52-	batch           string
+53-	maxTokens       int
+54-	maxTokensBudget int
+55-	provider        string
+56-	model           string
+57:=======
+58-	toolConfigPath        string
+59-	rulePath              string
+60-	repoDir               string
+61-	paths                 string
+62-	excludes              string
+63-	outputFormat          string
+64-	audience              string
+65-	outputPath            string
+66-	background            string
+67-	concurrency           int
+68-	concurrentTaskTimeout int
+69-	maxTools              int
+70-	maxGitProcs           int
+71-	preview               bool
+72-	noPlan                bool
+73-	noDedup               bool
+74-	noSummary             bool
+75-	batch                 string
+76-	maxTokens             int
+77-	maxTokensBudget       int
+78-	provider              string
+79-	model                 string
+80-	resume                string
+81:>>>>>>> upstream/main
+82-}
+83-
+84-var scanOpts scanOptions
+85-
+86-var scanCmd = &cobra.Command{
+87-	Use:     "scan [flags]",
+88-	Aliases: []string{"s"},
+89-	Short:   "Scan entire files (no diff required)",
+90-	Long:    "OpenCodeReview - Full-File Scan\n\nScan entire files for code review without requiring a diff.",
+91-	Args:    cobra.NoArgs,
+92-	Example: `  # Scan the entire repository
+93-  ocr scan
+94-
+95-  # Scan a single directory
+96-  ocr scan --path internal/agent
+97-
+98-  # Scan multiple files
+99-  ocr scan --path internal/agent/agent.go,internal/diff/scan.go
+100-
+101-  # Exclude generated files / fixtures
+102-  ocr scan --exclude '**/generated/*,**/testdata/*'
+103-
+104-  # Preview which files would be scanned without calling the LLM
+105-  ocr scan --preview
+106-
+107-  # Skip the per-file PLAN_TASK pre-pass
+108-  ocr scan --no-plan`,
+109-	RunE: func(cmd *cobra.Command, args []string) error {
+110-		if err := validateScanOptions(&scanOpts); err != nil {
+111-			return err
+112-		}
+113-		return executeScan(cmd.Context(), scanOpts)
+114-	},
+115-}
+116-
+117-func init() {
+118-	registerScanFlags(scanCmd, &scanOpts)
+119-}
+120-
+121-func splitPaths(raw string) []string {
+122-	if raw == "" {
+123-		return nil
+124-	}
+125-	parts := strings.Split(raw, ",")
+126-	out := make([]string, 0, len(parts))
+127-	for _, p := range parts {
+128-		p = strings.TrimSpace(p)
+129-		if p != "" {
+130-			out = append(out, p)
+131-		}
+132-	}
+133-	return out
+134-}
+135-
+136-func saveScanResult(repoDir string, opts scanOptions, ag *scan.Agent, comments []model.LlmComment, warnings []llmloop.AgentWarning, duration time.Duration, resultID string) (string, string, error) {
+137-	sess := ag.Session()
+138-	if sess == nil {
+139-		return "", "", fmt.Errorf("agent session is nil, cannot save scan result")
+140-	}
+141-	projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(repoDir))
+142-	projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(repoDir))
+143-
+144-	result := reviewstore.Result{
+145-		ID: resultID,
+146-		Project: reviewstore.ProjectInfo{
+147-			ID:      projectID,
+148-			Name:    projectName,
+149-			RepoDir: repoDir,
+150-			WebURL:  os.Getenv("CI_PROJECT_URL"),
+151-		},
+152-		GitLab: reviewstore.GitLabInfo{
+153-			ServerURL:       os.Getenv("CI_SERVER_URL"),
+154-			ProjectID:       projectID,
+155-			MergeRequestIID: os.Getenv("CI_MERGE_REQUEST_IID"),
+156-			PipelineID:      os.Getenv("CI_PIPELINE_ID"),
+157-			JobID:           os.Getenv("CI_JOB_ID"),
+158-		},
+159-		Review: reviewstore.ReviewInfo{
+160-			Mode:             session.ReviewModeFullScan,
+161-			Model:            sess.Model,
+--
+322-		ConcurrentTaskTimeout: opts.concurrentTaskTimeout,
+323-		Model:                 rt.Model,
+324-		Background:            opts.background,
+325-		GitRunner:             cc.GitRunner,
+326-		MaxFileSizeBytes:      scanTpl.MaxFileSizeBytes,
+327-		MaxTokensBudget:       budget,
+328-		SkipPlan:              opts.noPlan,
+329-		SkipDedup:             opts.noDedup,
+330-		SkipSummary:           opts.noSummary,
+331-		Resume:                resumeState,
+332-		ResumeMode:            opts.resumeMode,
+333-		OnFileDone: func(filePath string, comments []model.LlmComment) {
+334-			if perFileWriter != nil {
+335-				if err := perFileWriter.WriteFile(filePath, comments); err != nil {
+336-					fmt.Fprintf(os.Stderr, "[ocr] warning: per-file save failed for %s: %v\n", filePath, err)
+337-				}
+338-			}
+339-		},
+340-	})
+341-
+342:<<<<<<< HEAD
+343-	// Use the session ID as the review result ID so --resume and review
+344-	// result persistence share one consistent identifier.
+345-	reviewID := ag.SessionID()
+346-	setResumeSessionID(ctx, reviewID)
+347-	if opts.savePerFile && reviewID == "" {
+348-		fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save because the session was not persisted\n")
+349-	} else if opts.savePerFile {
+350-		if opts.resultDir == "" {
+351-			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
+352-				opts.resultDir = d
+353-			} else {
+354-				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+355-			}
+356-		}
+357-		projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(cc.RepoDir))
+358-		projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir))
+359-		project := reviewstore.ProjectInfo{
+360-			ID:      projectID,
+361-			Name:    projectName,
+362-			RepoDir: cc.RepoDir,
+363-			WebURL:  os.Getenv("CI_PROJECT_URL"),
+364-		}
+365-		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
+366-		if pfwErr != nil {
+367-			fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save: %v\n", pfwErr)
+368-		} else {
+369-			perFileWriter = pfw
+370-		}
+371-	}
+372:=======
+373-	closeRaw := bindRawWriter(rt.RawHolder, cc.RepoDir, ag.Session())
+374-	defer closeRaw()
+375:>>>>>>> upstream/main
+376-
+377-	q := newQuietHandle(opts.outputFormat, opts.audience)
+378-	defer q.Restore()
+379-
+380-	ctx, span := telemetry.StartSpan(telemetry.ContextWithTraceParentFromEnv(ctx), "scan.run")
+381-	defer span.End()
+382-	var traceID string
+383-	if telemetry.IsEnabled() {
+384-		traceID = telemetry.TraceIDFromContext(ctx)
+385-		if !isMachineReadable(opts.outputFormat) {
+386-			fmt.Fprintf(os.Stderr, "[ocr] TraceID: %s\n", traceID)
+387-		}
+388-	}
+389-	startTime := time.Now()
+390-
+391-	var finalized bool
+392-	defer func() {
+393-		if perFileWriter != nil && !finalized {
+394-			if _, fErr := perFileWriter.Finalize(reviewstore.ReviewInfo{}, reviewstore.GitLabInfo{}, nil); fErr != nil {
+395-				fmt.Fprintf(os.Stderr, "[ocr] warning: failed to finalize partial per-file output: %v\n", fErr)
+396-			}
+397-		}
+398-	}()
+399-
+400-	comments, err := ag.Run(ctx)
+401-	duration := time.Since(startTime)
+402-
+403-	// Persist/emit partial results even when every file fails (e.g. timeout).
+404-	persistScanOutputs(cc.RepoDir, opts, ag, comments, duration, reviewID, perFileWriter, &finalized)
+405-
+406-	if err != nil {
+407-		span.SetStatus(codes.Error, err.Error())
+408-		span.RecordError(err)
+409-		if id := ag.SessionID(); id != "" {
+410-			fmt.Fprintf(os.Stderr, "[ocr] Session: %s (retry with: --resume %s)\n", id, id)
+411-		}
+412-		if len(comments) > 0 {
+413-			fmt.Fprintf(os.Stderr, "[ocr] Wrote %d partial finding(s) before failure\n", len(comments))
+414-		}
+415-		if emitErr := emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity, out, nil); emitErr != nil {
+416-			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to emit partial scan result: %v\n", emitErr)
+417-		}
+418-		return fmt.Errorf("scan failed: %w", err)
+419-	}
+420-
+421-	if failed := ag.SubtaskFailed(); failed > 0 {
+422-		if id := ag.SessionID(); id != "" {
+423-			fmt.Fprintf(os.Stderr, "[ocr] %d file(s) failed — Session: %s (retry with: --resume %s)\n", failed, id, id)
+424-		}
+425-	}
+426-
+427-	return emitRunResult(ctx, ag, comments, duration, opts.outputFormat, opts.audience, q, llmIdentity, out, nil)
+428-}
+429-
+430-func persistScanOutputs(
+431-	repoDir string,
+432-	opts scanOptions,
+433-	ag *scan.Agent,
+434-	comments []model.LlmComment,
+435-	duration time.Duration,
+436-	reviewID string,
+437-	perFileWriter *reviewstore.PerFileWriter,
+438-	finalized *bool,
+439-) {
+440-	if opts.saveResult {
+441-		if opts.resultDir == "" {
+442-			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
+443-				opts.resultDir = d
+444-			} else {
+445-				opts.resultDir = filepath.Join(repoDir, ".opencodereview", "reviews")
+446-			}
+447-		}
+448-		path, mdPath, saveErr := saveScanResult(repoDir, opts, ag, comments, ag.Warnings(), duration, reviewID)
+449-		if saveErr != nil {
+450-			fmt.Fprintf(os.Stderr, "[ocr] warning: failed to save scan result: %v\n", saveErr)
+451-		} else {
+452-			fmt.Fprintf(os.Stderr, "[ocr] JSON saved to: %s\n", path)
+453-			if mdPath != "" {
+454-				fmt.Fprintf(os.Stderr, "[ocr] Markdown report saved to: %s\n", mdPath)
+455-			}
