@@ -4,7 +4,8 @@ on:
     branches:
       - fix/upstream-merge-20260912-work
 permissions:
-  contents: write
+  contents: read
+  issues: write
 jobs:
   merge:
     runs-on: ubuntu-latest
@@ -12,19 +13,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Merge upstream and push
+      - name: Merge upstream and test
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/alibaba/open-code-review.git
           git fetch upstream main
           git merge --no-edit --no-ff upstream/main
-          git push origin HEAD
-      - name: Test
-        run: go test ./...
-      - name: Cleanup helper
+          go test ./...
+      - name: Publish merge commit SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          rm .github/workflows/_resolve_upstream.yml
-          git add -A
-          git commit -m "chore: remove temporary upstream merge helper"
-          git push origin HEAD
+          MERGE_SHA=$(git rev-parse HEAD)
+          gh api repos/tk1cntt/open-code-review/issues/2/comments \
+            -f body="Verified upstream merge commit: ${MERGE_SHA}"
