@@ -18,12 +18,15 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/alibaba/open-code-review.git
           git fetch upstream main
-          git merge --no-edit --no-ff upstream/main
+          if ! git merge --no-edit --no-ff upstream/main; then
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            printf '%s\n' '# Upstream merge conflicts' 'Use this file to resolve the merge on the branch.' '' > MERGE_CONFLICTS.md
+            cat /tmp/conflicts.txt >> MERGE_CONFLICTS.md
+            git merge --abort
+            git add MERGE_CONFLICTS.md
+            git commit -m "chore: record upstream merge conflicts"
+            git push origin HEAD
+            exit 0
+          fi
       - name: Test
         run: go test ./...
-      - name: Remove helper workflow
-        run: |
-          rm .github/workflows/_resolve_upstream.yml
-          git add -A
-          git commit -m "chore: resolve upstream merge conflicts"
-          git push origin HEAD
