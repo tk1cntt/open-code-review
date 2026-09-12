@@ -6,41 +6,115 @@ on:
 permissions:
   contents: write
 jobs:
-  probe:
+  resolve:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Extract per-file conflict hunks
+      - name: Resolve upstream conflicts
+        shell: bash
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/alibaba/open-code-review.git
           git fetch upstream main
-          set +e
-          git merge --no-commit --no-ff upstream/main
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            rm -rf CONFLICTS
-            mkdir CONFLICTS
-            files=$(git diff --name-only --diff-filter=U)
-            for f in $files; do
-              out="CONFLICTS/$(basename "$f").txt"
-              {
-                echo "===== $f ====="
-                grep -n -B20 -A80 '^<<<<<<<\|^=======$\|^>>>>>>> ' "$f" || true
-              } > "$out"
-            done
-            git merge --abort
-            git add CONFLICTS
-            git commit -m "chore: capture per-file upstream conflict hunks"
-            git push origin HEAD
-          else
-            echo NO_CONFLICTS > CONFLICTS.txt
-            git merge --abort
-            git add CONFLICTS.txt
-            git commit -m "chore: record no conflicts"
-            git push origin HEAD
+          git merge --no-commit --no-ff upstream/main || true
+
+          # Start with the dev side for conflict files whose custom behavior must be preserved.
+          git checkout --ours cmd/opencodereview/review_cmd.go cmd/opencodereview/scan_cmd.go internal/scan/agent.go internal/viewer/store.go internal/viewer/store_load_test.go skills/open-code-review/SKILL.md
+          git checkout --ours internal/config/rules/system_rules.json
+
+          # viewer/server and viewer command need upstream's new routing/browser work plus dev's review-result API.
+          git checkout --theirs internal/viewer/server.go
+          git checkout --ours cmd/opencodereview/viewer_cmd.go
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # review_cmd.go: retain dev options and persistence; add upstream timeout name, forced interrupt, raw writer.
+          p = Path('cmd/opencodereview/review_cmd.go'); s = p.read_text()
+          s = s.replace('\tperFileTimeout     int\n', '\tperFileTimeout     int\n\tconcurrentTaskTimeout int\n')
+          s = s.replace('ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)', 'ctx, stop := interruptContextWithForcedExit(cmd.Context())')
+          s = s.replace('ConcurrentTaskTimeout: opts.perFileTimeout,', 'ConcurrentTaskTimeout: func() int { if opts.perFileTimeout != 0 { return opts.perFileTimeout }; return opts.concurrentTaskTimeout }(),')
+          marker = '\t// Silence progress output during execution; restored before the trace\n'
+          inject = '\tcloseRaw := bindRawWriter(rt.RawHolder, cc.RepoDir, ag.Session())\n\tdefer closeRaw()\n\n'
+          if inject not in s:
+              s = s.replace(marker, inject + marker)
+          p.write_text(s)
+
+          # scan_cmd.go: preserve dev persistence/resume fields and add upstream raw writer + timeout alias.
+          p = Path('cmd/opencodereview/scan_cmd.go'); s = p.read_text()
+          s = s.replace('\tperFileTimeout  int\n', '\tperFileTimeout  int\n\tconcurrentTaskTimeout int\n')
+          s = s.replace('ConcurrentTaskTimeout: opts.perFileTimeout,', 'ConcurrentTaskTimeout: func() int { if opts.perFileTimeout != 0 { return opts.perFileTimeout }; return opts.concurrentTaskTimeout }(),')
+          marker = '\tq := newQuietHandle(opts.outputFormat, opts.audience)\n'
+          inject = '\tcloseRaw := bindRawWriter(rt.RawHolder, cc.RepoDir, ag.Session())\n\tdefer closeRaw()\n\n'
+          if inject not in s:
+              s = s.replace(marker, inject + marker)
+          p.write_text(s)
+
+          # viewer_cmd.go: keep reviews-dir and add upstream browser open mode.
+          p = Path('cmd/opencodereview/viewer_cmd.go'); s = p.read_text()
+          s = s.replace('\taddr       string\n\treviewsDir string\n', '\taddr       string\n\treviewsDir string\n\topen       string\n')
+          s = s.replace('ocr viewer --reviews-dir /path/to/reviews`,', 'ocr viewer --reviews-dir /path/to/reviews\n  ocr viewer --open=always`,')
+          s = s.replace('ReviewsDir: viewerOpts.reviewsDir,', 'ReviewsDir: viewerOpts.reviewsDir,\n\t\t\tOpen:       viewerOpts.open,')
+          s = s.replace('viewerCmd.Flags().StringVar(&viewerOpts.reviewsDir, "reviews-dir", "", "root directory for review result JSON files (env: OCR_REVIEWS_DIR)")', 'viewerCmd.Flags().StringVar(&viewerOpts.reviewsDir, "reviews-dir", "", "root directory for review result JSON files (env: OCR_REVIEWS_DIR)")\n\tviewerCmd.Flags().StringVar(&viewerOpts.open, "open", viewer.OpenAuto, "when to open the browser: auto, always, or never")\n\tviewerCmd.RegisterFlagCompletionFunc("open", completeEnum(viewer.OpenAuto, viewer.OpenAlways, viewer.OpenNever))')
+          p.write_text(s)
+
+          # viewer/server.go: wrap upstream StartServer with ServerOptions and inject dev review API registration.
+          p = Path('internal/viewer/server.go'); s = p.read_text()
+          old = 'func StartServer(addr, openMode string) error {'
+          new = '''type ServerOptions struct {\n\tAddr string\n\tReviewsDir string\n\tOpen string\n}\n\nfunc StartServer(addr, openMode string) error {\n\treturn StartServerWithOptions(ServerOptions{Addr: addr, Open: openMode})\n}\n\nfunc StartServerWithOptions(opts ServerOptions) error {\n\taddr := opts.Addr\n\topenMode := opts.Open\n'''
+          if old in s:
+              s = s.replace(old, new, 1)
+          s = s.replace('\tmux := newMux(root)\n', '''\treviewsRoot := opts.ReviewsDir\n\tif reviewsRoot == "" {\n\t\treviewsRoot = os.Getenv("OCR_REVIEWS_DIR")\n\t}\n\n\tmux := newMux(root)\n\tif reviewsRoot != "" {\n\t\tmux.HandleFunc("GET /api/reviews", func(w http.ResponseWriter, r *http.Request) { handleAPIReviews(w, r, reviewsRoot) })\n\t\tmux.HandleFunc("GET /api/reviews/{project}", func(w http.ResponseWriter, r *http.Request) { project := r.PathValue("project"); if !isValidPathSegment(project) { writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid project")); return }; handleAPIProjectReviews(w, r, reviewsRoot, project) })\n\t\tmux.HandleFunc("GET /api/reviews/{project}/{reviewID}", func(w http.ResponseWriter, r *http.Request) { project := r.PathValue("project"); reviewID := r.PathValue("reviewID"); if !isValidPathSegment(project) || !isValidPathSegment(reviewID) { writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid path")); return }; handleAPIReviewDetail(w, r, reviewsRoot, project, reviewID) })\n\t}\n''', 1)
+          p.write_text(s)
+
+          # system_rules.json: add upstream rego mapping while preserving dev mappings.
+          p = Path('internal/config/rules/system_rules.json'); s = p.read_text()
+          s = s.replace('"**/*.vy": "vyper.md"\n', '"**/*.vy": "vyper.md",\n    "**/*.rego": "rego.md"\n') if '"**/*.vy": "vyper.md"\n' in s else s
+          p.write_text(s)
+
+          # viewer/store.go: retain dev ReviewFinding and add upstream path sanitizer + stable MarkID.
+          p = Path('internal/viewer/store.go'); s = p.read_text()
+          if 'func safeSegment(s string)' not in s:
+              marker = '\n// LoadSession fully parses a JSONL file into a ViewSession.\n'
+              helper = '''\n// safeSegment validates that s is safe to use as a single path component.\nfunc safeSegment(s string) (string, error) {\n\tif s == "" || strings.Contains(s, "..") || strings.ContainsAny(s, `/\\\\`) {\n\t\treturn "", fmt.Errorf("invalid path segment: %q", s)\n\t}\n\treturn s, nil\n}\n'''
+              s = s.replace(marker, helper + marker)
+          s = s.replace('\t\t\t\t\tif rc.Content == "" && rc.SuggestionCode == "" {\n\t\t\t\t\t\tcontinue\n\t\t\t\t\t}\n', '\t\t\t\t\trc.MarkID = commentMarkID(recUUID, ci, rc, markOccurrences)\n\t\t\t\t\tif rc.Content == "" && rc.SuggestionCode == "" {\n\t\t\t\t\t\tcontinue\n\t\t\t\t\t}\n')
+          s = s.replace('path := filepath.Join(root, encodedRepo, sessionID+".jsonl")', 'path := filepath.Join(root, encodedRepo, sessionID+".jsonl")')
+          p.write_text(s)
+
+          # store_load_test.go: keep dev grouping test and add a compact MarkID stability test.
+          p = Path('internal/viewer/store_load_test.go'); s = p.read_text()
+          if 'TestLoadSession_MarkIDStableAndDistinct_Merge' not in s:
+              s += '''\n\nfunc TestLoadSession_MarkIDStableAndDistinct_Merge(t *testing.T) {\n\troot := t.TempDir()\n\trepoDir := filepath.Join(root, "repo")\n\tif err := os.MkdirAll(repoDir, 0755); err != nil { t.Fatal(err) }\n\twriteJSONL(t, filepath.Join(repoDir, "s.jsonl"),\n\t\t`{"type":"session_start","timestamp":"2025-01-01T00:00:00Z","cwd":"/x","model":"m"}`,\n\t\t`{"type":"review_item_done","uuid":"11111111-2222-3333-4444-555555555555","filePath":"main.go","comments":[{"content":"one","path":"main.go"},{"content":"two","path":"main.go"}]}`,\n\t\t`{"type":"session_end","duration_seconds":1}`,\n\t)\n\ta, err := LoadSession(root, "repo", "s"); if err != nil { t.Fatal(err) }\n\tb, err := LoadSession(root, "repo", "s"); if err != nil { t.Fatal(err) }\n\tif len(a.Comments) != 2 || len(b.Comments) != 2 { t.Fatalf("comments = %d/%d, want 2/2", len(a.Comments), len(b.Comments)) }\n\tif a.Comments[0].MarkID == "" || a.Comments[0].MarkID != b.Comments[0].MarkID || a.Comments[1].MarkID != b.Comments[1].MarkID || a.Comments[0].MarkID == a.Comments[1].MarkID { t.Fatalf("unstable/non-distinct MarkIDs: %#v", []string{a.Comments[0].MarkID, a.Comments[1].MarkID}) }\n}\n'''
+          p.write_text(s)
+
+          # scan agent: choose dev checkpoint-aware runner intentionally; no further patch needed.
+
+          # skill: preserve dev resume/apply/save documentation and retain upstream upgrade guidance.
+          p = Path('skills/open-code-review/SKILL.md'); s = p.read_text()
+          s = s.replace('-- **Output file**: use `--output <path>` to write the full result to a file instead of stdout. If the command fails with `unknown flag: --output`, do not continue the review with plain stdout. Ask the user whether to upgrade (`npm i -g @alibaba-group/open-code-review@latest`) and wait for the answer before proceeding. After the user confirms and the upgrade succeeds, rerun with `--output`.', '-- **Output file**: `--output <path>` / `-o` writes results to a UTF-8 file (default: stdout). If the command fails with `unknown flag: --output`, upgrade to the latest CLI before continuing.')
+          p.write_text(s)
+          PY
+
+          # Validate and clean temporary probe artifacts/workflow before committing the merge.
+          rm -rf CONFLICTS CONFLICT_HUNKS.txt MERGE_CONFLICTS.txt
+          rm -f .github/workflows/_conflict_probe.yml
+
+          # Resolve any remaining unmerged entries (all intentional choices above).
+          git add -A
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "Unresolved merge conflicts remain:" >&2
+            git diff --name-only --diff-filter=U >&2
+            exit 1
           fi
+
+          gofmt -w cmd/opencodereview/review_cmd.go cmd/opencodereview/scan_cmd.go cmd/opencodereview/viewer_cmd.go internal/scan/agent.go internal/viewer/server.go internal/viewer/store.go internal/viewer/store_load_test.go
+          python3 -m json.tool internal/config/rules/system_rules.json >/dev/null
+          go test ./...
+          git add -A
+          git commit -m "chore: resolve dev merge conflicts with upstream main"
+          git push origin HEAD
