@@ -24,12 +24,19 @@ jobs:
           set -e
           if [ "$rc" -ne 0 ]; then
             git diff --name-only --diff-filter=U > MERGE_CONFLICTS.txt
-            git status --short >> MERGE_CONFLICTS.txt
+            printf '\n\n# Combined conflict diff\n\n' >> MERGE_CONFLICTS.txt
+            git diff --cc >> MERGE_CONFLICTS.txt
+            for f in $(git diff --name-only --diff-filter=U); do
+              printf '\n\n===== %s : OURS (:2) =====\n' "$f" >> MERGE_CONFLICTS.txt
+              git show ":2:$f" >> MERGE_CONFLICTS.txt
+              printf '\n\n===== %s : THEIRS (:3) =====\n' "$f" >> MERGE_CONFLICTS.txt
+              git show ":3:$f" >> MERGE_CONFLICTS.txt
+            done
             git merge --abort
           else
             echo "NO CONFLICTS" > MERGE_CONFLICTS.txt
             git merge --abort
           fi
           git add MERGE_CONFLICTS.txt
-          git commit -m "chore: record dev upstream merge conflicts"
+          git commit -m "chore: record detailed dev upstream merge conflicts"
           git push origin HEAD
