@@ -1,0 +1,1308 @@
+
+===== cmd/opencodereview/review_cmd.go =====
+4-	"context"
+5-	"errors"
+6-	"fmt"
+7-	"io"
+8-	"os"
+9-	"path/filepath"
+10-	"sort"
+11-	"strings"
+12-	"time"
+13-
+14-	"github.com/alibaba/open-code-review/internal/agent"
+15-	"github.com/alibaba/open-code-review/internal/diff"
+16-	"github.com/alibaba/open-code-review/internal/llm"
+17-	"github.com/alibaba/open-code-review/internal/mcp"
+18-	"github.com/alibaba/open-code-review/internal/model"
+19-	"github.com/alibaba/open-code-review/internal/reviewstore"
+20-	"github.com/alibaba/open-code-review/internal/session"
+21-	"github.com/alibaba/open-code-review/internal/telemetry"
+22-	"github.com/alibaba/open-code-review/internal/tool"
+23-	"github.com/spf13/cobra"
+24-
+25-	"go.opentelemetry.io/otel/codes"
+26-)
+27-
+28-type reviewOptions struct {
+29:<<<<<<< ours
+30-	toolConfigPath     string
+31-	rulePath           string
+32-	repoDir            string
+33-	from               string
+34-	to                 string
+35-	commit             string
+36-	resume             string
+37-	resumeMode         string
+38-	excludes           string
+39-	outputFormat       string
+40-	audience           string
+41-	outputPath         string
+42-	background         string
+43-	backgroundFile     string
+44-	provider           string
+45-	model              string
+46-	concurrency        int
+47-	perFileTimeout     int
+48-	maxTools           int
+49-	maxGitProcs        int
+50-	maxTokens          int
+51-	maxTokensBudget    int
+52-	effort             string
+53-	noFilter           bool
+54-	preview            bool
+--
+63-||||||| base
+64-	toolConfigPath  string
+65-	rulePath        string
+66-	repoDir         string
+67-	from            string
+68-	to              string
+69-	commit          string
+70-	resume          string
+71-	excludes        string
+72-	outputFormat    string
+73-	audience        string
+74-	outputPath      string
+75-	background      string
+76-	backgroundFile  string
+77-	provider        string
+78-	model           string
+79-	concurrency     int
+80-	perFileTimeout  int
+81-	maxTools        int
+82-	maxGitProcs     int
+83-	maxTokens       int
+84-	maxTokensBudget int
+85-	effort          string
+86-	noFilter        bool
+87-	preview         bool
+88:=======
+89-	toolConfigPath        string
+90-	rulePath              string
+91-	repoDir               string
+92-	from                  string
+93-	to                    string
+94-	commit                string
+95-	resume                string
+96-	excludes              string
+97-	outputFormat          string
+98-	audience              string
+99-	outputPath            string
+100-	background            string
+101-	backgroundFile        string
+102-	provider              string
+103-	model                 string
+104-	concurrency           int
+105-	concurrentTaskTimeout int
+106-	maxTools              int
+107-	maxGitProcs           int
+108-	maxTokens             int
+109-	maxTokensBudget       int
+110-	effort                string
+111-	noFilter              bool
+112-	preview               bool
+113:>>>>>>> theirs
+114-}
+115-
+116-var reviewOpts reviewOptions
+117-
+118-var reviewCmd = &cobra.Command{
+119-	Use:     "review [flags]",
+120-	Aliases: []string{"r"},
+121-	Short:   "Start a diff-based code review",
+122-	Long:    "OpenCodeReview - AI-Powered Code Review CLI\n\nStart a diff-based code review using a configurable LLM.",
+123-	Args:    cobra.NoArgs,
+124-	Example: `  # Review staged + unstaged + untracked changes in current workspace
+125-  ocr review
+126-
+127-  # Review a branch against its base (merge-base mode)
+128-  ocr review --from master --to dev-ref
+129-
+130-  # Review a specific commit
+131-  ocr review --commit abc123
+132-  ocr review -c abc123
+133-
+134-  # Resume a previous range review
+135-  ocr review --from master --to dev-ref --resume <session-id>
+136-
+137-  # Output JSON format
+138-  ocr review --format json
+--
+308-		CommentCollector:      rt.Collector,
+309-		CommentWorkerPool:     agent.NewCommentWorkerPool(opts.concurrency),
+310-		MaxConcurrency:        opts.concurrency,
+311-		ConcurrentTaskTimeout: opts.concurrentTaskTimeout,
+312-		Model:                 rt.Model,
+313-		Provider:              rt.Provider,
+314-		Background:            opts.background,
+315-		GitRunner:             cc.GitRunner,
+316-		Resume:                resumeState,
+317-		ResumeMode:            opts.resumeMode,
+318-		SealedInput:           sealedInput,
+319-		MaxTokensBudget:       int64(opts.maxTokensBudget),
+320-		Apply:                 opts.apply,
+321-		ApplyToolDefs:         applyToolDefs,
+322-		SkipFilter:            opts.noFilter,
+323-		OnFileDone: func(filePath string, comments []model.LlmComment) {
+324-			if perFileWriter != nil {
+325-				if err := perFileWriter.WriteFile(filePath, comments); err != nil {
+326-					fmt.Fprintf(os.Stderr, "[ocr] warning: per-file save failed for %s: %v\n", filePath, err)
+327-				}
+328-			}
+329-		},
+330-		RuntimeConfig: rt.RuntimeConfig,
+331-	})
+332-
+333:<<<<<<< ours
+334-	// Use the session ID as the review result ID so --resume and review
+335-	// result persistence share one consistent identifier.
+336-	reviewID := ag.SessionID()
+337-	setResumeSessionID(ctx, reviewID)
+338-	if opts.savePerFile && reviewID == "" {
+339-		fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save because the session was not persisted\n")
+340-	} else if opts.savePerFile {
+341-		if opts.resultDir == "" {
+342-			opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+343-		}
+344-		projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(cc.RepoDir))
+345-		projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir))
+346-		project := reviewstore.ProjectInfo{
+347-			ID:      projectID,
+348-			Name:    projectName,
+349-			RepoDir: cc.RepoDir,
+350-			WebURL:  os.Getenv("CI_PROJECT_URL"),
+351-		}
+352-		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
+353-		if pfwErr != nil {
+354-			fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save: %v\n", pfwErr)
+355-		} else {
+356-			perFileWriter = pfw
+357-		}
+358-	}
+359-
+360-||||||| base
+361:=======
+362-	closeRaw := bindRawWriter(rt.RawHolder, cc.RepoDir, ag.Session())
+363-	defer closeRaw()
+364-
+365:>>>>>>> theirs
+366-	// Silence progress output during execution; restored before the trace
+367-	// summary in agent-text mode (and on function exit otherwise).
+368-	q := newQuietHandle(opts.outputFormat, opts.audience)
+369-	defer q.Restore()
+370-
+371-	runCtx, span := telemetry.StartSpan(telemetry.ContextWithTraceParentFromEnv(ctx), "review.run")
+372-	defer span.End()
+373-	telemetry.SetAttr(span, "review.repo", cc.RepoDir)
+374-	telemetry.SetAttr(span, "review.from", opts.from)
+375-	telemetry.SetAttr(span, "review.to", opts.to)
+376-	telemetry.SetAttr(span, "review.model", rt.Model)
+377-	var traceID string
+378-	if telemetry.IsEnabled() {
+379-		traceID = telemetry.TraceIDFromContext(runCtx)
+380-		if !isMachineReadable(opts.outputFormat) {
+381-			fmt.Fprintf(os.Stderr, "[ocr] TraceID: %s\n", traceID)
+382-		}
+383-	}
+384-	startTime := time.Now()
+385-
+386-	var finalized bool
+387-	defer func() {
+388-		if perFileWriter != nil && !finalized {
+389-			if _, fErr := perFileWriter.Finalize(reviewstore.ReviewInfo{}, reviewstore.GitLabInfo{}, nil); fErr != nil {
+390-				fmt.Fprintf(os.Stderr, "[ocr] warning: failed to finalize partial per-file output: %v\n", fErr)
+
+===== cmd/opencodereview/scan_cmd.go =====
+3-import (
+4-	"context"
+5-	"errors"
+6-	"fmt"
+7-	"io"
+8-	"os"
+9-	"path/filepath"
+10-	"strings"
+11-	"time"
+12-
+13-	"github.com/alibaba/open-code-review/internal/config/template"
+14-	"github.com/alibaba/open-code-review/internal/llm"
+15-	"github.com/alibaba/open-code-review/internal/llmloop"
+16-	"github.com/alibaba/open-code-review/internal/model"
+17-	"github.com/alibaba/open-code-review/internal/reviewstore"
+18-	"github.com/alibaba/open-code-review/internal/scan"
+19-	"github.com/alibaba/open-code-review/internal/session"
+20-	"github.com/alibaba/open-code-review/internal/telemetry"
+21-	"github.com/alibaba/open-code-review/internal/tool"
+22-	"github.com/spf13/cobra"
+23-
+24-	"go.opentelemetry.io/otel/codes"
+25-)
+26-
+27-type scanOptions struct {
+28:<<<<<<< ours
+29-	toolConfigPath  string
+30-	rulePath        string
+31-	repoDir         string
+32-	paths           string
+33-	excludes        string
+34-	outputFormat    string
+35-	audience        string
+36-	outputPath      string
+37-	background      string
+38-	resume          string // --resume: resume from a previous scan session id
+39-	resumeMode      string // --resume-mode: continue | restart-failed
+40-	saveResult      bool   // --save-result: persist final scan result for the WebUI review viewer
+41-	savePerFile     bool   // --save-per-file: split output into per-file markdown files
+42-	resultDir       string // --result-dir: root directory for persisted scan results
+43-	resultProject   string // --result-project: display project name/path for persisted results
+44-	concurrency     int
+45-	perFileTimeout  int
+46-	maxTools        int
+47-	maxGitProcs     int
+48-	preview         bool
+49-	noPlan          bool
+50-	noDedup         bool
+51-	noSummary       bool
+52-	batch           string
+53-	maxTokens       int
+--
+56-	model           string
+57-||||||| base
+58-	toolConfigPath  string
+59-	rulePath        string
+60-	repoDir         string
+61-	paths           string
+62-	excludes        string
+63-	outputFormat    string
+64-	audience        string
+65-	outputPath      string
+66-	background      string
+67-	concurrency     int
+68-	perFileTimeout  int
+69-	maxTools        int
+70-	maxGitProcs     int
+71-	preview         bool
+72-	noPlan          bool
+73-	noDedup         bool
+74-	noSummary       bool
+75-	batch           string
+76-	maxTokens       int
+77-	maxTokensBudget int
+78-	provider        string
+79-	model           string
+80-	resume          string
+81:=======
+82-	toolConfigPath        string
+83-	rulePath              string
+84-	repoDir               string
+85-	paths                 string
+86-	excludes              string
+87-	outputFormat          string
+88-	audience              string
+89-	outputPath            string
+90-	background            string
+91-	concurrency           int
+92-	concurrentTaskTimeout int
+93-	maxTools              int
+94-	maxGitProcs           int
+95-	preview               bool
+96-	noPlan                bool
+97-	noDedup               bool
+98-	noSummary             bool
+99-	batch                 string
+100-	maxTokens             int
+101-	maxTokensBudget       int
+102-	provider              string
+103-	model                 string
+104-	resume                string
+105:>>>>>>> theirs
+106-}
+107-
+108-var scanOpts scanOptions
+109-
+110-var scanCmd = &cobra.Command{
+111-	Use:     "scan [flags]",
+112-	Aliases: []string{"s"},
+113-	Short:   "Scan entire files (no diff required)",
+114-	Long:    "OpenCodeReview - Full-File Scan\n\nScan entire files for code review without requiring a diff.",
+115-	Args:    cobra.NoArgs,
+116-	Example: `  # Scan the entire repository
+117-  ocr scan
+118-
+119-  # Scan a single directory
+120-  ocr scan --path internal/agent
+121-
+122-  # Scan multiple files
+123-  ocr scan --path internal/agent/agent.go,internal/diff/scan.go
+124-
+125-  # Exclude generated files / fixtures
+126-  ocr scan --exclude '**/generated/*,**/testdata/*'
+127-
+128-  # Preview which files would be scanned without calling the LLM
+129-  ocr scan --preview
+130-
+--
+341-		Tools:                 tools,
+342-		MainToolDefs:          scanToolDefs,
+343-		CommentCollector:      rt.Collector,
+344-		CommentWorkerPool:     llmloop.NewCommentWorkerPool(opts.concurrency),
+345-		MaxConcurrency:        opts.concurrency,
+346-		ConcurrentTaskTimeout: opts.concurrentTaskTimeout,
+347-		Model:                 rt.Model,
+348-		Background:            opts.background,
+349-		GitRunner:             cc.GitRunner,
+350-		MaxFileSizeBytes:      scanTpl.MaxFileSizeBytes,
+351-		MaxTokensBudget:       budget,
+352-		SkipPlan:              opts.noPlan,
+353-		SkipDedup:             opts.noDedup,
+354-		SkipSummary:           opts.noSummary,
+355-		Resume:                resumeState,
+356-		ResumeMode:            opts.resumeMode,
+357-		OnFileDone: func(filePath string, comments []model.LlmComment) {
+358-			if perFileWriter != nil {
+359-				if err := perFileWriter.WriteFile(filePath, comments); err != nil {
+360-					fmt.Fprintf(os.Stderr, "[ocr] warning: per-file save failed for %s: %v\n", filePath, err)
+361-				}
+362-			}
+363-		},
+364-	})
+365-
+366:<<<<<<< ours
+367-	// Use the session ID as the review result ID so --resume and review
+368-	// result persistence share one consistent identifier.
+369-	reviewID := ag.SessionID()
+370-	setResumeSessionID(ctx, reviewID)
+371-	if opts.savePerFile && reviewID == "" {
+372-		fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save because the session was not persisted\n")
+373-	} else if opts.savePerFile {
+374-		if opts.resultDir == "" {
+375-			if d := os.Getenv("OCR_REVIEWS_DIR"); d != "" {
+376-				opts.resultDir = d
+377-			} else {
+378-				opts.resultDir = filepath.Join(cc.RepoDir, ".opencodereview", "reviews")
+379-			}
+380-		}
+381-		projectName := firstNonEmpty(opts.resultProject, os.Getenv("CI_PROJECT_PATH"), filepath.Base(cc.RepoDir))
+382-		projectID := firstNonEmpty(os.Getenv("CI_PROJECT_ID"), filepath.Base(cc.RepoDir))
+383-		project := reviewstore.ProjectInfo{
+384-			ID:      projectID,
+385-			Name:    projectName,
+386-			RepoDir: cc.RepoDir,
+387-			WebURL:  os.Getenv("CI_PROJECT_URL"),
+388-		}
+389-		pfw, pfwErr := reviewstore.NewPerFileWriter(opts.resultDir, project, reviewID)
+390-		if pfwErr != nil {
+391-			fmt.Fprintf(os.Stderr, "[ocr] warning: skipping per-file save: %v\n", pfwErr)
+392-		} else {
+393-			perFileWriter = pfw
+394-		}
+395-	}
+396-
+397-||||||| base
+398:=======
+399-	closeRaw := bindRawWriter(rt.RawHolder, cc.RepoDir, ag.Session())
+400-	defer closeRaw()
+401-
+402:>>>>>>> theirs
+403-	q := newQuietHandle(opts.outputFormat, opts.audience)
+404-	defer q.Restore()
+405-
+406-	ctx, span := telemetry.StartSpan(telemetry.ContextWithTraceParentFromEnv(ctx), "scan.run")
+407-	defer span.End()
+408-	var traceID string
+409-	if telemetry.IsEnabled() {
+410-		traceID = telemetry.TraceIDFromContext(ctx)
+411-		if !isMachineReadable(opts.outputFormat) {
+412-			fmt.Fprintf(os.Stderr, "[ocr] TraceID: %s\n", traceID)
+413-		}
+414-	}
+415-	startTime := time.Now()
+416-
+417-	var finalized bool
+418-	defer func() {
+419-		if perFileWriter != nil && !finalized {
+420-			if _, fErr := perFileWriter.Finalize(reviewstore.ReviewInfo{}, reviewstore.GitLabInfo{}, nil); fErr != nil {
+421-				fmt.Fprintf(os.Stderr, "[ocr] warning: failed to finalize partial per-file output: %v\n", fErr)
+422-			}
+423-		}
+424-	}()
+425-
+426-	comments, err := ag.Run(ctx)
+427-	duration := time.Since(startTime)
+
+===== cmd/opencodereview/viewer_cmd.go =====
+1-// SPDX-License-Identifier: Apache-2.0
+2-// Copyright 2026 alibaba/open-code-review Contributors
+3-
+4-package main
+5-
+6-import (
+7:<<<<<<< ours
+8-	"fmt"
+9-	"os"
+10-
+11-||||||| base
+12-	"fmt"
+13-
+14:=======
+15:>>>>>>> theirs
+16-	"github.com/alibaba/open-code-review/internal/viewer"
+17-	"github.com/spf13/cobra"
+18-)
+19-
+20-type viewerOptions struct {
+21:<<<<<<< ours
+22-	addr       string
+23-	reviewsDir string
+24-||||||| base
+25-	addr string
+26:=======
+27-	addr string
+28-	open string
+29:>>>>>>> theirs
+30-}
+31-
+32-var viewerOpts viewerOptions
+33-
+34-var viewerCmd = &cobra.Command{
+35-	Use:     "viewer [flags]",
+36-	Aliases: []string{"v"},
+37-	Short:   "Start the WebUI session viewer",
+38-	Long:    "Session history WebUI viewer.",
+39-	Args:    cobra.NoArgs,
+40:<<<<<<< ours
+41-	Example: `  ocr viewer                     # start on default port
+42-  ocr viewer --addr :3000        # bind to all interfaces on port 3000
+43-  ocr viewer --reviews-dir /path/to/reviews`,
+44-||||||| base
+45-	Example: `  ocr viewer                     # start on default port
+46-  ocr viewer --addr :3000        # bind to all interfaces on port 3000`,
+47:=======
+48-	Example: `  ocr viewer                     # start and open the browser
+49-  ocr viewer --addr :3000        # bind to all interfaces on port 3000
+50-  ocr viewer --open=never        # just print the URL
+51-  ocr viewer --open=always       # force it when auto declines (piped output, WSL)`,
+52:>>>>>>> theirs
+53-	RunE: func(cmd *cobra.Command, args []string) error {
+54:<<<<<<< ours
+55-		if viewerOpts.reviewsDir == "" {
+56-			viewerOpts.reviewsDir = os.Getenv("OCR_REVIEWS_DIR")
+57-		}
+58-		fmt.Printf("Open Code Review Viewer starting on http://%s\n", viewer.DisplayAddr(viewerOpts.addr))
+59-		return viewer.StartServerWithOptions(viewer.ServerOptions{
+60-			Addr:       viewerOpts.addr,
+61-			ReviewsDir: viewerOpts.reviewsDir,
+62-		})
+63-||||||| base
+64-		fmt.Printf("Open Code Review Viewer starting on http://%s\n", viewer.DisplayAddr(viewerOpts.addr))
+65-		return viewer.StartServer(viewerOpts.addr)
+66:=======
+67-		if err := viewer.ValidateOpenMode(viewerOpts.open); err != nil {
+68-			return err
+69-		}
+70-		return viewer.StartServer(viewerOpts.addr, viewerOpts.open)
+71:>>>>>>> theirs
+72-	},
+73-}
+74-
+75-func init() {
+76-	viewerCmd.Flags().StringVar(&viewerOpts.addr, "addr", "localhost:5483", "listen address")
+77:<<<<<<< ours
+78-	viewerCmd.Flags().StringVar(&viewerOpts.reviewsDir, "reviews-dir", "", "root directory for review result JSON files (env: OCR_REVIEWS_DIR)")
+79-||||||| base
+80:=======
+81-	viewerCmd.Flags().StringVar(&viewerOpts.open, "open", viewer.OpenAuto,
+82-		"when to open the browser: auto (only on a local terminal with a display), always, or never")
+83-	viewerCmd.RegisterFlagCompletionFunc("open", completeEnum(viewer.OpenAuto, viewer.OpenAlways, viewer.OpenNever))
+84:>>>>>>> theirs
+85-}
+
+===== internal/config/rules/system_rules.json =====
+39-    "**/*.dart": "dart.md",
+40-    "**/*.swift": "swift.md",
+41-    "**/*.{rb,rake}": "ruby.md",
+42-    "**/Gemfile": "ruby.md",
+43-    "**/*.gemspec": "ruby.md",
+44-    "**/config.ru": "ruby.md",
+45-    "**/*.{fs,fsx}": "fsharp.md",
+46-    "**/*.{pl,pm,t,psgi,cgi}": "perl.md",
+47-    "**/*.vue": "vue.md",
+48-    "**/*.{css,scss,sass,less,html,svelte}": "web.md",
+49-    "**/*.nix": "nix.md",
+50-    "**/*.{hs,lhs}": "haskell.md",
+51-    "**/*.{nim,nims,nimble}": "nim.md",
+52-    "**/*.elm": "elm.md",
+53-    "**/*.{jsonnet,libsonnet}": "jsonnet.md",
+54-    "**/*.zig": "zig.md",
+55-    "**/*.thrift": "thrift.md",
+56-    "**/*.capnp": "capnp.md",
+57-    "**/*.{ml,mli}": "ocaml.md",
+58-    "**/*.{re,rei}": "ocaml.md",
+59-    "**/*.{v,sv,vh}": "verilog.md",
+60-    "**/*.{vhd,vhdl}": "vhdl.md",
+61-    "**/*.m": "matlab.md",
+62-    "**/*.mm": "objc.md",
+63-    "**/*.sol": "solidity.md",
+64:<<<<<<< ours
+65-    "**/*.vy": "vyper.md"
+66-  },
+67-  "default_refactor_rule": "refactoring/common.md",
+68-  "refactor_rule_map": {
+69-    "**/*.properties": "refactoring/properties.md",
+70-    "**/*{mapper,dao}*.xml": "refactoring/mapper_dao_xml.md",
+71-    "**/pom.xml": "refactoring/pom_xml.md",
+72-    "**/build.gradle": "refactoring/build_gradle.md",
+73-    "**/package.json": "refactoring/package_json.md",
+74-    "**/Cargo.toml": "refactoring/cargo_toml.md",
+75-    "**/composer.json": "refactoring/composer_json.md",
+76-    "**/*.{json,json5}": "refactoring/json.md",
+77-    ".github/workflows/**/*.{yaml,yml}": "refactoring/github_workflows.md",
+78-    ".github/**/*.{yaml,yml}": "refactoring/github_config.md",
+79-    "**/*.{yaml,yml}": "refactoring/yaml.md",
+80-    "**/*.java": "refactoring/java.md",
+81-    "**/*.go": "refactoring/go.md",
+82-    "**/*.{ftl,ftlh,ftlx}": "refactoring/freemarker.md",
+83-    "**/*.ets": "refactoring/arkts.md",
+84-    "**/*.astro": "refactoring/astro.md",
+85-    "**/*.{ts,js,tsx,jsx}": "refactoring/ts_js_tsx_jsx.md",
+86-    "**/*.{kt}": "refactoring/kotlin.md",
+87-    "**/*.rs": "refactoring/rust.md",
+88-    "**/*.{cpp,cc,hpp}": "refactoring/cpp.md",
+89-    "**/*.c": "refactoring/c.md",
+--
+144-  "refactor_profile_map": {
+145-    "**/*.java": "jvm",
+146-    "**/*.{kt}": "jvm",
+147-    "**/*.go": "go_idiomatic",
+148-    "**/*.rs": "systems",
+149-    "**/*.{cpp,cc,hpp}": "systems",
+150-    "**/*.c": "systems",
+151-    "**/*.py": "scripting",
+152-    "**/*.{php,phtml}": "scripting",
+153-    "**/*.{rb,rake}": "scripting",
+154-    "**/Gemfile": "scripting",
+155-    "**/*.gemspec": "scripting",
+156-    "**/config.ru": "scripting",
+157-    "**/*.{pl,pm,t,psgi,cgi}": "scripting",
+158-    "**/*.jl": "scripting",
+159-    "**/*.{ts,js,tsx,jsx}": "react_web",
+160-    "**/*.vue": "react_web",
+161-    "**/*.astro": "react_web",
+162-    "**/*.ets": "react_web",
+163-    "**/*.{cs,csx}": "dotnet",
+164-    "**/*.{fs,fsx}": "dotnet",
+165-    "**/*.dart": "mobile",
+166-    "**/*.swift": "mobile"
+167-||||||| base
+168-    "**/*.vy": "vyper.md"
+169:=======
+170-    "**/*.vy": "vyper.md",
+171-    "**/*.rego": "rego.md"
+172:>>>>>>> theirs
+173-  }
+174-}
+
+===== internal/scan/agent.go =====
+933-		fmt.Fprintf(stdout.Writer(), "[ocr] Mid-file continue %s from round %d (%d messages)\n",
+934-			it.Path, completedRounds, len(messages))
+935-	} else {
+936-		if start.PlanGuidance != "" {
+937-			planGuidance = start.PlanGuidance
+938-		} else {
+939-			planGuidance = a.maybeRunPlan(ctx, it, rule)
+940-		}
+941-		messages = a.renderMessages(it, rule, planGuidance)
+942-	}
+943-
+944-	tokenCount := llmloop.CountMessagesTokens(messages)
+945-	maxAllowed := a.args.Template.MaxTokens
+946-	tokenLimit := llmloop.PromptTokenLimit(maxAllowed)
+947-	if tokenCount > tokenLimit {
+948-		msg := fmt.Sprintf("prompt tokens (%d) exceed %d%% of max_tokens(%d)", tokenCount, 80, maxAllowed)
+949-		fmt.Fprintf(stdout.Writer(), "[ocr] WARNING: %s for %s\n", msg, it.Path)
+950-		a.recordWarning("token_threshold_exceeded", it.Path, msg)
+951-		telemetry.Event(ctx, "token.threshold.exceeded",
+952-			telemetry.AnyToAttr("file.path", it.Path),
+953-			telemetry.AnyToAttr("tokens", tokenCount),
+954-			telemetry.AnyToAttr("max_tokens", maxAllowed))
+955-		return false, "", nil
+956-	}
+957-
+958:<<<<<<< ours
+959-	llmloop.BindSessionCheckpoint(a.runner, a.session, fingerprint, planGuidance, a.args.Model, a.templateHash())
+960-	a.runner.SetCompletedRounds(completedRounds)
+961-	completed, stop, err := a.runner.RunPerFile(ctx, messages, it.Path)
+962-||||||| base
+963-	completed, stop, err := a.runner.RunPerFile(ctx, messages, it.Path)
+964:=======
+965-	completed, stop, err := a.runner.RunMainTask(ctx, messages, it.Path)
+966:>>>>>>> theirs
+967-	if err != nil {
+968-		return false, "", err
+969-	}
+970-	if !completed {
+971-		// Scan sessions opt out of the run manifest, so this one string is the
+972-		// whole diagnostic: it feeds both RecordReviewItemFailed and the
+973-		// scan_subtask_error warning, and under --format json the [ocr] progress
+974-		// lines that would say which exit fired are discarded. Name the trigger
+975-		// via the shared Reason() instead of a second hardcoded sentence, so
+976-		// scan and review never describe the same stop differently. The prefix
+977-		// stays for the resume records and warnings that already match on it.
+978-		return false, "main_task did not complete before stopping: " + stop.Reason(), nil
+979-	}
+980-	return true, "", nil
+981-}
+982-
+983-func (a *Agent) templateHash() string {
+984-	return session.ComputeTemplateHashFrom(&a.args.Template)
+985-}
+986-
+987-func (a *Agent) prepareFileStart(it model.ScanItem) session.FileStart {
+988-	fingerprint := a.scanItemFingerprint(it)
+989-	if cp, ok := a.session.LastConversationCheckpoint(fingerprint); ok && len(cp.Messages) > 0 {
+990-		return session.FileStart{
+991-			Mode:         session.ModeContinue,
+
+===== internal/viewer/server.go =====
+1-package viewer
+2-
+3-import (
+4-	"embed"
+5-	"fmt"
+6-	"html/template"
+7-	"io/fs"
+8-	"net"
+9-	"net/http"
+10-	"os"
+11-	"strconv"
+12-	"strings"
+13-	"time"
+14-
+15-	"github.com/alibaba/open-code-review/internal/reviewstore"
+16-)
+17-
+18-//go:embed templates/*.html static/style.css
+19-var assets embed.FS
+20-
+21:<<<<<<< ours
+22-// ServerOptions configures the viewer HTTP server.
+23-type ServerOptions struct {
+24-	Addr       string
+25-	ReviewsDir string
+26-}
+27-
+28-func StartServer(addr string) error {
+29-	return StartServerWithOptions(ServerOptions{Addr: addr})
+30-}
+31-
+32-func StartServerWithOptions(opts ServerOptions) error {
+33-||||||| base
+34-func StartServer(addr string) error {
+35:=======
+36-// StartServer binds addr and serves until the listener fails. openMode is one
+37-// of OpenAuto, OpenAlways or OpenNever; callers should have run
+38-// ValidateOpenMode first, and anything unrecognized behaves as OpenAuto.
+39-func StartServer(addr, openMode string) error {
+40:>>>>>>> theirs
+41-	root, err := SessionsRoot()
+42-	if err != nil {
+43-		return fmt.Errorf("resolve sessions root: %w", err)
+44-	}
+45-
+46:<<<<<<< ours
+47-	reviewsRoot := opts.ReviewsDir
+48-	if reviewsRoot == "" {
+49-		reviewsRoot = os.Getenv("OCR_REVIEWS_DIR")
+50-	}
+51-
+52-||||||| base
+53:=======
+54-	mux := newMux(root)
+55-
+56-	// Wrap the mux with a Host-header allowlist. Without this, any web page
+57-	// the user visits can DNS-rebind its origin to 127.0.0.1 and read the
+58-	// session JSONL exposed by this viewer (which contains LLM request bodies
+59-	// = source code being reviewed and the LLM's analysis of it).
+60-	allowed := resolveAllowedHostsFromEnv(addr)
+61-	guarded := hostGuard(allowed, mux)
+62-
+63-	// Outermost layer: set defense-in-depth security headers on every response.
+64-	handler := securityHeaders(guarded)
+65-
+66-	srv := &http.Server{
+67-		Handler: handler,
+68-	}
+69-
+70-	// Bind before printing or opening anything: once Listen returns, early
+71-	// connections queue in the accept backlog instead of being refused, so the
+72-	// browser cannot outrun the server.
+73-	ln, err := net.Listen("tcp", addr)
+74-	if err != nil {
+75-		return fmt.Errorf("listen on %s: %w", addr, err)
+76-	}
+77-	// srv.Serve takes ownership and closes ln itself; this covers the
+78-	// early-return path below and any future one. Close is idempotent enough
+--
+92-	autoOpen, suppressed := shouldAutoOpen(openMode)
+93-	if suppressed != "" {
+94-		fmt.Printf("Viewer ready: %s (browser not opened: %s)\n", url, suppressed)
+95-	} else {
+96-		fmt.Printf("Viewer ready: %s\n", url)
+97-	}
+98-	if autoOpen {
+99-		go func() {
+100-			if err := openBrowser(url); err != nil {
+101-				browserWarnf("could not open browser: %v", err)
+102-			}
+103-		}()
+104-	}
+105-
+106-	return <-serveErr
+107-}
+108-
+109-// newMux builds the viewer's routing table against a sessions root. The
+110-// viewer is read-only: the document routes are registered with GET-only
+111-// patterns (which also serve HEAD), so the ServeMux itself answers any other
+112-// method with 405 + Allow before a handler runs. The root pattern matches
+113-// exactly "/" via {$}; every other unmatched path gets the ServeMux's 404.
+114-// New routes must register method-qualified patterns to keep this contract
+115-// testable (TestMux_HasNoWriteRoutes).
+116-func newMux(root string) *http.ServeMux {
+117:>>>>>>> theirs
+118-	mux := http.NewServeMux()
+119-
+120-	// Static assets.
+121-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS()))))
+122-
+123-	// Routes
+124-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+125-		handleRepos(w, r, root)
+126-	})
+127-	mux.HandleFunc("GET /r/{repo}", func(w http.ResponseWriter, r *http.Request) {
+128-		repo := r.PathValue("repo")
+129:<<<<<<< ours
+130-		if !isValidPathSegment(repo) {
+131-||||||| base
+132-		if strings.Contains(repo, "..") || strings.Contains(repo, "/") {
+133:=======
+134-		if unsafeSegment(repo) {
+135:>>>>>>> theirs
+136-			http.Error(w, "invalid repo path", http.StatusBadRequest)
+137-			return
+138-		}
+139-		handleSessions(w, r, root, repo)
+140-	})
+141-	// Registered before the {sessionID} wildcard for readability only: a
+142-	// literal segment wins over a wildcard whatever the order.
+143-	mux.HandleFunc("GET /r/{repo}/compare", func(w http.ResponseWriter, r *http.Request) {
+144-		repo := r.PathValue("repo")
+145-		if unsafeSegment(repo) {
+146-			http.Error(w, "invalid repo path", http.StatusBadRequest)
+147-			return
+148-		}
+149-		handleCompare(w, r, root, repo)
+150-	})
+151-	mux.HandleFunc("GET /r/{repo}/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
+152-		repo := r.PathValue("repo")
+153-		sid := r.PathValue("sessionID")
+154:<<<<<<< ours
+155-		if !isValidPathSegment(repo) || !isValidPathSegment(sid) {
+156-||||||| base
+157-		if strings.Contains(repo, "..") || strings.Contains(sid, "..") {
+158:=======
+159-		if unsafeSegment(repo) || unsafeSegment(sid) {
+160:>>>>>>> theirs
+161-			http.Error(w, "invalid path", http.StatusBadRequest)
+162-			return
+163-		}
+164-		handleSession(w, r, root, repo, sid)
+165-	})
+166-
+167:<<<<<<< ours
+168-	// JSON API for review results
+169-	if reviewsRoot != "" {
+170-		mux.HandleFunc("/api/reviews", func(w http.ResponseWriter, r *http.Request) {
+171-			handleAPIReviews(w, r, reviewsRoot)
+172-		})
+173-		mux.HandleFunc("/api/reviews/{project}", func(w http.ResponseWriter, r *http.Request) {
+174-			project := r.PathValue("project")
+175-			if !isValidPathSegment(project) {
+176-				writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid project"))
+177-				return
+178-			}
+179-			handleAPIProjectReviews(w, r, reviewsRoot, project)
+180-		})
+181-		mux.HandleFunc("/api/reviews/{project}/{reviewID}", func(w http.ResponseWriter, r *http.Request) {
+182-			project := r.PathValue("project")
+183-			reviewID := r.PathValue("reviewID")
+184-			if !isValidPathSegment(project) || !isValidPathSegment(reviewID) {
+185-				writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid path"))
+186-				return
+187-			}
+188-			handleAPIReviewDetail(w, r, reviewsRoot, project, reviewID)
+189-		})
+190-	}
+191-
+192-	// Wrap the mux with a Host-header allowlist. Without this, any web page
+193-	// the user visits can DNS-rebind its origin to 127.0.0.1 and read the
+194-	// session JSONL exposed by this viewer (which contains LLM request bodies
+195-	// = source code being reviewed and the LLM's analysis of it).
+196-	allowed := resolveAllowedHostsFromEnv(opts.Addr)
+197-	guarded := hostGuard(allowed, mux)
+198-
+199-	srv := &http.Server{
+200-		Addr:    opts.Addr,
+201-		Handler: guarded,
+202-||||||| base
+203-	// Wrap the mux with a Host-header allowlist. Without this, any web page
+204-	// the user visits can DNS-rebind its origin to 127.0.0.1 and read the
+205-	// session JSONL exposed by this viewer (which contains LLM request bodies
+206-	// = source code being reviewed and the LLM's analysis of it).
+207-	allowed := resolveAllowedHostsFromEnv(addr)
+208-	guarded := hostGuard(allowed, mux)
+209-
+210-	// Outermost layer: set defense-in-depth security headers on every response.
+211-	handler := securityHeaders(guarded)
+212-
+213-	srv := &http.Server{
+214-		Addr:    addr,
+215-		Handler: handler,
+216:=======
+217-	return mux
+218-}
+219-
+220-// displayURL builds the URL to print and hand to the browser.
+221-//
+222-// The host comes from the requested address, not from the listener: net.Listen
+223-// resolves a hostname to an IP literal, while the Host allowlist in hostGuard is
+224-// built from the requested address (resolveAllowedHostsFromEnv). Using the
+225-// resolved form makes the two disagree, so `ocr viewer --addr box.local:5483`
+226-// would auto-open http://192.168.1.10:5483 and land on "403 forbidden host".
+227-//
+228-// The port comes from the listener so `--addr :0` reports the port the kernel
+229-// actually assigned rather than the literal 0.
+230-func displayURL(requestedAddr, listenerAddr string) (string, error) {
+231-	_, port, err := net.SplitHostPort(listenerAddr)
+232-	if err != nil {
+233-		return "", fmt.Errorf("parse listener addr %q: %w", listenerAddr, err)
+234:>>>>>>> theirs
+235-	}
+236-	return "http://" + DisplayAddr(net.JoinHostPort(splitBindHost(requestedAddr), port)), nil
+237-}
+238-
+239:<<<<<<< ours
+240-	fmt.Printf("\nOpen browser: http://%s\n", DisplayAddr(opts.Addr))
+241-	return srv.ListenAndServe()
+242-||||||| base
+243-	fmt.Printf("\nOpen browser: http://%s\n", DisplayAddr(addr))
+244-	return srv.ListenAndServe()
+245:=======
+246-// unsafeSegment rejects a URL-supplied name that must stay a single directory
+247-// or file name once it reaches filepath.Join. ServeMux unescapes each path
+248-// segment, so "%2F" and "%5C" arrive here as real separators; "\" is one on
+249-// Windows, so it is rejected everywhere "/" is.
+250-func unsafeSegment(s string) bool {
+251-	return strings.Contains(s, "..") || strings.ContainsAny(s, `/\`)
+252:>>>>>>> theirs
+253-}
+254-
+255-var cstZone = func() *time.Location {
+256-	loc, err := time.LoadLocation("Asia/Shanghai")
+257-	if err != nil {
+258-		loc = time.FixedZone("CST", 8*60*60)
+259-	}
+260-	return loc
+261-}()
+262-
+263-// isValidPathSegment delegates to reviewstore.IsSafePathSegment so the
+264-// HTTP-layer validation stays consistent with the store-layer validation.
+265-func isValidPathSegment(segment string) bool {
+266-	return reviewstore.IsSafePathSegment(segment)
+267-}
+268-
+269-func formatTime(t time.Time) string {
+270-	return t.In(cstZone).Format("2006-01-02 15:04")
+271-}
+272-
+273-// CommentFileGroup groups review comments by file path for template rendering.
+274-type CommentFileGroup struct {
+275-	FilePath string
+276-	Comments []*ReviewComment
+277-}
+
+===== internal/viewer/store.go =====
+310-// TaskCard links an LLM request with its response and tool calls.
+311-type TaskCard struct {
+312-	RequestMessages  any // preserved for display
+313-	RequestNo        int
+314-	ResponseContent  string
+315-	ReasoningContent string // the model's reasoning/thinking text for this turn, if the provider exposed any
+316-	ToolCalls        []ToolCallInfo
+317-	DurationMs       int64
+318-	Error            string
+319-	Model            string
+320-	PromptTokens     int
+321-	CompletionTokens int
+322-	CacheReadTokens  int
+323-	CacheWriteTokens int
+324-}
+325-
+326-// ToolCallInfo summarizes a single tool call.
+327-type ToolCallInfo struct {
+328-	Name       string
+329-	Arguments  string
+330-	Result     string
+331-	Ok         bool
+332-	DurationMs int64
+333-}
+334-
+335:<<<<<<< ours
+336-// ReviewFinding represents a single code review finding from LlmComment.
+337-type ReviewFinding struct {
+338-	FilePath       string
+339-	Content        string
+340-	SuggestionCode string
+341-	ExistingCode   string
+342-	StartLine      int
+343-	EndLine        int
+344-	Category       string
+345-	Severity       string
+346-}
+347-
+348-||||||| base
+349:=======
+350-// safeSegment validates that s is safe to use as a single path component and
+351-// returns it unchanged. Every caller must join the returned value, not its
+352-// own copy of s: a validate-then-use-the-original-variable shape leaves the
+353-// join sourced from the untrusted argument, which static path-injection
+354-// analysis (this codebase's CodeQL scan included) cannot tell apart from a
+355-// join with no check at all. Returning the checked value is what makes the
+356-// join provably downstream of the check.
+357-func safeSegment(s string) (string, error) {
+358-	if s == "" || strings.Contains(s, "..") || strings.ContainsAny(s, `/\`) {
+359-		return "", fmt.Errorf("invalid path segment: %q", s)
+360-	}
+361-	return s, nil
+362-}
+363-
+364:>>>>>>> theirs
+365-// LoadSession fully parses a JSONL file into a ViewSession.
+366-func LoadSession(root, encodedRepo, sessionID string) (*ViewSession, error) {
+367-	encodedRepo, err := safeSegment(encodedRepo)
+368-	if err != nil {
+369-		return nil, err
+370-	}
+371-	sessionID, err = safeSegment(sessionID)
+372-	if err != nil {
+373-		return nil, err
+374-	}
+375-	path := filepath.Join(root, encodedRepo, sessionID+".jsonl")
+376-	f, err := os.Open(path) //nolint:gosec // encodedRepo and sessionID are validated by safeSegment above
+377-	if err != nil {
+378-		return nil, fmt.Errorf("open session file: %w", err)
+379-	}
+380-	defer f.Close()
+381-
+382-	vs := &ViewSession{
+383-		Files:         make([]*FileGroup, 0),
+384-		SeverityCount: make(map[string]int),
+385-		CategoryCount: make(map[string]int),
+386-	}
+387-	vs.Summary.Aborted = true
+388-	fileIndex := make(map[string]*FileGroup)
+389-	markOccurrences := make(map[string]int)
+--
+575-					rc := &ReviewComment{FilePath: fp}
+576-					if v, ok := cm["path"].(string); ok && v != "" {
+577-						rc.FilePath = v
+578-					}
+579-					if v, ok := cm["content"].(string); ok {
+580-						rc.Content = v
+581-					}
+582-					if v, ok := cm["suggestion_code"].(string); ok {
+583-						rc.SuggestionCode = v
+584-					}
+585-					if v, ok := cm["existing_code"].(string); ok {
+586-						rc.ExistingCode = v
+587-					}
+588-					if v, ok := cm["start_line"].(float64); ok {
+589-						rc.StartLine = int(v)
+590-					}
+591-					if v, ok := cm["end_line"].(float64); ok {
+592-						rc.EndLine = int(v)
+593-					}
+594-					if v, ok := cm["category"].(string); ok {
+595-						rc.Category = v
+596-					}
+597-					if v, ok := cm["severity"].(string); ok {
+598-						rc.Severity = v
+599-					}
+600:<<<<<<< ours
+601-					if rc.Content == "" && rc.SuggestionCode == "" {
+602-						continue
+603-					}
+604-||||||| base
+605:=======
+606-					rc.MarkID = commentMarkID(recUUID, ci, rc, markOccurrences)
+607:>>>>>>> theirs
+608-					vs.Comments = append(vs.Comments, rc)
+609-					if rc.Severity != "" {
+610-						vs.SeverityCount[strings.ToLower(rc.Severity)]++
+611-					}
+612-					if rc.Category != "" {
+613-						vs.CategoryCount[strings.ToLower(rc.Category)]++
+614-					}
+615-				}
+616-			}
+617-
+618-		case "session_end":
+619-			applySessionEnd(&vs.Summary, rec)
+620-		}
+621-	})
+622-
+623-	// Aggregate token usage across all task cards
+624-	fileBreakdown := make([]FileTokenUsage, 0, len(vs.Files))
+625-	for _, fg := range vs.Files {
+626-		ft := FileTokenUsage{FilePath: fg.FilePath}
+627-		for _, cards := range fg.Tasks {
+628-			for _, c := range cards {
+629-				vs.TokenUsage.TotalPromptTokens += c.PromptTokens
+630-				vs.TokenUsage.TotalCompletionTokens += c.CompletionTokens
+631-				vs.TokenUsage.TotalCacheReadTokens += c.CacheReadTokens
+632-				vs.TokenUsage.TotalCacheWriteTokens += c.CacheWriteTokens
+
+===== internal/viewer/store_load_test.go =====
+924-	if c.SuggestionCode != "const N = 3" {
+925-		t.Errorf("SuggestionCode = %q", c.SuggestionCode)
+926-	}
+927-	if c.ExistingCode != "3" {
+928-		t.Errorf("ExistingCode = %q", c.ExistingCode)
+929-	}
+930-	if c.StartLine != 10 || c.EndLine != 12 {
+931-		t.Errorf("lines = %d-%d, want 10-12", c.StartLine, c.EndLine)
+932-	}
+933-	if c.Category != "style" {
+934-		t.Errorf("Category = %q", c.Category)
+935-	}
+936-	if c.Severity != "minor" {
+937-		t.Errorf("Severity = %q", c.Severity)
+938-	}
+939-
+940-	// A reused comment with no path falls back to the record-level filePath.
+941-	reused := vs.Comments[1]
+942-	if reused.FilePath != "util.go" {
+943-		t.Errorf("reused FilePath = %q, want util.go", reused.FilePath)
+944-	}
+945-	if reused.Content != "reused finding" {
+946-		t.Errorf("reused Content = %q", reused.Content)
+947-	}
+948-}
+949:<<<<<<< ours
+950-
+951-func TestLoadSession_SessionLevelGroupingTask(t *testing.T) {
+952-	root := t.TempDir()
+953-	repoDir := filepath.Join(root, "repo")
+954-	if err := os.MkdirAll(repoDir, 0755); err != nil {
+955-		t.Fatal(err)
+956-	}
+957-
+958-	writeJSONL(t, filepath.Join(repoDir, "group.jsonl"),
+959-		`{"type":"session_start","timestamp":"2025-01-01T00:00:00Z","cwd":"/x","model":"m"}`,
+960-		`{"type":"llm_request","filePath":"__grouping__","taskType":"grouping_task","request_no":1,"messages":[]}`,
+961-		`{"type":"llm_response","filePath":"__grouping__","taskType":"grouping_task","content":"grouped","duration_ms":10,"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+962-		`{"type":"llm_request","filePath":"a.go","taskType":"main_task","request_no":1,"messages":[]}`,
+963-		`{"type":"llm_response","filePath":"a.go","taskType":"main_task","content":"ok","duration_ms":10,"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+964-		`{"type":"session_end","duration_seconds":1,"files_reviewed":["a.go"]}`,
+965-	)
+966-
+967-	vs, err := LoadSession(root, "repo", "group")
+968-	if err != nil {
+969-		t.Fatal(err)
+970-	}
+971-	if len(vs.Files) != 1 || vs.Files[0].FilePath != "a.go" {
+972-		t.Fatalf("Files = %+v, want [a.go]", vs.Files)
+973-	}
+974-	if len(vs.SessionTasks) != 1 || vs.SessionTasks[0].FilePath != "__grouping__" {
+975-		t.Fatalf("SessionTasks = %+v, want [__grouping__]", vs.SessionTasks)
+976-	}
+977-	if len(vs.SessionTasks[0].Tasks[GroupingTask]) != 1 {
+978-		t.Errorf("grouping_task cards = %d, want 1", len(vs.SessionTasks[0].Tasks[GroupingTask]))
+979-	}
+980-}
+981-||||||| base
+982:=======
+983-
+984-func TestLoadSession_MarkIDStableAndDistinct(t *testing.T) {
+985-	root := t.TempDir()
+986-	writeMarkIdentityFixture(t, root, "repo", "s1")
+987-
+988-	first, err := LoadSession(root, "repo", "s1")
+989-	if err != nil {
+990-		t.Fatal(err)
+991-	}
+992-	second, err := LoadSession(root, "repo", "s1")
+993-	if err != nil {
+994-		t.Fatal(err)
+995-	}
+996-
+997-	if len(first.Comments) != 4 || len(second.Comments) != 4 {
+998-		t.Fatalf("comments = %d/%d, want 4/4", len(first.Comments), len(second.Comments))
+999-	}
+1000-	for i := range first.Comments {
+1001-		if first.Comments[i].MarkID == "" {
+1002-			t.Fatalf("comment %d has empty MarkID", i)
+1003-		}
+1004-		if first.Comments[i].MarkID != second.Comments[i].MarkID {
+1005-			t.Errorf("comment %d MarkID unstable: %q vs %q", i, first.Comments[i].MarkID, second.Comments[i].MarkID)
+1006-		}
+1007-	}
+--
+1030-	root := t.TempDir()
+1031-	repoDir := filepath.Join(root, "repo")
+1032-	if err := os.MkdirAll(repoDir, 0755); err != nil {
+1033-		t.Fatal(err)
+1034-	}
+1035-	writeJSONL(t, filepath.Join(repoDir, "s.jsonl"),
+1036-		`{"type":"session_start","timestamp":"2025-01-01T00:00:00Z","cwd":"/x","model":"m"}`,
+1037-		`{"type":"review_item_done","filePath":"main.go","comments":[`+
+1038-			`{"content":"emoji \u00e9\u4e2d\u6587 finding","path":"main.go","category":"bug","severity":"high"}]}`,
+1039-		`{"type":"session_end","duration_seconds":5}`,
+1040-	)
+1041-
+1042-	first, err := LoadSession(root, "repo", "s")
+1043-	if err != nil {
+1044-		t.Fatal(err)
+1045-	}
+1046-	second, err := LoadSession(root, "repo", "s")
+1047-	if err != nil {
+1048-		t.Fatal(err)
+1049-	}
+1050-	if first.Comments[0].MarkID == "" || first.Comments[0].MarkID != second.Comments[0].MarkID {
+1051-		t.Fatalf("unicode fallback MarkID = %q / %q, want non-empty and stable",
+1052-			first.Comments[0].MarkID, second.Comments[0].MarkID)
+1053-	}
+1054-}
+1055:>>>>>>> theirs
+
+===== skills/open-code-review/SKILL.md =====
+28-### Step 1: Gather Business Context
+29-
+30-Analyze the review target (commits, branch, or changes) to extract concise business context. Pass this context via `--background` to improve review quality.
+31-
+32-### Step 2: Run Code Review
+33-
+34-Run the OCR command with appropriate flags. **Always pass business context via `--background`** when available:
+35-
+36-```bash
+37-ocr review --audience agent --background "business context here" [user-args]
+38-```
+39-
+40-**`--save-result` is enabled by default.** Results are automatically persisted to `<repo>/.opencodereview/reviews/<project-key>/<review-id>.json`.
+41-
+42-**Argument handling:**
+43-
+44-- **Background context** (RECOMMENDED): use `--background "context"` or `-b "context"` to provide business context for better review quality
+45-- **Default** (no user arguments): reviews staged, unstaged, and untracked changes (workspace mode)
+46-- **Specific commit**: use `--commit` or `-c` to review a single commit against its parent
+47-- **Branch comparison**: use `--from <ref>` and `--to <ref>` to review diff between two refs
+48-- **Effort**: `--effort low|medium|high` (default `medium`) sets review rounds (1/2/3). More rounds improve recall at higher cost
+49-- **Timeout**: effective timeout per review group = `--timeout` × review rounds. Default `--timeout 15` with default effort `medium` (2 rounds) gives 30 minutes; `low`/`high` give 15/45 minutes.
+50-- **Concurrency**: default concurrency is 8 file workers; reduce with `--concurrency <n>` if rate limits are hit
+51-- **Grouping / max-tools**: files are grouped semantically before review. `--max-tools` is the per-group tool-call cap; values 1–49 are clamped up to 50
+52-- **Preview mode**: use `--preview` or `-p` to preview which files will be reviewed without running the LLM
+53:<<<<<<< ours
+54-- **No filter**: `--no-filter` keeps all comments and skips the LLM post-filter pass
+55-- **Output file**: `--output <path>` / `-o` writes results to a UTF-8 file (default: stdout)
+56-- **Resume**: use `--resume <session-id>` to reuse completed results and retry failed files from a previous session
+57-- **Resume mode**: `--resume-mode continue|restart-failed` (default `continue`) — `continue` uses mid-file checkpoints; `restart-failed` cold-retries failed files
+58-- **Apply**: `--apply` lets the LLM edit files directly (LLM-as-editor via `file_edit` + `shell_run`)
+59-- **Save result**: `--save-result` is on by default; `--save-per-file` splits output into per-file markdown; `--rules-dir` points at enterprise/project rules
+60-||||||| base
+61:=======
+62-- **Output file**: use `--output <path>` to write the full result to a file instead of stdout. If the command fails with `unknown flag: --output`, do not continue the review with plain stdout. Ask the user whether to upgrade (`npm i -g @alibaba-group/open-code-review@latest`) and wait for the answer before proceeding. After the user confirms and the upgrade succeeds, rerun with `--output`.
+63:>>>>>>> theirs
+64-- **Installation**: if `ocr` command is not found, install it by running `npm i -g @alibaba-group/open-code-review`
+65-
+66-**Common invocation patterns:**
+67-
+68-| User says | Command to run |
+69-|-----------|---------------|
+70-| "review my changes" / "review the working copy" | `ocr review --audience agent -b "context"` |
+71-| "review this PR" / "review feature branch" | `ocr review --audience agent -b "context" --from main --to <branch>` |
+72-| "review commit abc123" | `ocr review --audience agent -b "context" --commit abc123` |
+73-| "review and apply fixes" | `ocr review --audience agent -b "context" --apply` |
+74-| "what would be reviewed?" (dry-run) | `ocr review --preview` |
+75-
+76-**Output mode:**
+77-
+78-- Always use `--audience agent` to suppress progress UI and emit only the final summary
+79-- **Prevent output truncation**: For large reviews or restricted tool environments, pass `--output /tmp/ocr_out.txt` and inspect the file in full via a file reading tool instead of piping stdout through `tail` or `head`, which drops earlier review comments.
+80-
+81-**On failure:** If `ocr review` exits non-zero (e.g. an LLM connection error), do not retry blindly — consult the Troubleshooting section below for the matching fix before re-running.
+82-
+83-### Step 3: Read Structured Review Results
+84-
+85-After the review completes, the result JSON is saved at `<repo>/.opencodereview/reviews/`. The terminal output will show the exact path:
+86-
+87-```
+88-[ocr] Review result saved to: /path/to/.opencodereview/reviews/<project-key>/<review-id>.json
+--
+245-      "merge_system_rule": true
+246-    },
+247-    {
+248-      "path": "**/*mapper*.xml",
+249-      "rule": "Check SQL for injection risks and missing closing tags"
+250-    }
+251-  ]
+252-}
+253-```
+254-
+255-To preview which rule applies to a file before reviewing:
+256-
+257-```bash
+258-ocr rules check src/main/java/com/example/Foo.java
+259-```
+260-
+261-## Gotchas
+262-
+263-- **LLM must be configured first** — `ocr review` will fail loudly if no LLM is reachable. See the Troubleshooting section below if this happens.
+264-- **Working directory matters** — `ocr review` operates on the Git repo at the current directory. Use `--repo /path/to/repo` to run from elsewhere.
+265-- **Untracked files are reviewed in workspace mode** — running bare `ocr review` includes staged, unstaged, *and* untracked changes. Stage selectively if you want narrower scope.
+266-- **Large diffs may hit token limits** — files with very large diffs may be truncated. The default `MAX_TOKENS` is 58888 per request.
+267-- **Plan phase triggers at 50 lines** — diffs exceeding 50 changed lines run an extra risk-analysis phase before main review. This adds latency but improves quality.
+268-- **Don't pass `--audience human`** — it streams progress UI that pollutes output. Always use `--audience agent`.
+269-- **Comment language follows config** — set `language` config to `English` or `Chinese` (default: Chinese) to control review comment language.
+270:<<<<<<< ours
+271-- **`--save-result` is always on** — results are saved to `<repo>/.opencodereview/reviews/`. Read this JSON instead of parsing terminal output. `--save-per-file` writes per-file markdown under a tree that mirrors the source.
+272-- **Use `--resume` after fixing** — it skips unchanged files and retries failed files, making re-review fast. Ctrl+C prints the session ID to resume with.
+273-- **Avoid output truncation** — Large review runs produce verbose output. Never pipe command output to `tail` or `head` as it drops review comments from earlier sections. Redirect output to a file (`--output` or a shell redirect) and read it in full.
+274-||||||| base
+275-- **Avoid output truncation** — Large review runs produce verbose output. Never pipe command output to `tail` or `head` as it drops review comments from earlier sections. Redirect output to a file and read it in full.
+276:=======
+277-- **Avoid output truncation** — Large review runs produce verbose output. Never pipe command output to `tail` or `head` as it drops review comments from earlier sections. Use `--output <path>` and read it in full; on older CLIs, follow the **Output file** guidance above.
+278:>>>>>>> theirs
+279-
+280-## Validation
+281-
+282-After the review completes, verify success by checking:
+283-
+284-1. The command exited with code 0
+285-2. A result JSON was saved to `.opencodereview/reviews/`
+286-3. `cat .opencodereview/reviews/<project-key>/<latest>.json | jq '.comments | length'` returns a count
+287-4. Warnings (if any) are displayed in stderr
+288-
+289-If errors occurred, check the stderr warnings for details about which files failed and why.
+290-
+291-## Troubleshooting
+292-
+293-**`ocr: command not found`**
+294-
+295-Install the CLI:
+296-
+297-```bash
+298-npm install -g @alibaba-group/open-code-review
+299-```
+300-
+301-**`unknown flag: --output`**
+302-
+303-The CLI is older than v1.10.0. Do not continue the review with plain stdout. Ask the user whether to upgrade (`npm i -g @alibaba-group/open-code-review@latest`) and wait for the answer before proceeding. After the user confirms and the upgrade succeeds, rerun with `--output`.
